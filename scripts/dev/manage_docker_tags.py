@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import base64
 import sys
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Set
@@ -100,10 +101,51 @@ class DockerHubClient:
                 next_path = None
         return tags
 
+def _read_auth_from_config(config_path: str) -> Optional[tuple[str, str]]:
+  
+
+    if not os.path.exists(config_path):
+        return None
+
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    auths = config.get("auths", {})
+    for registry_key in ("docker.io", "https://index.docker.io/v1/", "index.docker.io"):
+        auth_entry = auths.get(registry_key, {})
+        auth_value = auth_entry.get("auth")
+        if auth_value:
+            try:
+                decoded = base64.b64decode(auth_value).decode("utf-8")
+                if ":" in decoded:
+                    username, password = decoded.split(":", 1)
+                    return username, password
+            except (ValueError, UnicodeDecodeError):
+                continue
+    return None
 
 def resolve_credentials(username: Optional[str], password: Optional[str]) -> tuple[str, str]:
     resolved_username = username or os.environ.get("DOCKERHUB_USERNAME")
     resolved_password = password or os.environ.get("DOCKERHUB_TOKEN") or os.environ.get("DOCKERHUB_PASSWORD")
+
+    if not resolved_username or not resolved_password:
+        xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+        auth_paths = [
+            os.path.join(xdg_runtime_dir, "containers", "auth.json") if xdg_runtime_dir else "",
+        ]
+
+        for auth_path in auth_paths:
+            if not auth_path:
+                continue
+            creds = _read_auth_from_config(auth_path)
+            if creds:
+                print(f"Using cached credentials from {auth_path}")
+                resolved_username, resolved_password = creds
+                break
+
     if not resolved_username or not resolved_password:
         raise DockerHubError(
             "Docker Hub credentials are required. Provide --username/--password or set "
