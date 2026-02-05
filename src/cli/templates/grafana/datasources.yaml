@@ -8,7 +8,7 @@ datasources:
     secureJsonData:
       password: {{ grafana_pg_password }}
     jsonData:
-      database: a2rchi-db
+      database: archi-db
       sslmode: 'disable' # disable/require/verify-ca/verify-full
       maxOpenConns: 100 # Grafana v5.4+
       maxIdleConns: 100 # Grafana v5.4+

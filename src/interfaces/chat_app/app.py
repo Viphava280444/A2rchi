@@ -2,22 +2,22 @@ import json
 import os
 import re
 import time
+import uuid
 
-from datetime import datetime
-from threading import Lock
-from typing import List
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterator, List, Optional
 from urllib.parse import urlparse
+from functools import wraps
 
-import chromadb
 import mistune as mt
 import numpy as np
 import psycopg2
 import psycopg2.extras
 import yaml
-from chromadb.config import Settings
-from flask import jsonify, render_template, request, session, flash, redirect, url_for
+from authlib.integrations.flask_client import OAuth
+from flask import jsonify, render_template, request, session, flash, redirect, url_for, Response, stream_with_context
 from flask_cors import CORS
-from langchain_chroma.vectorstores import Chroma
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import (BashLexer, CLexer, CppLexer, FortranLexer,
@@ -25,32 +25,69 @@ from pygments.lexers import (BashLexer, CLexer, CppLexer, FortranLexer,
                              MathematicaLexer, MatlabLexer, PythonLexer,
                              TypeScriptLexer)
 
-from src.a2rchi.a2rchi import A2rchi
-from src.data_manager.data_manager import DataManager
-from src.utils.config_loader import CONFIGS_PATH, get_config_names, load_config
+from src.archi.archi import archi
+from src.archi.providers.base import ModelInfo, ProviderConfig, ProviderType
+from src.archi.utils.output_dataclass import PipelineOutput
+# from src.data_manager.data_manager import DataManager
+from src.data_manager.data_viewer_service import DataViewerService
 from src.utils.env import read_secret
 from src.utils.logging import get_logger
-from src.utils.sql import SQL_INSERT_CONVO, SQL_INSERT_FEEDBACK, SQL_INSERT_TIMING, SQL_QUERY_CONVO, SQL_INSERT_CONFIG, SQL_CREATE_CONVERSATION, SQL_UPDATE_CONVERSATION_TIMESTAMP, SQL_LIST_CONVERSATIONS, SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION, SQL_INSERT_TOOL_CALLS, SQL_QUERY_CONVO_WITH_FEEDBACK, SQL_DELETE_REACTION_FEEDBACK
-from src.data_manager.collectors.scrapers.scraper_manager import ScraperManager
-from src.data_manager.collectors.persistence import PersistenceService
-from src.data_manager.collectors.utils.index_utils import CatalogService
+from src.utils.config_access import get_full_config, get_services_config, get_global_config
+from src.utils.config_access import get_full_config
+from src.utils.sql import (
+    SQL_INSERT_CONVO, SQL_INSERT_FEEDBACK, SQL_INSERT_TIMING, SQL_QUERY_CONVO,
+    SQL_CREATE_CONVERSATION, SQL_UPDATE_CONVERSATION_TIMESTAMP,
+    SQL_LIST_CONVERSATIONS, SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION,
+    SQL_INSERT_TOOL_CALLS, SQL_QUERY_CONVO_WITH_FEEDBACK, SQL_DELETE_REACTION_FEEDBACK,
+    SQL_INSERT_AB_COMPARISON, SQL_UPDATE_AB_PREFERENCE, SQL_GET_AB_COMPARISON,
+    SQL_GET_PENDING_AB_COMPARISON, SQL_DELETE_AB_COMPARISON, SQL_GET_AB_COMPARISONS_BY_CONVERSATION,
+    SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
+    SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
+)
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.utils import collapse_assistant_sequences
 
 
 logger = get_logger(__name__)
 
+
+def _build_provider_config_from_payload(config_payload: Dict[str, Any], provider_type: ProviderType) -> Optional[ProviderConfig]:
+    """Helper to build ProviderConfig from loaded YAML for a provider."""
+    archi_cfg = config_payload.get("archi", {}) or {}
+    providers_cfg = archi_cfg.get("providers", {}) or {}
+    cfg = providers_cfg.get(provider_type.value, {})
+    if not cfg:
+        return None
+
+    models = [ModelInfo(id=m, name=m, display_name=m) for m in cfg.get("models", [])]
+    extra = {}
+    if provider_type == ProviderType.LOCAL and cfg.get("mode"):
+        extra["local_mode"] = cfg.get("mode")
+
+    return ProviderConfig(
+        provider_type=provider_type,
+        enabled=cfg.get("enabled", True),
+        base_url=cfg.get("base_url"),
+        models=models,
+        default_model=cfg.get("default_model"),
+        extra_kwargs=extra,
+    )
+
+def _config_names():
+    cfg = get_full_config()
+    return [cfg.get("name", "default")]
+
 # DEFINITIONS
 QUERY_LIMIT = 10000 # max queries per conversation
-MAIN_PROMPT_FILE = "/root/A2rchi/main.prompt"
-CONDENSE_PROMPT_FILE = "/root/A2rchi/condense.prompt"
-SUMMARY_PROMPT_FILE = "/root/A2rchi/summary.prompt"
-A2RCHI_SENDER = "A2rchi"
+MAIN_PROMPT_FILE = "/root/archi/main.prompt"
+CONDENSE_PROMPT_FILE = "/root/archi/condense.prompt"
+SUMMARY_PROMPT_FILE = "/root/archi/summary.prompt"
+ARCHI_SENDER = "archi"
 
 
 class AnswerRenderer(mt.HTMLRenderer):
     """
-    Class for custom rendering of A2rchi output. Child of mistune's HTMLRenderer, with custom overrides.
+    Class for custom rendering of archi output. Child of mistune's HTMLRenderer, with custom overrides.
     Code blocks are structured and colored according to pygment lexers
     """
     RENDERING_LEXER_MAPPING = {
@@ -70,7 +107,7 @@ class AnswerRenderer(mt.HTMLRenderer):
         }
 
     def __init__(self):
-        self.config = load_config()
+        self.config = get_full_config()
         super().__init__()
 
     def block_code(self, code, info=None):
@@ -100,127 +137,114 @@ class ConversationAccessError(Exception):
     pass
 
 
+@dataclass
+class ChatRequestContext:
+    sender: str
+    content: str
+    conversation_id: int
+    history: List
+    is_refresh: bool
+
+
 class ChatWrapper:
     """
     Wrapper which holds functionality for the chatbot
     """
     def __init__(self):
         # load configs
-        self.config = load_config()
+        self.config = get_full_config()
         self.global_config = self.config["global"]
-        self.utils_config = self.config["utils"]
         self.services_config = self.config["services"]
         self.data_path = self.global_config["DATA_PATH"]
-
-        # initialize data manager
-        self.data_manager = DataManager()
-        self.data_manager.update_vectorstore()
-        embedding_name = self.config["data_manager"]["embedding_name"]
-        self.similarity_score_reference = self.config["data_manager"]["embedding_class_map"][embedding_name]["similarity_score_reference"]
-        self.sources_config = self.config["data_manager"]["sources"]
 
         # store postgres connection info
         self.pg_config = {
             "password": read_secret("PG_PASSWORD"),
             **self.services_config["postgres"],
         }
+
+        # initialize data manager (ingestion handled by data-manager service)
+        # self.data_manager = DataManager(run_ingestion=False)
+        embedding_name = self.config["data_manager"]["embedding_name"]
+        self.similarity_score_reference = self.config["data_manager"]["embedding_class_map"][embedding_name]["similarity_score_reference"]
+        self.sources_config = self.config["data_manager"]["sources"]
+
+        # initialize data viewer service for per-chat document selection
+        self.data_viewer = DataViewerService(data_path=self.data_path, pg_config=self.pg_config)
+
         self.conn = None
         self.cursor = None
 
-        # initialize lock and chain
-        self.lock = Lock()
-        self.a2rchi = A2rchi(pipeline=self.config["services"]["chat_app"]["pipeline"])
+        # initialize chain
+        self.archi = archi(pipeline=self.config["services"]["chat_app"]["pipeline"])
         self.number_of_queries = 0
 
-        # track configs and active config state
+        # track active config/model/pipeline state
         self.default_config_name = self.config.get("name")
         self.current_config_name = None
-        self.config_id = None
-        self.config_name_to_id = {}
+        self.current_model_used = None
+        self.current_pipeline_used = None
         self._config_cache = {}
         if self.default_config_name:
             self._config_cache[self.default_config_name] = self.config
 
-        # ensure all supplied configs are registered in Postgres and activate default
-        self._store_config_ids()
+        # activate default config
         if self.default_config_name:
             self.update_config(config_name=self.default_config_name)
 
-    def update_config(self, config_id=None, config_name=None):
+    def update_config(self, config_name=None):
         """
-        Update the active config by ensuring it exists in thje postgres and applying it to the pipeline.
+        Update the active config and apply it to the pipeline.
+        Tracks model_used and pipeline_used for conversation storage.
         """
         target_config_name = config_name or self.current_config_name or self.default_config_name
         if not target_config_name:
             raise ValueError("Config name must be provided to update the chat configuration.")
 
         config_payload = self._get_config_payload(target_config_name)
-        if config_id is None:
-            config_id = self._get_or_create_config_id(target_config_name, config_payload)
-        else:
-            self.config_name_to_id[target_config_name] = config_id
 
-        if self.config_id == config_id and self.current_config_name == target_config_name:
+        if self.current_config_name == target_config_name:
             return
 
         pipeline_name = config_payload["services"]["chat_app"]["pipeline"]
-        self.config_id = config_id
+        
+        # Extract the model name from the config
+        model_name = self._extract_model_name(config_payload, pipeline_name)
+        
         self.current_config_name = target_config_name
-        self.a2rchi.update(pipeline=pipeline_name, config_name=target_config_name)
+        self.current_pipeline_used = pipeline_name
+        self.current_model_used = model_name
+        self.archi.update(pipeline=pipeline_name, config_name=target_config_name)
+
+    def _extract_model_name(self, config_payload, pipeline_name):
+        """Extract the primary model name from config for a given pipeline."""
+        try:
+            pipeline_map = config_payload.get("archi", {}).get("pipeline_map", {})
+            pipeline_cfg = pipeline_map.get(pipeline_name, {})
+            required_models = pipeline_cfg.get("models", {}).get("required", {})
+            
+            # Try common model keys
+            for key in ["chat_model", "agent_model", "model"]:
+                if key in required_models:
+                    return required_models[key]
+            
+            # Return first model if any exist
+            if required_models:
+                return next(iter(required_models.values()))
+        except Exception:
+            pass
+        return None
 
     def _get_config_payload(self, config_name):
         if config_name not in self._config_cache:
-            self._config_cache[config_name] = load_config(name=config_name)
+            self._config_cache[config_name] = get_full_config()
         return self._config_cache[config_name]
-
-    def _get_or_create_config_id(self, config_name, config_payload=None):
-        if config_name in self.config_name_to_id:
-            return self.config_name_to_id[config_name]
-
-        payload = config_payload or self._get_config_payload(config_name)
-        serialized = yaml.dump(payload)
-
-        conn = psycopg2.connect(**self.pg_config)
-        cursor = conn.cursor()
-        try:
-            cursor.execute("SELECT config_id FROM configs WHERE config_name = %s ORDER BY config_id DESC LIMIT 1", (config_name,))
-            row = cursor.fetchone()
-            if row:
-                config_id = row[0]
-            else:
-                insert_tup = [(serialized, config_name)]
-                psycopg2.extras.execute_values(cursor, SQL_INSERT_CONFIG, insert_tup)
-                config_id = list(map(lambda tup: tup[0], cursor.fetchall()))[0]
-            conn.commit()
-            self.config_name_to_id[config_name] = config_id
-            return config_id
-        finally:
-            cursor.close()
-            conn.close()
-
-    def _store_config_ids(self):
-        for config_name in get_config_names():
-            try:
-                payload = self._get_config_payload(config_name)
-                self._get_or_create_config_id(config_name, payload)
-            except FileNotFoundError:
-                logger.warning(f"Config file {config_name} missing.")
-            except Exception as exc:
-                logger.warning(f"Failed to register config {config_name}: {exc}")
-
-    def get_config_id(self, config_name):
-        """
-        Helper for external callers needing the config_id for a given config name.
-        """
-        if config_name in self.config_name_to_id:
-            return self.config_name_to_id[config_name]
-        return self._get_or_create_config_id(config_name)
 
     @staticmethod
     def convert_to_app_history(history):
         """
         Input: the history in the form of a list of tuples, where the first entry of each tuple is
-        the author of the text and the second entry is the text itself (native A2rchi history format)
+        the author of the text and the second entry is the text itself (native archi history format)
 
         Output: the history in the form of a list of lists, where the first entry of each tuple is
         the author of the text and the second entry is the text itself
@@ -231,7 +255,7 @@ class ChatWrapper:
     @staticmethod
     def format_code_in_text(text):
         """
-        Takes in input plain text (the output from A2rchi);
+        Takes in input plain text (the output from archi);
         Recognizes structures in canonical Markdown format, and processes according to the custom renderer;
         Returns it formatted in HTML
         """
@@ -340,6 +364,32 @@ class ChatWrapper:
         return _output
 
     @staticmethod
+    def format_links_markdown(top_sources):
+        """Format source links as markdown (for client-side rendering)."""
+        if not top_sources:
+            return ""
+
+        _output = "\n\n---\n**Sources:**\n"
+
+        for entry in top_sources:
+            score = entry["score"]
+            link = entry["link"]
+            display_name = entry["display"]
+
+            # Format score: show nothing for -1 (placeholder), otherwise show numeric value
+            if score == -1.0 or score == "N/A":
+                score_str = ""
+            else:
+                score_str = f" ({score:.2f})"
+
+            if link:
+                _output += f"- [{display_name}]({link}){score_str}\n"
+            else:
+                _output += f"- {display_name}{score_str}\n"
+
+        return _output
+
+    @staticmethod
     def _looks_like_url(value: str | None) -> bool:
         return isinstance(value, str) and value.startswith(("http://", "https://"))
 
@@ -426,6 +476,378 @@ class ChatWrapper:
         self.conn.close()
         self.cursor, self.conn = None, None
 
+    # =========================================================================
+    # A/B Comparison Methods
+    # =========================================================================
+
+    def create_ab_comparison(
+        self,
+        conversation_id: int,
+        user_prompt_mid: int,
+        response_a_mid: int,
+        response_b_mid: int,
+        config_a_id: int,
+        config_b_id: int,
+        is_config_a_first: bool,
+    ) -> int:
+        """
+        Create an A/B comparison record linking two responses to the same user prompt.
+        
+        Args:
+            conversation_id: The conversation this comparison belongs to
+            user_prompt_mid: Message ID of the user's question
+            response_a_mid: Message ID of response A
+            response_b_mid: Message ID of response B
+            config_a_id: Config ID used for response A
+            config_b_id: Config ID used for response B
+            is_config_a_first: True if config A was the "first" config before randomization
+            
+        Returns:
+            The comparison_id of the newly created record
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                SQL_INSERT_AB_COMPARISON,
+                (conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
+                 config_a_id, config_b_id, is_config_a_first)
+            )
+            comparison_id = cursor.fetchone()[0]
+            conn.commit()
+            logger.info(f"Created A/B comparison {comparison_id} for conversation {conversation_id}")
+            return comparison_id
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update_ab_preference(self, comparison_id: int, preference: str) -> None:
+        """
+        Record user's preference for an A/B comparison.
+        
+        Args:
+            comparison_id: The comparison to update
+            preference: 'a', 'b', or 'tie'
+        """
+        if preference not in ('a', 'b', 'tie'):
+            raise ValueError(f"Invalid preference: {preference}")
+            
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                SQL_UPDATE_AB_PREFERENCE,
+                (preference, datetime.now(), comparison_id)
+            )
+            conn.commit()
+            logger.info(f"Updated A/B comparison {comparison_id} with preference '{preference}'")
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_ab_comparison(self, comparison_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get an A/B comparison by ID.
+        
+        Returns:
+            Dict with comparison data or None if not found
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_AB_COMPARISON, (comparison_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                'comparison_id': row[0],
+                'conversation_id': row[1],
+                'user_prompt_mid': row[2],
+                'response_a_mid': row[3],
+                'response_b_mid': row[4],
+                'config_a_id': row[5],
+                'config_b_id': row[6],
+                'is_config_a_first': row[7],
+                'preference': row[8],
+                'preference_ts': row[9].isoformat() if row[9] else None,
+                'created_at': row[10].isoformat() if row[10] else None,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_pending_ab_comparison(self, conversation_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent incomplete A/B comparison for a conversation.
+        
+        Returns:
+            Dict with comparison data or None if no pending comparison
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_PENDING_AB_COMPARISON, (conversation_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                'comparison_id': row[0],
+                'conversation_id': row[1],
+                'user_prompt_mid': row[2],
+                'response_a_mid': row[3],
+                'response_b_mid': row[4],
+                'config_a_id': row[5],
+                'config_b_id': row[6],
+                'is_config_a_first': row[7],
+                'preference': row[8],
+                'preference_ts': row[9].isoformat() if row[9] else None,
+                'created_at': row[10].isoformat() if row[10] else None,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    def delete_ab_comparison(self, comparison_id: int) -> bool:
+        """
+        Delete an A/B comparison (e.g., on abort/failure).
+        
+        Returns:
+            True if a record was deleted, False otherwise
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_DELETE_AB_COMPARISON, (comparison_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            if deleted:
+                logger.info(f"Deleted A/B comparison {comparison_id}")
+            return deleted
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_ab_comparisons_by_conversation(self, conversation_id: int) -> List[Dict[str, Any]]:
+        """
+        Get all A/B comparisons for a conversation.
+        
+        Returns:
+            List of comparison dicts
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_AB_COMPARISONS_BY_CONVERSATION, (conversation_id,))
+            rows = cursor.fetchall()
+            return [
+                {
+                    'comparison_id': row[0],
+                    'conversation_id': row[1],
+                    'user_prompt_mid': row[2],
+                    'response_a_mid': row[3],
+                    'response_b_mid': row[4],
+                    'config_a_id': row[5],
+                    'config_b_id': row[6],
+                    'is_config_a_first': row[7],
+                    'preference': row[8],
+                    'preference_ts': row[9].isoformat() if row[9] else None,
+                    'created_at': row[10].isoformat() if row[10] else None,
+                }
+                for row in rows
+            ]
+        finally:
+            cursor.close()
+            conn.close()
+
+    # =========================================================================
+    # Agent Trace Methods
+    # =========================================================================
+
+    def create_agent_trace(
+        self,
+        conversation_id: int,
+        user_message_id: int,
+        config_id: Optional[int] = None,
+        pipeline_name: Optional[str] = None,
+    ) -> str:
+        """
+        Create a new agent trace record for tracking execution.
+        
+        Returns:
+            The trace_id (UUID string) of the newly created trace
+        """
+        trace_id = str(uuid.uuid4())
+        started_at = datetime.now(timezone.utc)
+        
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                SQL_CREATE_AGENT_TRACE,
+                (trace_id, conversation_id, None, user_message_id,
+                 config_id, pipeline_name, json.dumps([]), started_at, 'running')
+            )
+            conn.commit()
+            logger.info(f"Created agent trace {trace_id} for conversation {conversation_id}")
+            return trace_id
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update_agent_trace(
+        self,
+        trace_id: str,
+        events: List[Dict[str, Any]],
+        status: str = 'running',
+        message_id: Optional[int] = None,
+        total_tool_calls: Optional[int] = None,
+        total_duration_ms: Optional[int] = None,
+        cancelled_by: Optional[str] = None,
+        cancellation_reason: Optional[str] = None,
+    ) -> None:
+        """
+        Update an agent trace with new events and/or status.
+        """
+        completed_at = datetime.now(timezone.utc) if status in ('completed', 'cancelled', 'error') else None
+        
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                SQL_UPDATE_AGENT_TRACE,
+                (json.dumps(events), completed_at, status, message_id,
+                 total_tool_calls, total_duration_ms, cancelled_by, cancellation_reason,
+                 trace_id)
+            )
+            conn.commit()
+            logger.debug(f"Updated agent trace {trace_id}: status={status}")
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_agent_trace(self, trace_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get an agent trace by ID.
+        
+        Returns:
+            Dict with trace data or None if not found
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_AGENT_TRACE, (trace_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                'trace_id': row[0],
+                'conversation_id': row[1],
+                'message_id': row[2],
+                'user_message_id': row[3],
+                'config_id': row[4],
+                'pipeline_name': row[5],
+                'events': row[6],  # Already JSON from JSONB
+                'started_at': row[7].isoformat() if row[7] else None,
+                'completed_at': row[8].isoformat() if row[8] else None,
+                'status': row[9],
+                'total_tool_calls': row[10],
+                'total_tokens_used': row[11],
+                'total_duration_ms': row[12],
+                'cancelled_by': row[13],
+                'cancellation_reason': row[14],
+                'created_at': row[15].isoformat() if row[15] else None,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_trace_by_message(self, message_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get agent trace by the final message ID.
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_TRACE_BY_MESSAGE, (message_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                'trace_id': row[0],
+                'conversation_id': row[1],
+                'message_id': row[2],
+                'user_message_id': row[3],
+                'config_id': row[4],
+                'pipeline_name': row[5],
+                'events': row[6],
+                'started_at': row[7].isoformat() if row[7] else None,
+                'completed_at': row[8].isoformat() if row[8] else None,
+                'status': row[9],
+                'total_tool_calls': row[10],
+                'total_tokens_used': row[11],
+                'total_duration_ms': row[12],
+                'cancelled_by': row[13],
+                'cancellation_reason': row[14],
+                'created_at': row[15].isoformat() if row[15] else None,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_active_trace(self, conversation_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get the currently running trace for a conversation, if any.
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_ACTIVE_TRACE, (conversation_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                'trace_id': row[0],
+                'conversation_id': row[1],
+                'message_id': row[2],
+                'user_message_id': row[3],
+                'config_id': row[4],
+                'pipeline_name': row[5],
+                'events': row[6],
+                'started_at': row[7].isoformat() if row[7] else None,
+                'status': row[8],
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    def cancel_active_traces(
+        self,
+        conversation_id: int,
+        cancelled_by: str = 'user',
+        cancellation_reason: Optional[str] = None,
+    ) -> int:
+        """
+        Cancel all running traces for a conversation.
+        
+        Returns:
+            Number of traces cancelled
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                SQL_CANCEL_ACTIVE_TRACES,
+                (datetime.now(timezone.utc), cancelled_by, cancellation_reason, conversation_id)
+            )
+            count = cursor.rowcount
+            conn.commit()
+            if count > 0:
+                logger.info(f"Cancelled {count} active traces for conversation {conversation_id}")
+            return count
+        finally:
+            cursor.close()
+            conn.close()
+
 
     def query_conversation_history(self, conversation_id, client_id):
         """
@@ -433,28 +855,26 @@ class ChatWrapper:
         is determined by ascending message_id. Each tuple contains the sender and
         the message content
         """
-        # create connection to database
-        self.conn = psycopg2.connect(**self.pg_config)
-        self.cursor = self.conn.cursor()
+        # create connection to database (use local vars for thread safety)
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
 
         # ensure conversation belongs to client before querying
-        self.cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
-        metadata = self.cursor.fetchone()
+        cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+        metadata = cursor.fetchone()
         if metadata is None:
-            self.cursor.close()
-            self.conn.close()
-            self.cursor, self.conn = None, None
+            cursor.close()
+            conn.close()
             raise ConversationAccessError("Conversation does not exist for this client")
 
         # query conversation history
-        self.cursor.execute(SQL_QUERY_CONVO, (conversation_id,))
-        history = self.cursor.fetchall()
-        history = collapse_assistant_sequences(history, sender_name=A2RCHI_SENDER)
+        cursor.execute(SQL_QUERY_CONVO, (conversation_id,))
+        history = cursor.fetchall()
+        history = collapse_assistant_sequences(history, sender_name=ARCHI_SENDER)
 
         # clean up database connection state
-        self.cursor.close()
-        self.conn.close()
-        self.cursor, self.conn = None, None
+        cursor.close()
+        conn.close()
 
         return history
 
@@ -475,17 +895,16 @@ class ChatWrapper:
         # title, created_at, last_message_at, version
         insert_tup = (title, now, now, client_id, version)
 
-        # create connection to database
-        self.conn = psycopg2.connect(**self.pg_config)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute(SQL_CREATE_CONVERSATION, insert_tup)
-        conversation_id = self.cursor.fetchone()[0]
-        self.conn.commit()
+        # create connection to database (use local vars for thread safety)
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        cursor.execute(SQL_CREATE_CONVERSATION, insert_tup)
+        conversation_id = cursor.fetchone()[0]
+        conn.commit()
 
         # clean up database connection state
-        self.cursor.close()
-        self.conn.close()
-        self.cursor, self.conn = None, None
+        cursor.close()
+        conn.close()
 
         logger.info(f"Created new conversation with ID: {conversation_id}")
         return conversation_id
@@ -497,18 +916,17 @@ class ChatWrapper:
         """
         now = datetime.now()
 
-        # create connection to database
-        self.conn = psycopg2.connect(**self.pg_config)
-        self.cursor = self.conn.cursor()
+        # create connection to database (use local vars for thread safety)
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
 
         # update timestamp
-        self.cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP, (now, conversation_id, client_id))
-        self.conn.commit()
+        cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP, (now, conversation_id, client_id))
+        conn.commit()
 
         # clean up database connection state
-        self.cursor.close()
-        self.conn.close()
-        self.cursor, self.conn = None, None
+        cursor.close()
+        conn.close()
 
     def prepare_context_for_storage(self, source_documents, scores):
         scores = scores or []
@@ -533,40 +951,47 @@ class ChatWrapper:
 
         return context
 
-    def insert_conversation(self, conversation_id, user_message, a2rchi_message, link, a2rchi_context, is_refresh=False) -> List[int]:
+    def insert_conversation(self, conversation_id, user_message, archi_message, link, archi_context, is_refresh=False) -> List[int]:
         """
         """
         logger.debug("Entered insert_conversation.")
 
-        service = "Chatbot"
-        # parse user message / a2rchi message
-        user_sender, user_content, user_msg_ts = user_message
-        a2rchi_sender, a2rchi_content, a2rchi_msg_ts = a2rchi_message
+        def _sanitize(text: str) -> str:
+            return text.replace("\x00", "") if isinstance(text, str) else text
 
-        # construct insert_tups
+        service = "Chatbot"
+        # parse user message / archi message
+        user_sender, user_content, user_msg_ts = user_message
+        ARCHI_SENDER, archi_content, archi_msg_ts = archi_message
+
+        user_content = _sanitize(user_content)
+        archi_content = _sanitize(archi_content)
+        link = _sanitize(link)
+        archi_context = _sanitize(archi_context)
+
+        # construct insert_tups with model_used and pipeline_used
+        # Format: (service, conversation_id, sender, content, link, context, ts, model_used, pipeline_used)
         insert_tups = (
             [
-                # (service, conversation_id, sender, content, context, ts)
-                (service, conversation_id, user_sender, user_content, '', '', user_msg_ts, self.config_id),
-                (service, conversation_id, a2rchi_sender, a2rchi_content, link, a2rchi_context, a2rchi_msg_ts, self.config_id),
+                (service, conversation_id, user_sender, user_content, '', '', user_msg_ts, self.current_model_used, self.current_pipeline_used),
+                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, self.current_model_used, self.current_pipeline_used),
             ]
             if not is_refresh
             else [
-                (service, conversation_id, a2rchi_sender, a2rchi_content, link, a2rchi_context, a2rchi_msg_ts, self.config_id),
+                (service, conversation_id, ARCHI_SENDER, archi_content, link, archi_context, archi_msg_ts, self.current_model_used, self.current_pipeline_used),
             ]
         )
 
-        # create connection to database
-        self.conn = psycopg2.connect(**self.pg_config)
-        self.cursor = self.conn.cursor()
-        psycopg2.extras.execute_values(self.cursor, SQL_INSERT_CONVO, insert_tups)
-        self.conn.commit()
-        message_ids = list(map(lambda tup: tup[0], self.cursor.fetchall()))
+        # create connection to database (use local vars for thread safety)
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        psycopg2.extras.execute_values(cursor, SQL_INSERT_CONVO, insert_tups)
+        conn.commit()
+        message_ids = list(map(lambda tup: tup[0], cursor.fetchall()))
 
         # clean up database connection state
-        self.cursor.close()
-        self.conn.close()
-        self.cursor, self.conn = None, None
+        cursor.close()
+        conn.close()
 
         return message_ids
 
@@ -585,208 +1010,364 @@ class ChatWrapper:
             timestamps['vectorstore_update_ts'],
             timestamps['query_convo_history_ts'],
             timestamps['chain_finished_ts'],
-            timestamps['a2rchi_message_ts'],
+            timestamps['archi_message_ts'],
             timestamps['insert_convo_ts'],
             timestamps['finish_call_ts'],
             timestamps['server_response_msg_ts'],
             timestamps['server_response_msg_ts'] - timestamps['server_received_msg_ts']
         )
 
-        # create connection to database
-        self.conn = psycopg2.connect(**self.pg_config)
-        self.cursor = self.conn.cursor()
-        self.cursor.execute(SQL_INSERT_TIMING, insert_tup)
-        self.conn.commit()
+        # create connection to database (use local vars for thread safety)
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        cursor.execute(SQL_INSERT_TIMING, insert_tup)
+        conn.commit()
 
         # clean up database connection state
-        self.cursor.close()
-        self.conn.close()
-        self.cursor, self.conn = None, None
+        cursor.close()
+        conn.close()
 
-    def insert_tool_calls_from_messages(self, conversation_id: int, message_id: int, messages: List) -> None:
+    def insert_tool_calls_from_output(self, conversation_id: int, message_id: int, output: PipelineOutput) -> None:
         """
-        Extract and store agent tool calls from the messages list.
-        
+        Extract and store agent tool calls from the pipeline output.
+
         AIMessage with tool_calls contains the tool name, args, and timestamp.
         ToolMessage contains the result, matched by tool_call_id.
         """
-        if not messages:
+        if not output or not output.messages:
             return
-        
-        tool_results = {}
-        for msg in messages:
-            if hasattr(msg, 'tool_call_id') and msg.tool_call_id:
-                tool_results[msg.tool_call_id] = getattr(msg, 'content', '')
-        
-        # Extract tool calls from AIMessages
-        insert_tups = []
-        step_number = 0
-        for msg in messages:
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                # Get timestamp from response_metadata if available
-                response_metadata = getattr(msg, 'response_metadata', {}) or {}
-                created_at = response_metadata.get('created_at')
+
+        tool_calls = output.extract_tool_calls()
+        if not tool_calls:
+            return
+
+        tool_call_timestamps: Dict[str, datetime] = {}
+        for msg in output.messages:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                response_metadata = getattr(msg, "response_metadata", {}) or {}
+                created_at = response_metadata.get("created_at")
                 if created_at:
                     try:
-                        # Parse ISO format timestamp
-                        ts = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                     except (ValueError, TypeError):
                         ts = datetime.now()
                 else:
                     ts = datetime.now()
-                
+
                 for tc in msg.tool_calls:
-                    step_number += 1
-                    tool_call_id = tc.get('id', '')
-                    tool_name = tc.get('name', 'unknown')
-                    tool_args = tc.get('args', {})
-                    tool_result = tool_results.get(tool_call_id, '')
-                    # Truncate result for storage (max 500 chars)
-                    if len(tool_result) > 500:
-                        tool_result = tool_result[:500] + '...'
-                    
-                    insert_tups.append((
-                        conversation_id,
-                        message_id,
-                        step_number,
-                        tool_name,
-                        json.dumps(tool_args) if tool_args else None,
-                        tool_result,
-                        ts,
-                    ))
+                    tool_call_id = tc.get("id", "")
+                    if tool_call_id and tool_call_id not in tool_call_timestamps:
+                        tool_call_timestamps[tool_call_id] = ts
+
+        insert_tups = []
+        step_number = 0
+        for tc in tool_calls:
+            step_number += 1
+            tool_call_id = tc.get("id", "")
+            tool_name = tc.get("name", "unknown")
+            tool_args = tc.get("args", {})
+            tool_result = tc.get("result", "")
+            if len(tool_result) > 500:
+                tool_result = tool_result[:500] + "..."
+            ts = tool_call_timestamps.get(tool_call_id, datetime.now())
+
+            insert_tups.append((
+                conversation_id,
+                message_id,
+                step_number,
+                tool_name,
+                json.dumps(tool_args) if tool_args else None,
+                tool_result,
+                ts,
+            ))
         
-        if not insert_tups:
-            return
-            
         logger.debug("Inserting %d tool calls for message %d", len(insert_tups), message_id)
 
-        self.conn = psycopg2.connect(**self.pg_config)
-        self.cursor = self.conn.cursor()
-        psycopg2.extras.execute_values(self.cursor, SQL_INSERT_TOOL_CALLS, insert_tups)
-        self.conn.commit()
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        psycopg2.extras.execute_values(cursor, SQL_INSERT_TOOL_CALLS, insert_tups)
+        conn.commit()
 
-        self.cursor.close()
-        self.conn.close()
-        self.cursor, self.conn = None, None
+        cursor.close()
+        conn.close()
+
+    def _init_timestamps(self) -> Dict[str, datetime]:
+        return {
+            "lock_acquisition_ts": datetime.now(),
+            "vectorstore_update_ts": datetime.now(),
+        }
+
+    def _resolve_config_name(self, config_name: Optional[str]) -> str:
+        return config_name or self.current_config_name or self.default_config_name
+
+    def _create_provider_llm(self, provider: str, model: str, api_key: str = None):
+        """
+        Create a LangChain chat model using the provider abstraction layer.
+        
+        Args:
+            provider: Provider type (openai, anthropic, gemini, openrouter, local)
+            model: Model ID/name to use
+            api_key: Optional API key (overrides environment variable)
+        
+        Returns:
+            A LangChain BaseChatModel instance, or None if creation fails
+        """
+        try:
+            from src.archi.providers import get_provider
+
+            # Build provider config from YAML so base_url/mode/default_model are respected
+            cfg = _build_provider_config_from_payload(self.config, ProviderType(provider))
+            provider_instance = get_provider(provider, config=cfg, use_cache=False) if cfg else get_provider(provider)
+            if api_key:
+                provider_instance.set_api_key(api_key)
+            return provider_instance.get_chat_model(model)
+        except ImportError as e:
+            logger.warning(f"Providers module not available: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to create provider LLM {provider}/{model}: {e}")
+            raise
+
+    def _prepare_chat_context(
+        self,
+        message: List[str],
+        conversation_id: int | None,
+        client_id: str,
+        is_refresh: bool,
+        server_received_msg_ts: datetime,
+        client_sent_msg_ts: float,
+        client_timeout: float,
+        timestamps: Dict[str, datetime],
+    ) -> tuple[Optional[ChatRequestContext], Optional[int]]:
+        if not client_id:
+            raise ValueError("client_id is required to process chat messages")
+        sender, content = tuple(message[0])
+
+        if conversation_id is None:
+            conversation_id = self.create_conversation(content, client_id)
+            history = []
+        else:
+            history = self.query_conversation_history(conversation_id, client_id)
+            self.update_conversation_timestamp(conversation_id, client_id)
+
+        timestamps["query_convo_history_ts"] = datetime.now()
+
+        if is_refresh:
+            while history and history[-1][0] == ARCHI_SENDER:
+                _ = history.pop(-1)
+
+        if server_received_msg_ts.timestamp() - client_sent_msg_ts > client_timeout:
+            return None, 408
+
+        if not is_refresh:
+            history = history + [(sender, content)]
+
+        if len(history) >= QUERY_LIMIT:
+            return None, 500
+
+        return (
+            ChatRequestContext(
+                sender=sender,
+                content=content,
+                conversation_id=conversation_id,
+                history=history,
+                is_refresh=is_refresh,
+            ),
+            None,
+        )
+
+    def _message_content(self, message) -> str:
+        content = getattr(message, "content", "")
+        if isinstance(content, list):
+            content = " ".join(str(part) for part in content)
+        return str(content)
+
+    def _truncate_text(self, text: str, max_chars: int) -> str:
+        if max_chars and len(text) > max_chars:
+            return text[: max_chars - 3].rstrip() + "..."
+        return text
+
+    def _stream_events_from_output(
+        self,
+        output,
+        *,
+        include_agent_steps: bool,
+        include_tool_steps: bool,
+        conversation_id: int,
+        max_chars: int = 800,
+    ) -> List[Dict[str, Any]]:
+        messages = getattr(output, "messages", []) or []
+        if not messages:
+            return []
+        message = messages[-1]
+        events: List[Dict[str, Any]] = []
+        msg_type = str(getattr(message, "type", "")).lower()
+
+        if include_tool_steps and hasattr(message, "tool_calls") and message.tool_calls:
+            for tool_call in message.tool_calls:
+                tool_name = tool_call.get("name", "unknown")
+                tool_args = tool_call.get("args", {})
+                events.append(
+                    {
+                        "type": "step",
+                        "step_type": "tool_call",
+                        "tool_name": tool_name,
+                        "tool_args": tool_args,
+                        "tool_call_id": tool_call.get("id", ""),
+                        "content": self._truncate_text(f"{tool_name}({tool_args})", max_chars),
+                        "conversation_id": conversation_id,
+                    }
+                )
+
+        if include_tool_steps and getattr(message, "tool_call_id", None):
+            events.append(
+                {
+                    "type": "step",
+                    "step_type": "tool_result",
+                    "tool_call_id": message.tool_call_id,
+                    "content": self._truncate_text(self._message_content(message), max_chars),
+                    "conversation_id": conversation_id,
+                }
+            )
+
+        content = self._message_content(message) if msg_type in {"ai", "assistant"} else ""
+        handled_tool_call = False
+        if include_tool_steps and content:
+            tool_match = re.match(r"^\s*([\w.-]+)\[ARGS\](.*)$", content, re.DOTALL)
+            if tool_match:
+                tool_name = tool_match.group(1)
+                tool_args_raw = tool_match.group(2).strip()
+                events.append(
+                    {
+                        "type": "step",
+                        "step_type": "tool_call",
+                        "tool_name": tool_name,
+                        "tool_args": tool_args_raw,
+                        "tool_call_id": "",
+                        "content": self._truncate_text(content, max_chars),
+                        "conversation_id": conversation_id,
+                    }
+                )
+                handled_tool_call = True
+
+        if include_agent_steps and content and not handled_tool_call:
+            events.append(
+                {
+                    "type": "step",
+                    "step_type": "agent",
+                    "content": content,
+                    "conversation_id": conversation_id,
+                }
+            )
+
+        return events
+
+    def _finalize_result(
+        self,
+        result,
+        *,
+        context: ChatRequestContext,
+        server_received_msg_ts: datetime,
+        timestamps: Dict[str, datetime],
+        render_markdown: bool = True,
+    ) -> tuple[str, List[int]]:
+        # For streaming responses, return raw markdown (client renders with marked.js)
+        # For non-streaming responses, render server-side with Mistune
+        if render_markdown:
+            output = self.format_code_in_text(result["answer"])
+        else:
+            output = result["answer"]
+
+        documents = result.get("source_documents", [])
+        scores = result.get("metadata", {}).get("retriever_scores", [])
+        top_sources = self.get_top_sources(documents, scores)
+        
+        # Use markdown links for client-side rendering, HTML for server-side
+        if render_markdown:
+            output += self.format_links(top_sources)
+        else:
+            output += self.format_links_markdown(top_sources)
+
+        timestamps["archi_message_ts"] = datetime.now()
+        context_data = self.prepare_context_for_storage(documents, scores)
+
+        best_reference = "Link unavailable"
+        if top_sources:
+            primary_source = top_sources[0]
+            best_reference = primary_source["link"] or primary_source["display"]
+
+        user_message = (context.sender, context.content, server_received_msg_ts)
+        archi_message = (ARCHI_SENDER, output, timestamps["archi_message_ts"])
+        message_ids = self.insert_conversation(
+            context.conversation_id,
+            user_message,
+            archi_message,
+            best_reference,
+            context_data,
+            context.is_refresh,
+        )
+        timestamps["insert_convo_ts"] = datetime.now()
+        context.history.append((ARCHI_SENDER, result["answer"]))
+
+        agent_messages = getattr(result, "messages", []) or []
+        if agent_messages:
+            logger.debug("Agent messages count: %d", len(agent_messages))
+            for i, msg in enumerate(agent_messages):
+                msg_type = type(msg).__name__
+                has_tool_calls = hasattr(msg, "tool_calls") and msg.tool_calls
+                has_tool_call_id = hasattr(msg, "tool_call_id") and msg.tool_call_id
+                logger.debug(
+                    "  Message %d: %s, tool_calls=%s, tool_call_id=%s",
+                    i,
+                    msg_type,
+                    has_tool_calls,
+                    has_tool_call_id,
+                )
+        if agent_messages and message_ids:
+            archi_message_id = message_ids[-1]
+            self.insert_tool_calls_from_output(context.conversation_id, archi_message_id, result)
+
+        return output, message_ids
 
     def __call__(self, message: List[str], conversation_id: int|None, client_id: str, is_refresh: bool, server_received_msg_ts: datetime,  client_sent_msg_ts: float, client_timeout: float, config_name: str):
         """
         Execute the chat functionality.
         """
-        # store timestamps for code profiling information
-        start_time = time.time()
-
-        timestamps = {}
-
-        self.lock.acquire()
-        timestamps['lock_acquisition_ts'] = datetime.now()
-        try:
-            # update vector store through data manager; will only do something if newwhere files have been added
-            logger.info("Acquired lock file update vectorstore")
-
-            self.data_manager.update_vectorstore()
-            timestamps['vectorstore_update_ts'] = datetime.now()
-
-        except Exception as e:
-            # NOTE: we log the error message but do not return here, as a failure
-            # to update the data manager does not necessarily mean A2rchi cannot
-            # process and respond to the message
-            logger.error(f"Failed to update vectorstore - {str(e)}")
-
-        finally:
-            self.lock.release()
-            logger.info("Released lock file update vectorstore")
+        timestamps = self._init_timestamps()
+        output = None
+        message_ids = None
+        context = None
 
         try:
-            # convert the message to native A2rchi form (because javascript does not have tuples)
-            sender, content = tuple(message[0])
+            context, error_code = self._prepare_chat_context(
+                message,
+                conversation_id,
+                client_id,
+                is_refresh,
+                server_received_msg_ts,
+                client_sent_msg_ts,
+                client_timeout,
+                timestamps,
+            )
+            if error_code is not None:
+                return None, None, None, timestamps, error_code
 
-            if not client_id:
-                raise ValueError("client_id is required to process chat messages")
+            requested_config = self._resolve_config_name(config_name)
+            self.update_config(config_name=requested_config)
 
-            # new conversation if conversation_id is None, otherwise use existing
-            if conversation_id is None:
-                conversation_id = self.create_conversation(content, client_id)
-                history = []
-            else:
-                history = self.query_conversation_history(conversation_id, client_id)
-                self.update_conversation_timestamp(conversation_id, client_id)
-
-            timestamps['query_convo_history_ts'] = datetime.now()
-
-            # if this is a chat refresh / message regeneration; remove previous contiuous non-A2rchi message(s)
-            if is_refresh:
-                while history and history[-1][0] == A2RCHI_SENDER:
-                    _ = history.pop(-1)
-
-            # guard call to LLM; if timestamp from message is more than timeout secs in the past;
-            # return error=True and do not generate response as the client will have timed out
-            if server_received_msg_ts.timestamp() - client_sent_msg_ts > client_timeout:
-                return None, None, None, timestamps, 408
-
-            # run chain to get result; limit users to 1000 queries per conversation; refreshing browser starts new conversation
-            if len(history) < QUERY_LIMIT:
-                history = history + [(sender, content)] if not is_refresh else history
-                requested_config = config_name or self.current_config_name or self.default_config_name
-                self.update_config(config_name=requested_config)
-                result = self.a2rchi(history=history, conversation_id=conversation_id)
-                timestamps['chain_finished_ts'] = datetime.now()
-            else:
-                # for now let's return a timeout error, as returning a different
-                # error message would require handling new message_ids param. properly
-                return None, None, None, timestamps, 500
+            result = self.archi(history=context.history, conversation_id=context.conversation_id)
+            timestamps["chain_finished_ts"] = datetime.now()
 
             # keep track of total number of queries and log this amount
             self.number_of_queries += 1
             logger.info(f"Number of queries is: {self.number_of_queries}")
 
-            # display answer
-            output = self.format_code_in_text(result["answer"])
-
-
-            # display sources (links or ticket references)
-            documents = result.get("source_documents", [])
-            scores = result.get("metadata", {}).get("retriever_scores", [])
-            top_sources = self.get_top_sources(documents, scores)
-            output += self.format_links(top_sources)
-
-            # message is constructed!
-            timestamps['a2rchi_message_ts'] = datetime.now()
-
-            # formatting context
-            context = self.prepare_context_for_storage(documents, scores)
-
-            best_reference = "Link unavailable"
-            if top_sources:
-                primary_source = top_sources[0]
-                best_reference = primary_source["link"] or primary_source["display"]
-
-            # and now finally insert the conversation
-            user_message = (sender, content, server_received_msg_ts)
-            a2rchi_message = (A2RCHI_SENDER, output, timestamps['a2rchi_message_ts'])
-            message_ids = self.insert_conversation(
-                conversation_id,
-                user_message,
-                a2rchi_message,
-                best_reference,
-                context,
-                is_refresh
+            output, message_ids = self._finalize_result(
+                result,
+                context=context,
+                server_received_msg_ts=server_received_msg_ts,
+                timestamps=timestamps,
             )
-            timestamps['insert_convo_ts'] = datetime.now()
-            history.append((A2RCHI_SENDER, result["answer"]))
-            
-            # insert tool calls extracted from messages
-            agent_messages = getattr(result, 'messages', []) or []
-            logger.debug("Agent messages count: %d", len(agent_messages))
-            for i, msg in enumerate(agent_messages):
-                msg_type = type(msg).__name__
-                has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
-                has_tool_call_id = hasattr(msg, 'tool_call_id') and msg.tool_call_id
-                logger.debug("  Message %d: %s, tool_calls=%s, tool_call_id=%s", 
-                           i, msg_type, has_tool_calls, has_tool_call_id)
-            if agent_messages and message_ids:
-                a2rchi_message_id = message_ids[-1]  # A2rchi's response is the last message
-                self.insert_tool_calls_from_messages(conversation_id, a2rchi_message_id, agent_messages)
 
         except ConversationAccessError as e:
             logger.warning(f"Unauthorized conversation access attempt: {e}")
@@ -804,7 +1385,295 @@ class ChatWrapper:
 
         timestamps['finish_call_ts'] = datetime.now()
 
-        return output, conversation_id, message_ids, timestamps, None
+        return output, context.conversation_id if context else None, message_ids, timestamps, None
+
+    def stream(
+        self,
+        message: List[str],
+        conversation_id: int | None,
+        client_id: str,
+        is_refresh: bool,
+        server_received_msg_ts: datetime,
+        client_sent_msg_ts: float,
+        client_timeout: float,
+        config_name: str,
+        *,
+        include_agent_steps: bool = True,
+        include_tool_steps: bool = True,
+        max_step_chars: int = 800,
+        provider: str = None,
+        model: str = None,
+        provider_api_key: str = None,
+    ) -> Iterator[Dict[str, Any]]:
+        timestamps = self._init_timestamps()
+        context = None
+        last_output = None
+        last_streamed_text = ""
+        trace_id = None
+        trace_events: List[Dict[str, Any]] = []
+        tool_call_count = 0
+        stream_start_time = time.time()
+
+        try:
+            context, error_code = self._prepare_chat_context(
+                message,
+                conversation_id,
+                client_id,
+                is_refresh,
+                server_received_msg_ts,
+                client_sent_msg_ts,
+                client_timeout,
+                timestamps,
+            )
+            if error_code is not None:
+                error_message = "server error; see chat logs for message"
+                if error_code == 408:
+                    error_message = "client timeout"
+                elif error_code == 403:
+                    error_message = "conversation not found"
+                yield {"type": "error", "status": error_code, "message": error_message}
+                return
+
+            requested_config = self._resolve_config_name(config_name)
+            self.update_config(config_name=requested_config)
+            
+            # If provider and model are specified, override the pipeline's LLM
+            if provider and model:
+                try:
+                    override_llm = self._create_provider_llm(provider, model, provider_api_key)
+                    if override_llm and hasattr(self.archi, 'pipeline') and hasattr(self.archi.pipeline, 'agent_llm'):
+                        original_llm = self.archi.pipeline.agent_llm
+                        self.archi.pipeline.agent_llm = override_llm
+                        # Force agent refresh to use new LLM
+                        if hasattr(self.archi.pipeline, 'refresh_agent'):
+                            self.archi.pipeline.refresh_agent(force=True)
+                        logger.info(f"Overrode pipeline LLM with {provider}/{model}")
+                except Exception as e:
+                    logger.warning(f"Failed to create provider LLM {provider}/{model}: {e}")
+                    yield {"type": "warning", "message": f"Using default model: {e}"}
+            
+            # Create trace for this streaming request
+            trace_id = self.create_agent_trace(
+                conversation_id=context.conversation_id,
+                user_message_id=None,  # Will be updated at finalization
+                config_id=None,  # Legacy field, no longer used
+                pipeline_name=self.archi.pipeline_name if hasattr(self.archi, 'pipeline_name') else None,
+            )
+
+            for output in self.archi.stream(history=context.history, conversation_id=context.conversation_id):
+                last_output = output
+                
+                # Extract event_type from metadata (new structured events from BaseReActAgent)
+                event_type = output.metadata.get("event_type", "text") if output.metadata else "text"
+                timestamp = datetime.now(timezone.utc).isoformat()
+                
+                # Handle different event types
+                if event_type == "tool_start":
+                    tool_messages = getattr(output, "messages", []) or []
+                    tool_message = tool_messages[0] if tool_messages else None
+                    tool_calls = getattr(tool_message, "tool_calls", None) if tool_message else None
+                    if tool_calls:
+                        for tool_call in tool_calls:
+                            tool_call_count += 1
+                            trace_event = {
+                                "type": "tool_start",
+                                "tool_call_id": tool_call.get("id", ""),
+                                "tool_name": tool_call.get("name", "unknown"),
+                                "tool_args": tool_call.get("args", {}),
+                                "timestamp": timestamp,
+                                "conversation_id": context.conversation_id,
+                            }
+                            trace_events.append(trace_event)
+                            if include_tool_steps:
+                                yield trace_event
+                        
+                elif event_type == "tool_output":
+                    tool_messages = getattr(output, "messages", []) or []
+                    tool_message = tool_messages[0] if tool_messages else None
+                    tool_output = self._message_content(tool_message) if tool_message else ""
+                    truncated = len(tool_output) > max_step_chars
+                    full_length = len(tool_output) if truncated else None
+                    display_output = self._truncate_text(tool_output, max_step_chars)
+                    
+                    trace_event = {
+                        "type": "tool_output",
+                        "tool_call_id": getattr(tool_message, "tool_call_id", "") if tool_message else "",
+                        "output": display_output,
+                        "truncated": truncated,
+                        "full_length": full_length,
+                        "timestamp": timestamp,
+                        "conversation_id": context.conversation_id,
+                    }
+                    trace_events.append(trace_event)
+                    if include_tool_steps:
+                        yield trace_event
+                        
+                elif event_type == "tool_end":
+                    trace_event = {
+                        "type": "tool_end",
+                        "tool_call_id": output.metadata.get("tool_call_id", ""),
+                        "status": output.metadata.get("status", "success"),
+                        "duration_ms": output.metadata.get("duration_ms"),
+                        "timestamp": timestamp,
+                        "conversation_id": context.conversation_id,
+                    }
+                    trace_events.append(trace_event)
+                    if include_tool_steps:
+                        yield trace_event
+                        
+                elif event_type == "text":
+                    # Stream text content
+                    content = getattr(output, "answer", "") or ""
+                    if content and include_agent_steps:
+                        last_streamed_text = content
+                        yield {
+                            "type": "chunk",
+                            "content": content,
+                            "accumulated": True,
+                            "conversation_id": context.conversation_id,
+                        }
+                    # Record text event in trace
+                    if content:
+                        trace_events.append({
+                            "type": "text",
+                            "content": content,
+                            "timestamp": timestamp,
+                        })
+                        
+                elif event_type == "final":
+                    # Final event handled below after loop
+                    pass
+                else:
+                    # Fallback: legacy event handling for non-agent pipelines
+                    if getattr(output, "final", False):
+                        continue
+                    for event in self._stream_events_from_output(
+                        output,
+                        include_agent_steps=False,
+                        include_tool_steps=include_tool_steps,
+                        conversation_id=context.conversation_id,
+                        max_chars=max_step_chars,
+                    ):
+                        yield event
+
+                    if include_agent_steps:
+                        content = getattr(output, "answer", "") or ""
+                        if content:
+                            if content.startswith(last_streamed_text):
+                                delta = content[len(last_streamed_text):]
+                            else:
+                                delta = content
+                            last_streamed_text = content
+                            chunk_size = 80
+                            for i in range(0, len(delta), chunk_size):
+                                yield {
+                                    "type": "chunk",
+                                    "content": delta[i:i + chunk_size],
+                                    "conversation_id": context.conversation_id,
+                                }
+
+            timestamps["chain_finished_ts"] = datetime.now()
+
+            if last_output is None:
+                if trace_id:
+                    self.update_agent_trace(
+                        trace_id=trace_id,
+                        events=trace_events,
+                        status='error',
+                        cancelled_by='system',
+                        cancellation_reason='No output from pipeline',
+                    )
+                yield {"type": "error", "status": 500, "message": "server error; see chat logs for message"}
+                return
+                
+            # keep track of total number of queries and log this amount
+            self.number_of_queries += 1
+            logger.info(f"Number of queries is: {self.number_of_queries}")
+
+            output, message_ids = self._finalize_result(
+                last_output,
+                context=context,
+                server_received_msg_ts=server_received_msg_ts,
+                timestamps=timestamps,
+                render_markdown=False,  # Client renders with marked.js
+            )
+
+            timestamps["finish_call_ts"] = datetime.now()
+            timestamps["server_received_msg_ts"] = server_received_msg_ts
+            timestamps["client_sent_msg_ts"] = datetime.fromtimestamp(client_sent_msg_ts)
+            timestamps["server_response_msg_ts"] = datetime.now()
+
+            if message_ids:
+                self.insert_timing(message_ids[-1], timestamps)
+                
+            # Calculate total duration
+            total_duration_ms = int((time.time() - stream_start_time) * 1000)
+            
+            # Update trace with final state
+            if trace_id:
+                user_message_id = message_ids[0] if message_ids and len(message_ids) > 1 else None
+                self.update_agent_trace(
+                    trace_id=trace_id,
+                    events=trace_events,
+                    status='completed',
+                    message_id=message_ids[-1] if message_ids else None,
+                    total_tool_calls=tool_call_count,
+                    total_duration_ms=total_duration_ms,
+                )
+
+            yield {
+                "type": "final",
+                "response": output,
+                "conversation_id": context.conversation_id,
+                "archi_msg_id": message_ids[-1] if message_ids else None,
+                "message_id": message_ids[-1] if message_ids else None,
+                "user_message_id": message_ids[0] if message_ids and len(message_ids) > 1 else None,
+                "trace_id": trace_id,
+                "server_response_msg_ts": timestamps["server_response_msg_ts"].timestamp(),
+                "final_response_msg_ts": datetime.now().timestamp(),
+            }
+
+        except GeneratorExit:
+            # User cancelled the stream
+            if trace_id:
+                total_duration_ms = int((time.time() - stream_start_time) * 1000)
+                self.update_agent_trace(
+                    trace_id=trace_id,
+                    events=trace_events,
+                    status='cancelled',
+                    total_tool_calls=tool_call_count,
+                    total_duration_ms=total_duration_ms,
+                    cancelled_by='user',
+                    cancellation_reason='Stream cancelled by client',
+                )
+            raise
+        except ConversationAccessError as exc:
+            logger.warning("Unauthorized conversation access attempt: %s", exc)
+            if trace_id:
+                self.update_agent_trace(
+                    trace_id=trace_id,
+                    events=trace_events,
+                    status='error',
+                    cancelled_by='system',
+                    cancellation_reason=str(exc),
+                )
+            yield {"type": "error", "status": 403, "message": "conversation not found"}
+        except Exception as exc:
+            logger.error("Failed to stream response: %s", exc, exc_info=True)
+            if trace_id:
+                self.update_agent_trace(
+                    trace_id=trace_id,
+                    events=trace_events,
+                    status='error',
+                    cancelled_by='system',
+                    cancellation_reason=str(exc),
+                )
+            yield {"type": "error", "status": 500, "message": "server error; see chat logs for message"}
+        finally:
+            if self.cursor is not None:
+                self.cursor.close()
+            if self.conn is not None:
+                self.conn.close()
 
 
 class FlaskAppWrapper(object):
@@ -813,30 +1682,27 @@ class FlaskAppWrapper(object):
         logger.info("Entering FlaskAppWrapper")
         self.app = app
         self.configs(**configs)
-        self.config = load_config()
+        self.config = get_full_config()
         self.global_config = self.config["global"]
-        self.utils_config = self.config["utils"]
         self.services_config = self.config["services"]
         self.chat_app_config = self.config["services"]["chat_app"]
         self.data_path = self.global_config["DATA_PATH"]
-        self.persistence = PersistenceService(self.data_path)
-        self.catalog = CatalogService(self.data_path)
-
         self.salt = read_secret("UPLOADER_SALT")
-        self.app.secret_key = read_secret("FLASK_UPLOADER_APP_SECRET_KEY")
-        self.app.config['UPLOAD_FOLDER'] = os.path.join(self.data_path, "manual_uploads")
-        self.app.config['WEBSITE_FOLDER'] = os.path.join(self.data_path, "manual_websites")
+        secret_key = read_secret("FLASK_UPLOADER_APP_SECRET_KEY")
+        if not secret_key:
+            logger.warning("FLASK_UPLOADER_APP_SECRET_KEY not found, generating a random secret key")
+            import secrets
+            secret_key = secrets.token_hex(32)
+        self.app.secret_key = secret_key
+        
+        # Session cookie security settings (BYOK security hardening)
+        self.app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JavaScript access
+        self.app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # CSRF protection
+        # SESSION_COOKIE_SECURE should be True in production (HTTPS only)
+        # Leave it False for local development to work over HTTP
+        
         self.app.config['ACCOUNTS_FOLDER'] = self.global_config["ACCOUNTS_PATH"]
-        self.app.config['WEBLISTS_FOLDER'] = os.path.join(self.data_path, "websites")
-
-        # create upload and accounts folders if they don't already exist
-        os.makedirs(self.app.config['UPLOAD_FOLDER'], exist_ok=True)
-        os.makedirs(self.app.config['WEBSITE_FOLDER'], exist_ok=True)
         os.makedirs(self.app.config['ACCOUNTS_FOLDER'], exist_ok=True)
-
-        # create path specifying URL sources for scraping
-        self.sources_path = os.path.join(self.data_path, 'index.yaml')
-        self.scraper_manager = ScraperManager()
 
         # store postgres connection info
         self.pg_config = {
@@ -846,6 +1712,18 @@ class FlaskAppWrapper(object):
         self.conn = None
         self.cursor = None
 
+        # Initialize authentication methods
+        self.oauth = None
+        auth_config = self.chat_app_config.get('auth', {})
+        self.auth_enabled = auth_config.get('enabled', False)
+        self.sso_enabled = auth_config.get('sso', {}).get('enabled', False)
+        self.basic_auth_enabled = auth_config.get('basic', {}).get('enabled', False)
+        
+        logger.info(f"Auth enabled: {self.auth_enabled}, SSO: {self.sso_enabled}, Basic: {self.basic_auth_enabled}")
+        
+        if self.sso_enabled:
+            self._setup_sso()
+
         # create the chat from the wrapper and ensure default config is active
         self.chat = ChatWrapper()
         self.chat.update_config(config_name=self.config["name"])
@@ -854,41 +1732,219 @@ class FlaskAppWrapper(object):
         CORS(self.app)
 
         # add endpoints for flask app
-        self.add_endpoint('/api/get_chat_response', 'get_chat_response', self.get_chat_response, methods=["POST"])
-        self.add_endpoint('/', '', self.index)
-        self.add_endpoint('/terms', 'terms', self.terms)
-        self.add_endpoint('/api/like', 'like', self.like,  methods=["POST"])
-        self.add_endpoint('/api/dislike', 'dislike', self.dislike,  methods=["POST"])
-        self.add_endpoint('/api/text_feedback', 'text_feedback', self.text_feedback, methods=["POST"])
-        self.add_endpoint('/api/update_config', 'update_config', self.update_config, methods=["POST"])
+        # Public endpoints (no auth required)
+        self.add_endpoint('/', 'landing', self.landing)
         self.add_endpoint('/api/health', 'health', self.health, methods=["GET"])
-        self.add_endpoint('/api/get_configs', 'get_configs', self.get_configs, methods=["GET"])
-
-        # conditionally add ChromaDB endpoints based on config
-        if self.chat_app_config.get('enable_debug_chroma_endpoints', False):
-            logger.info("Adding ChromaDB API endpoints (list_docs, search_docs)")
-            self.add_endpoint('/api/list_docs', 'list_docs', self.list_docs, methods=["GET"])
-            self.add_endpoint('/api/search_docs', 'search_docs', self.search_docs, methods=["POST"])
-        else:
-            logger.info("ChromaDB API endpoints disabled by config")
+        
+        # Protected endpoints (require auth when enabled)
+        self.add_endpoint('/chat', 'index', self.require_auth(self.index))
+        self.add_endpoint('/api/get_chat_response', 'get_chat_response', self.require_auth(self.get_chat_response), methods=["POST"])
+        self.add_endpoint('/api/get_chat_response_stream', 'get_chat_response_stream', self.require_auth(self.get_chat_response_stream), methods=["POST"])
+        self.add_endpoint('/terms', 'terms', self.require_auth(self.terms))
+        self.add_endpoint('/api/like', 'like', self.require_auth(self.like),  methods=["POST"])
+        self.add_endpoint('/api/dislike', 'dislike', self.require_auth(self.dislike),  methods=["POST"])
+        self.add_endpoint('/api/update_config', 'update_config', self.require_auth(self.update_config), methods=["POST"])
+        self.add_endpoint('/api/get_configs', 'get_configs', self.require_auth(self.get_configs), methods=["GET"])
+        self.add_endpoint('/api/text_feedback', 'text_feedback', self.require_auth(self.text_feedback), methods=["POST"])
 
         # endpoints for conversations managing
         logger.info("Adding conversations management API endpoints")
-        self.add_endpoint('/api/list_conversations', 'list_conversations', self.list_conversations, methods=["GET"])
-        self.add_endpoint('/api/load_conversation', 'load_conversation', self.load_conversation, methods=["POST"])
-        self.add_endpoint('/api/new_conversation', 'new_conversation', self.new_conversation, methods=["POST"])
-        self.add_endpoint('/api/delete_conversation', 'delete_conversation', self.delete_conversation, methods=["POST"])
+        self.add_endpoint('/api/list_conversations', 'list_conversations', self.require_auth(self.list_conversations), methods=["GET"])
+        self.add_endpoint('/api/load_conversation', 'load_conversation', self.require_auth(self.load_conversation), methods=["POST"])
+        self.add_endpoint('/api/new_conversation', 'new_conversation', self.require_auth(self.new_conversation), methods=["POST"])
+        self.add_endpoint('/api/delete_conversation', 'delete_conversation', self.require_auth(self.delete_conversation), methods=["POST"])
 
-        # add endpoints for document_index
-        self.add_endpoint('/document_index/', 'document_index', self.document_index)
-        self.add_endpoint('/document_index/index', 'index', self.document_index)
-        self.add_endpoint('/document_index/login', 'login', self.login, methods=['GET', 'POST'])
-        self.add_endpoint('/document_index/logout', 'logout', self.logout)
-        self.add_endpoint('/document_index/upload', 'upload', self.upload, methods=['POST'])
-        self.add_endpoint('/document_index/delete/<file_hash>', 'delete', self.delete)
-        self.add_endpoint('/document_index/delete_source/<source_type>', 'delete_source', self.delete_source)
-        self.add_endpoint('/document_index/upload_url', 'upload_url', self.upload_url, methods=['POST'])
-        self.add_endpoint('/document_index/load_document/<path:file_hash>', 'load_document', self.load_document)
+        # A/B testing endpoints
+        logger.info("Adding A/B testing API endpoints")
+        self.add_endpoint('/api/ab/create', 'ab_create', self.require_auth(self.ab_create_comparison), methods=["POST"])
+        self.add_endpoint('/api/ab/preference', 'ab_preference', self.require_auth(self.ab_submit_preference), methods=["POST"])
+        self.add_endpoint('/api/ab/pending', 'ab_pending', self.require_auth(self.ab_get_pending), methods=["GET"])
+
+        # Agent trace endpoints
+        logger.info("Adding agent trace API endpoints")
+        self.add_endpoint('/api/trace/<trace_id>', 'get_trace', self.require_auth(self.get_trace), methods=["GET"])
+        self.add_endpoint('/api/trace/message/<int:message_id>', 'get_trace_by_message', self.require_auth(self.get_trace_by_message), methods=["GET"])
+        self.add_endpoint('/api/cancel_stream', 'cancel_stream', self.require_auth(self.cancel_stream), methods=["POST"])
+
+        # Provider endpoints
+        logger.info("Adding provider API endpoints")
+        self.add_endpoint('/api/providers', 'get_providers', self.require_auth(self.get_providers), methods=["GET"])
+        self.add_endpoint('/api/providers/models', 'get_provider_models', self.require_auth(self.get_provider_models), methods=["GET"])
+        self.add_endpoint('/api/providers/validate', 'validate_provider', self.require_auth(self.validate_provider), methods=["POST"])
+        self.add_endpoint('/api/providers/keys', 'get_provider_api_keys', self.require_auth(self.get_provider_api_keys), methods=["GET"])
+        self.add_endpoint('/api/providers/keys/set', 'set_provider_api_key', self.require_auth(self.set_provider_api_key), methods=["POST"])
+        self.add_endpoint('/api/providers/keys/clear', 'clear_provider_api_key', self.require_auth(self.clear_provider_api_key), methods=["POST"])
+        self.add_endpoint('/api/pipeline/default_model', 'get_pipeline_default_model', self.require_auth(self.get_pipeline_default_model), methods=["GET"])
+        self.add_endpoint('/api/agent/info', 'get_agent_info', self.require_auth(self.get_agent_info), methods=["GET"])
+
+        # Data viewer endpoints
+        logger.info("Adding data viewer API endpoints")
+        self.add_endpoint('/data', 'data_viewer', self.require_auth(self.data_viewer_page))
+        self.add_endpoint('/api/data/documents', 'list_data_documents', self.require_auth(self.list_data_documents), methods=["GET"])
+        self.add_endpoint('/api/data/documents/<document_hash>/content', 'get_data_document_content', self.require_auth(self.get_data_document_content), methods=["GET"])
+        self.add_endpoint('/api/data/documents/<document_hash>/enable', 'enable_data_document', self.require_auth(self.enable_data_document), methods=["POST"])
+        self.add_endpoint('/api/data/documents/<document_hash>/disable', 'disable_data_document', self.require_auth(self.disable_data_document), methods=["POST"])
+        self.add_endpoint('/api/data/bulk-enable', 'bulk_enable_documents', self.require_auth(self.bulk_enable_documents), methods=["POST"])
+        self.add_endpoint('/api/data/bulk-disable', 'bulk_disable_documents', self.require_auth(self.bulk_disable_documents), methods=["POST"])
+        self.add_endpoint('/api/data/stats', 'get_data_stats', self.require_auth(self.get_data_stats), methods=["GET"])
+
+        # add unified auth endpoints
+        if self.auth_enabled:
+            logger.info("Adding unified authentication endpoints")
+            self.add_endpoint('/login', 'login', self.login, methods=['GET', 'POST'])
+            self.add_endpoint('/logout', 'logout', self.logout)
+            self.add_endpoint('/auth/user', 'get_user', self.get_user, methods=['GET'])
+            
+            if self.sso_enabled:
+                self.add_endpoint('/redirect', 'sso_callback', self.sso_callback)
+
+    def _setup_sso(self):
+        """Initialize OAuth client for SSO using OpenID Connect"""
+        auth_config = self.chat_app_config.get('auth', {})
+        sso_config = auth_config.get('sso', {})
+        
+        # Read client credentials from environment
+        client_id = read_secret('SSO_CLIENT_ID')
+        client_secret = read_secret('SSO_CLIENT_SECRET')
+        
+        if not client_id or not client_secret:
+            logger.error("SSO is enabled but SSO_CLIENT_ID or SSO_CLIENT_SECRET environment variables are not set")
+            self.sso_enabled = False
+            return
+        
+        # Initialize OAuth
+        self.oauth = OAuth(self.app)
+        
+        # Get server metadata URL and client kwargs from config
+        server_metadata_url = sso_config.get('server_metadata_url', '')
+        authorize_url = sso_config.get('authorize_url', None)
+        client_kwargs = sso_config.get('client_kwargs', {'scope': 'openid profile email'})
+        
+        # Register the OAuth provider
+        self.oauth.register(
+            name='sso',
+            client_id=client_id,
+            client_secret=client_secret,
+            server_metadata_url=server_metadata_url,
+            authorize_url=authorize_url,
+            client_kwargs=client_kwargs
+        )
+        
+        logger.info(f"SSO configured with server: {server_metadata_url}")
+
+    def login(self):
+        """Unified login endpoint supporting multiple auth methods"""
+        # If user is already logged in, redirect to index
+        if session.get('logged_in'):
+            return redirect(url_for('index'))
+        
+        # Handle SSO login initiation
+        if request.args.get('method') == 'sso' and self.sso_enabled:
+            if not self.oauth:
+                return jsonify({'error': 'SSO not configured'}), 400
+            redirect_uri = url_for('sso_callback', _external=True)
+            logger.info(f"Initiating SSO login with redirect URI: {redirect_uri}")
+            return self.oauth.sso.authorize_redirect(redirect_uri)
+        
+        # Handle basic auth login form submission
+        if request.method == 'POST' and self.basic_auth_enabled:
+            username = request.form.get('username')
+            password = request.form.get('password')
+            
+            if check_credentials(username, password, self.salt, self.app.config['ACCOUNTS_FOLDER']):
+                session['user'] = {
+                    'email': username,
+                    'name': username,
+                    'username': username
+                }
+                session['logged_in'] = True
+                session['auth_method'] = 'basic'
+                logger.info(f"Basic auth login successful for user: {username}")
+                return redirect(url_for('index'))
+            else:
+                flash('Invalid credentials')
+        
+        # Render login page with available auth methods
+        return render_template('login.html', 
+                             sso_enabled=self.sso_enabled, 
+                             basic_auth_enabled=self.basic_auth_enabled)
+
+    def logout(self):
+        """Unified logout endpoint for all auth methods"""
+        auth_method = session.get('auth_method', 'unknown')
+        session.pop('user', None)
+        session.pop('logged_in', None)
+        session.pop('auth_method', None)
+        
+        logger.info(f"User logged out (method: {auth_method})")
+        flash('You have been logged out successfully')
+        return redirect(url_for('landing'))
+
+    def sso_callback(self):
+        """Handle OAuth callback from SSO provider"""
+        if not self.sso_enabled or not self.oauth:
+            return jsonify({'error': 'SSO not enabled'}), 400
+        
+        try:
+            # Get the token from the callback
+            token = self.oauth.sso.authorize_access_token()
+            
+            # Parse the user info from the token
+            user_info = token.get('userinfo')
+            if not user_info:
+                # If userinfo is not in token, fetch it
+                user_info = self.oauth.sso.userinfo(token=token)
+            
+            # Store user information in session (normalized structure)
+            session['user'] = {
+                'email': user_info.get('email', ''),
+                'name': user_info.get('name', user_info.get('preferred_username', '')),
+                'username': user_info.get('preferred_username', user_info.get('email', '')),
+                'id': user_info.get('sub', '')
+            }
+            session['logged_in'] = True
+            session['auth_method'] = 'sso'
+            
+            logger.info(f"SSO login successful for user: {user_info.get('email')}")
+            
+            # Redirect to main page
+            return redirect(url_for('index'))
+            
+        except Exception as e:
+            logger.error(f"SSO callback error: {str(e)}")
+            flash(f"Authentication failed: {str(e)}")
+            return redirect(url_for('login'))
+
+    def get_user(self):
+        """API endpoint to get current user information"""
+        if session.get('logged_in'):
+            user = session.get('user', {})
+            return jsonify({
+                'logged_in': True,
+                'email': user.get('email', ''),
+                'name': user.get('name', ''),
+                'auth_method': session.get('auth_method', 'unknown'),
+                'auth_enabled': self.auth_enabled
+            })
+        return jsonify({
+            'logged_in': False,
+            'auth_enabled': self.auth_enabled
+        })
+
+    def require_auth(self, f):
+        """Decorator to require authentication for routes"""
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not self.auth_enabled:
+                # If auth is not enabled, allow access
+                return f(*args, **kwargs)
+            
+            if not session.get('logged_in'):
+                # Return 401 Unauthorized response instead of redirecting
+                return jsonify({'error': 'Unauthorized', 'message': 'Authentication required'}), 401
+            
+            return f(*args, **kwargs)
+        return decorated_function
 
     def health(self):
         return jsonify({"status": "OK"}, 200)
@@ -903,102 +1959,496 @@ class FlaskAppWrapper(object):
     def run(self, **kwargs):
         self.app.run(**kwargs)
 
-    def insert_config(self, config):
-        # TODO: use config_name (and then hash of config string) to determine
-        #       if config already exists; if so, don't push new config
-
-        # parse config and config_name
-        config_name = self.config["name"]
-        config = yaml.dump(self.config)
-
-        # construct insert_tup
-        insert_tup = [
-            (config, config_name),
-        ]
-
-        # create connection to database
-        self.conn = psycopg2.connect(**self.pg_config)
-        self.cursor = self.conn.cursor()
-        psycopg2.extras.execute_values(self.cursor, SQL_INSERT_CONFIG, insert_tup)
-        self.conn.commit()
-        config_id = list(map(lambda tup: tup[0], self.cursor.fetchall()))[0]
-
-        # clean up database connection state
-        self.cursor.close()
-        self.conn.close()
-        self.cursor, self.conn = None, None
-
-        return config_id
+    def _build_provider_config(self, provider_type: ProviderType) -> Optional[ProviderConfig]:
+        """Legacy shim: build ProviderConfig from the currently loaded YAML."""
+        return _build_provider_config_from_payload(self.config, provider_type)
 
     def update_config(self):
         """
-        Updates the config used by A2rchi for responding to messages. The config
-        is parsed and inserted into the `configs` table. Finally, the chat wrapper's
-        config_id is updated.
+        Updates the config used by archi for responding to messages.
+        Reloads the config and updates the chat wrapper.
         """
-        # parse config and write it out to CONFIGS_PATH
-        config_str = request.json.get('config')
-        config_name = config_str['name']
-        with open(CONFIGS_PATH+f'{config_name}.yaml', 'w') as f:
-            f.write(config_str)
-
-        # parse prompts and write them to their respective locations
-        # TODO fix
-        main_prompt = request.json.get('main_prompt')
-        with open(MAIN_PROMPT_FILE, 'w') as f:
-            f.write(main_prompt)
-
-        condense_prompt = request.json.get('condense_prompt')
-        with open(CONDENSE_PROMPT_FILE, 'w') as f:
-            f.write(condense_prompt)
-
-        summary_prompt = request.json.get('summary_prompt')
-        with open(SUMMARY_PROMPT_FILE, 'w') as f:
-            f.write(summary_prompt)
-
-        # re-read config using load_config and update dependent variables
-        self.config = load_config()
-        self.global_config = self.config["global"]
-        self.utils_config = self.config["utils"]
-        self.services_config = self.config["services"]
-        self.chat_app_config = self.config["services"]["chat_app"]
-        self.data_path = self.global_config["DATA_PATH"]
-
-        # store postgres connection info
-        self.pg_config = {
-            "password": read_secret("PG_PASSWORD"),
-            **self.services_config["postgres"],
-        }
-        self.conn = None
-        self.cursor = None
-
-        # recreate chat wrapper so all dependent services reload the new config
-        self.chat = ChatWrapper()
-        self.chat.update_config(config_name=self.config["name"])
-        new_config_id = self.chat.get_config_id(self.config["name"])
-
-        return jsonify({'response': f'config updated successfully w/config_id: {new_config_id}'}), 200
+        return jsonify({"error": "Config updates must be applied to Postgres; file-based updates are disabled."}), 400
 
     def get_configs(self):
         """
-        Gets the names of configs loaded in A2rchi.
+        Gets the names of configs loaded in archi.
 
 
         Returns:
             A json with a response list of the configs names
         """
 
-        config_names = get_config_names()
+        config_names = _config_names()
         options = []
         for name in config_names:
             description = ""
             try:
-                payload = load_config(name=name)
-                description = payload.get("a2rchi", {}).get("agent_description", "No description provided")
+                payload = get_full_config()
+                description = payload.get("archi", {}).get("agent_description", "No description provided")
             except Exception as exc:
                 logger.warning(f"Failed to load config {name} for description: {exc}")
             options.append({"name": name, "description": description})
         return jsonify({'options': options}), 200
+
+    def get_providers(self):
+        """
+        Get list of all enabled providers and their available models.
+        
+        Returns:
+            JSON with providers list, each containing:
+            - type: Provider type (openai, anthropic, etc.)
+            - display_name: Human-readable name
+            - enabled: Whether the provider has valid credentials
+            - models: List of available models
+        """
+        try:
+            from src.archi.providers import (
+                list_provider_types,
+                get_provider,
+                ProviderType,
+            )
+
+            providers_data = []
+            for provider_type in list_provider_types():
+                try:
+                    cfg = _build_provider_config_from_payload(self.config, provider_type)
+                    provider = get_provider(provider_type, config=cfg) if cfg else get_provider(provider_type)
+                    models = provider.list_models()
+                    providers_data.append({
+                        'type': provider_type.value,
+                        'display_name': provider.display_name,
+                        'enabled': provider.is_enabled,
+                        'default_model': provider.config.default_model,
+                        'models': [
+                            {
+                                'id': m.id,
+                                'name': m.name,
+                                'display_name': m.display_name,
+                                'context_window': m.context_window,
+                                'supports_tools': m.supports_tools,
+                                'supports_streaming': m.supports_streaming,
+                                'supports_vision': m.supports_vision,
+                            }
+                            for m in models
+                        ],
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to get provider {provider_type}: {e}")
+                    providers_data.append({
+                        'type': provider_type.value,
+                        'display_name': provider_type.value.title(),
+                        'enabled': False,
+                        'error': str(e),
+                        'models': [],
+                    })
+
+            return jsonify({'providers': providers_data}), 200
+        except ImportError as e:
+            logger.error(f"Providers module not available: {e}")
+            return jsonify({'error': 'Providers module not available', 'providers': []}), 200
+        except Exception as e:
+            logger.error(f"Error getting providers: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    def get_pipeline_default_model(self):
+        """
+        Get the default model configured for the active chat pipeline.
+
+        Returns:
+            JSON with pipeline name and provider/model reference (if available).
+        """
+        try:
+            pipeline_name = self.config.get("services", {}).get("chat_app", {}).get("pipeline")
+            archi_config = self.config.get("archi", {})
+            pipeline_map = archi_config.get("pipeline_map", {})
+
+            pipeline_cfg = pipeline_map.get(pipeline_name, {})
+            models_cfg = pipeline_cfg.get("models", {})
+            required_models = models_cfg.get("required", {})
+
+            model_key = None
+            model_ref = None
+            if "agent_model" in required_models:
+                model_key = "agent_model"
+                model_ref = required_models["agent_model"]
+            elif "chat_model" in required_models:
+                model_key = "chat_model"
+                model_ref = required_models["chat_model"]
+            elif required_models:
+                model_key, model_ref = next(iter(required_models.items()))
+
+            return jsonify({
+                "pipeline": pipeline_name,
+                "model_key": model_key,
+                "model": model_ref,
+            }), 200
+        except Exception as e:
+            logger.error(f"Error getting pipeline default model: {e}")
+            return jsonify({"error": str(e)}), 500
+
+    def get_agent_info(self):
+        """
+        Get high-level information about the active agent configuration.
+
+        Query params:
+            config_name: Optional config name to describe (defaults to active config).
+
+        Returns:
+            JSON with config name, pipeline name, embedding name, and data sources.
+        """
+        config_name = request.args.get("config_name") or self.chat.current_config_name or self.config.get("name")
+
+        try:
+            config_payload = self.chat._get_config_payload(config_name) if config_name else self.config
+        except Exception as exc:
+            logger.error(f"Error loading config '{config_name}': {exc}")
+            config_payload = self.config
+
+        pipeline_name = config_payload.get("services", {}).get("chat_app", {}).get("pipeline")
+        embedding_name = config_payload.get("data_manager", {}).get("embedding_name")
+        sources = config_payload.get("data_manager", {}).get("sources", {})
+        source_names = list(sources.keys()) if isinstance(sources, dict) else []
+
+        return jsonify({
+            "config_name": config_name,
+            "pipeline": pipeline_name,
+            "embedding_name": embedding_name,
+            "data_sources": source_names,
+        }), 200
+
+    def get_provider_models(self):
+        """
+        Get models for a specific provider.
+        
+        Query params:
+            provider: Provider type (openai, anthropic, gemini, openrouter, local)
+        
+        Returns:
+            JSON with models list
+        """
+        provider_type = request.args.get('provider')
+        if not provider_type:
+            return jsonify({'error': 'provider parameter required'}), 400
+        
+        try:
+            from src.archi.providers import get_provider
+            
+            provider = get_provider(provider_type)
+            models = provider.list_models()
+            
+            return jsonify({
+                'provider': provider_type,
+                'display_name': provider.display_name,
+                'enabled': provider.is_enabled,
+                'default_model': provider.config.default_model,
+                'models': [
+                    {
+                        'id': m.id,
+                        'name': m.name,
+                        'display_name': m.display_name,
+                        'context_window': m.context_window,
+                        'supports_tools': m.supports_tools,
+                        'supports_streaming': m.supports_streaming,
+                        'supports_vision': m.supports_vision,
+                        'max_output_tokens': m.max_output_tokens,
+                    }
+                    for m in models
+                ],
+            }), 200
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except ImportError:
+            return jsonify({'error': 'Providers module not available'}), 500
+        except Exception as e:
+            logger.error(f"Error getting provider models: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    def validate_provider(self):
+        """
+        Validate a provider connection.
+        
+        Request body:
+            provider: Provider type (openai, anthropic, etc.)
+        
+        Returns:
+            JSON with validation result
+        """
+        payload = request.get_json(silent=True) or {}
+        provider_type = payload.get('provider')
+        
+        if not provider_type:
+            return jsonify({'error': 'provider field required'}), 400
+        
+        try:
+            from src.archi.providers import get_provider
+            
+            provider = get_provider(provider_type)
+            is_valid = provider.validate_connection()
+            
+            return jsonify({
+                'provider': provider_type,
+                'display_name': provider.display_name,
+                'valid': is_valid,
+                'enabled': provider.is_enabled,
+            }), 200
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except ImportError:
+            return jsonify({'error': 'Providers module not available'}), 500
+        except Exception as e:
+            logger.error(f"Error validating provider: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    def set_provider_api_key(self):
+        """
+        Set an API key for a specific provider.
+        
+        The API key is stored in the user's session, not in environment variables
+        or persistent storage. This provides security (keys are not logged or stored)
+        while allowing runtime configuration.
+        
+        Request body:
+            provider: Provider type (openai, anthropic, gemini, openrouter)
+            api_key: The API key to set
+        
+        Returns:
+            JSON with success status and provider validation result
+        """
+        payload = request.get_json(silent=True) or {}
+        provider_type = payload.get('provider')
+        api_key = payload.get('api_key')
+        
+        if not provider_type:
+            return jsonify({'error': 'provider field required'}), 400
+        if not api_key:
+            return jsonify({'error': 'api_key field required'}), 400
+        
+        # Validate the provider type
+        try:
+            from src.archi.providers import ProviderType
+            ptype = ProviderType(provider_type.lower())
+        except ValueError:
+            return jsonify({'error': f'Unknown provider type: {provider_type}'}), 400
+        
+        # Store the API key in session
+        if 'provider_api_keys' not in session:
+            session['provider_api_keys'] = {}
+        session['provider_api_keys'][provider_type.lower()] = api_key
+        session.modified = True
+        
+        # Validate the API key by testing the provider
+        try:
+            from src.archi.providers import get_provider_with_api_key
+            
+            provider = get_provider_with_api_key(provider_type, api_key)
+            is_valid = provider.validate_connection()
+            
+            return jsonify({
+                'success': True,
+                'provider': provider_type,
+                'display_name': provider.display_name,
+                'valid': is_valid,
+                'message': 'API key saved to session' + (' and validated' if is_valid else ' but validation failed'),
+            }), 200
+        except Exception as e:
+            # Still save the key even if validation fails
+            logger.warning(f"API key validation failed for {provider_type}: {e}")
+            return jsonify({
+                'success': True,
+                'provider': provider_type,
+                'valid': False,
+                'message': f'API key saved but validation failed: {e}',
+            }), 200
+
+    def get_provider_api_keys(self):
+        """
+        Get a list of which providers have API keys configured.
+        
+        For security, this does NOT return the actual API keys, only which
+        providers have keys set and whether they are valid.
+        
+        Returns:
+            JSON with list of configured providers
+        """
+        session_keys = session.get('provider_api_keys', {})
+        
+        try:
+            from src.archi.providers import (
+                list_provider_types,
+                get_provider,
+                get_provider_with_api_key,
+                ProviderType,
+            )
+            
+            providers_status = []
+            for provider_type in list_provider_types():
+                # Skip local provider - no API key needed
+                if provider_type == ProviderType.LOCAL:
+                    continue
+                    
+                ptype_str = provider_type.value
+                has_session_key = ptype_str in session_keys
+                has_env_key = False
+                is_valid = False
+                display_name = ptype_str.title()  # fallback
+                
+                try:
+                    # Check if there's an env-based key
+                    env_provider = get_provider(provider_type)
+                    has_env_key = env_provider.is_configured
+                    display_name = env_provider.display_name  # use proper display name
+                    
+                    # If we have a session key, test that one
+                    if has_session_key:
+                        test_provider = get_provider_with_api_key(
+                            provider_type,
+                            session_keys[ptype_str]
+                        )
+                        is_valid = test_provider.is_configured
+                    else:
+                        is_valid = has_env_key
+                except Exception as e:
+                    logger.debug(f"Error checking provider {ptype_str}: {e}")
+                
+                providers_status.append({
+                    'provider': ptype_str,
+                    'display_name': display_name,
+                    'has_session_key': has_session_key,
+                    'has_env_key': has_env_key,
+                    'configured': has_session_key or has_env_key,
+                    'valid': is_valid,
+                    'masked_key': ('*' * 8 + session_keys[ptype_str][-4:]) if has_session_key else None,
+                })
+            
+            return jsonify({
+                'providers': providers_status,
+            }), 200
+        except ImportError as e:
+            logger.error(f"Providers module not available: {e}")
+            return jsonify({'error': 'Providers module not available'}), 500
+        except Exception as e:
+            logger.error(f"Error getting provider API keys status: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    def clear_provider_api_key(self):
+        """
+        Clear the API key for a specific provider from the session.
+        
+        Request body:
+            provider: Provider type to clear
+        
+        Returns:
+            JSON with success status
+        """
+        payload = request.get_json(silent=True) or {}
+        provider_type = payload.get('provider')
+        
+        if not provider_type:
+            return jsonify({'error': 'provider field required'}), 400
+        
+        ptype_str = provider_type.lower()
+        
+        if 'provider_api_keys' in session:
+            if ptype_str in session['provider_api_keys']:
+                del session['provider_api_keys'][ptype_str]
+                session.modified = True
+                return jsonify({
+                    'success': True,
+                    'message': f'API key for {provider_type} cleared from session',
+                }), 200
+        
+        return jsonify({
+            'success': True,
+            'message': f'No API key found for {provider_type}',
+        }), 200
+
+    def validate_provider_api_key(self):
+        """
+        Validate an API key for a provider without storing it.
+        
+        This endpoint allows testing a key before committing to save it.
+        The key is NOT stored in the session.
+        
+        Request body:
+            provider: Provider type (openai, anthropic, gemini, openrouter)
+            api_key: The API key to validate
+        
+        Returns:
+            JSON with validation result and available models
+        """
+        payload = request.get_json(silent=True) or {}
+        provider_type = payload.get('provider')
+        api_key = payload.get('api_key')
+        
+        if not provider_type:
+            return jsonify({'error': 'provider field required'}), 400
+        if not api_key:
+            return jsonify({'error': 'api_key field required'}), 400
+        
+        # Validate the provider type
+        try:
+            from src.archi.providers import ProviderType, get_provider_with_api_key
+            ptype = ProviderType(provider_type.lower())
+        except ValueError:
+            return jsonify({'error': f'Unknown provider type: {provider_type}'}), 400
+        
+        try:
+            # Create provider with the test key (not cached, not stored)
+            provider = get_provider_with_api_key(provider_type, api_key)
+            is_valid = provider.validate_connection()
+            
+            # If valid, also get available models
+            models = []
+            if is_valid:
+                try:
+                    models = [m.to_dict() for m in provider.list_models()]
+                except Exception:
+                    pass  # Models list is optional
+            
+            return jsonify({
+                'valid': is_valid,
+                'provider': provider_type,
+                'display_name': provider.display_name,
+                'models_available': models,
+            }), 200
+        except Exception as e:
+            logger.warning(f"API key validation failed for {provider_type}: {e}")
+            return jsonify({
+                'valid': False,
+                'provider': provider_type,
+                'error': str(e),
+            }), 200
+
+    def _parse_chat_request(self) -> Dict[str, Any]:
+        payload = request.get_json(silent=True) or {}
+
+        client_sent_msg_ts = payload.get("client_sent_msg_ts")
+        client_timeout = payload.get("client_timeout")
+        client_sent_msg_ts = client_sent_msg_ts / 1000 if client_sent_msg_ts else 0
+        client_timeout = client_timeout / 1000 if client_timeout else 0
+
+        include_agent_steps = payload.get("include_agent_steps", True)
+        include_tool_steps = payload.get("include_tool_steps", True)
+        if isinstance(include_agent_steps, str):
+            include_agent_steps = include_agent_steps.lower() == "true"
+        if isinstance(include_tool_steps, str):
+            include_tool_steps = include_tool_steps.lower() == "true"
+
+        return {
+            "message": payload.get("last_message"),
+            "conversation_id": payload.get("conversation_id"),
+            "config_name": payload.get("config_name"),
+            "is_refresh": payload.get("is_refresh"),
+            "client_sent_msg_ts": client_sent_msg_ts,
+            "client_timeout": client_timeout,
+            "client_id": payload.get("client_id"),
+            "include_agent_steps": include_agent_steps,
+            "include_tool_steps": include_tool_steps,
+            # Provider-based model selection
+            "provider": payload.get("provider"),
+            "model": payload.get("model"),
+        }
 
 
     def get_chat_response(self):
@@ -1020,13 +2470,14 @@ class FlaskAppWrapper(object):
         server_received_msg_ts = datetime.now()
 
         # get user input and conversation_id from the request
-        message = request.json.get('last_message')
-        conversation_id = request.json.get('conversation_id')
-        config_name = request.json.get('config_name')
-        is_refresh = request.json.get('is_refresh')
-        client_sent_msg_ts = request.json.get('client_sent_msg_ts') / 1000
-        client_timeout = request.json.get('client_timeout') / 1000
-        client_id = request.json.get('client_id')
+        request_data = self._parse_chat_request()
+        message = request_data["message"]
+        conversation_id = request_data["conversation_id"]
+        config_name = request_data["config_name"]
+        is_refresh = request_data["is_refresh"]
+        client_sent_msg_ts = request_data["client_sent_msg_ts"]
+        client_timeout = request_data["client_timeout"]
+        client_id = request_data["client_id"]
 
         if not client_id:
             return jsonify({'error': 'client_id missing'}), 400
@@ -1053,7 +2504,7 @@ class FlaskAppWrapper(object):
         timestamps['client_sent_msg_ts'] = datetime.fromtimestamp(client_sent_msg_ts)
         self.chat.insert_timing(message_ids[-1], timestamps)
 
-        # otherwise return A2rchi's response to client
+        # otherwise return archi's response to client
         try:
             response_size = len(response) if isinstance(response, str) else 0
             logger.info(f"Generated Response Length: {response_size} characters")
@@ -1065,7 +2516,7 @@ class FlaskAppWrapper(object):
         response_data = {
             'response': response,
             'conversation_id': conversation_id,
-            'a2rchi_msg_id': message_ids[-1],
+            'archi_msg_id': message_ids[-1],
             'server_response_msg_ts': timestamps['server_response_msg_ts'].timestamp(),
             'final_response_msg_ts': datetime.now().timestamp(),
         }
@@ -1074,6 +2525,72 @@ class FlaskAppWrapper(object):
         logger.info(f"API Response Time: {end_time - start_time:.2f} seconds")
 
         return jsonify(response_data)
+
+    def get_chat_response_stream(self):
+        """
+        Streams agent updates and the final response as NDJSON.
+        """
+        server_received_msg_ts = datetime.now()
+        request_data = self._parse_chat_request()
+
+        message = request_data["message"]
+        conversation_id = request_data["conversation_id"]
+        config_name = request_data["config_name"]
+        is_refresh = request_data["is_refresh"]
+        client_sent_msg_ts = request_data["client_sent_msg_ts"]
+        client_timeout = request_data["client_timeout"]
+        client_id = request_data["client_id"]
+        include_agent_steps = request_data["include_agent_steps"]
+        include_tool_steps = request_data["include_tool_steps"]
+        provider = request_data["provider"]
+        model = request_data["model"]
+
+        if not client_id:
+            return jsonify({"error": "client_id missing"}), 400
+
+        # Get API key from session if available
+        session_api_key = None
+        if provider and 'provider_api_keys' in session:
+            session_api_key = session.get('provider_api_keys', {}).get(provider.lower())
+
+        def _event_stream() -> Iterator[str]:
+            padding = " " * 2048
+            yield json.dumps({"type": "meta", "event": "stream_started", "padding": padding}) + "\n"
+            for event in self.chat.stream(
+                message,
+                conversation_id,
+                client_id,
+                is_refresh,
+                server_received_msg_ts,
+                client_sent_msg_ts,
+                client_timeout,
+                config_name,
+                include_agent_steps=include_agent_steps,
+                include_tool_steps=include_tool_steps,
+                provider=provider,
+                model=model,
+                provider_api_key=session_api_key,
+            ):
+                yield json.dumps(event, default=str) + "\n"
+
+        headers = {
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
+            "Content-Type": "application/x-ndjson",
+        }
+        return Response(stream_with_context(_event_stream()), headers=headers)
+
+    def landing(self):
+        """Landing page for unauthenticated users"""
+        # If user is already logged in, redirect to chat
+        if session.get('logged_in'):
+            return redirect(url_for('index'))
+        
+        # Render landing page with auth method information
+        return render_template('landing.html',
+                             sso_enabled=self.sso_enabled,
+                             basic_auth_enabled=self.basic_auth_enabled)
 
     def index(self):
         return render_template('index.html')
@@ -1211,196 +2728,6 @@ class FlaskAppWrapper(object):
             if self.chat.conn is not None:
                 self.chat.conn.close()
 
-    def list_docs(self):
-        """
-        API endpoint to list all documents indexed in ChromaDB with pagination.
-        Query parameters:
-        - page: Page number (1-based, default: 1)
-        - per_page: Documents per page (default: 50, max: 500)
-        - content_length: Max content preview length (default: -1 for full content)
-        Returns a JSON with paginated list of documents and their metadata.
-        """
-        # Check if ChromaDB endpoints are enabled
-        if not self.chat_app_config.get('enable_debug_chroma_endpoints', False):
-            return jsonify({'error': 'ChromaDB endpoints are disabled in configuration'}), 404
-
-        try:
-            # Get pagination parameters from query string
-            page = int(request.args.get('page', 1))
-            per_page = min(int(request.args.get('per_page', 50)), 500)  # Cap at 500
-            content_length = int(request.args.get('content_length', -1))  # Default -1 for full content
-
-            # Validate parameters
-            if page < 1:
-                return jsonify({'error': 'Page must be >= 1'}), 400
-            if per_page < 1:
-                return jsonify({'error': 'per_page must be >= 1'}), 400
-            if content_length < -1 or content_length == 0:
-                return jsonify({'error': 'content_length must be -1 (full content) or > 0'}), 400
-
-            # Get the collection from ChromaDB
-            collection = self.chat.data_manager.fetch_collection()
-
-            # Get total count first
-            total_documents = collection.count()
-
-            # Calculate pagination
-            offset = (page - 1) * per_page
-            total_pages = (total_documents + per_page - 1) // per_page  # Ceiling division
-
-            # Check if page is valid
-            if page > total_pages and total_documents > 0:
-                return jsonify({'error': f'Page {page} does not exist. Total pages: {total_pages}'}), 400
-
-            # Get paginated documents from the collection
-            result = collection.get(
-                include=['documents', 'metadatas'],
-                limit=per_page,
-                offset=offset
-            )
-
-            # Format the response
-            documents = []
-            for i, doc in enumerate(result['documents']):
-                # Truncate content based on content_length parameter (-1 means full content)
-                if content_length == -1:
-                    content = doc  # Return full content
-                else:
-                    content = doc[:content_length] + '...' if len(doc) > content_length else doc
-
-                doc_info = {
-                    'id': result['ids'][i],
-                    'content': content,
-                    'content_length': len(doc),  # Original content length
-                    'metadata': result['metadatas'][i] if i < len(result['metadatas']) else {}
-                }
-                documents.append(doc_info)
-
-            response_data = {
-                'pagination': {
-                    'page': page,
-                    'per_page': per_page,
-                    'total_documents': total_documents,
-                    'total_pages': total_pages,
-                    'has_next': page < total_pages,
-                    'has_prev': page > 1,
-                    'next_page': page + 1 if page < total_pages else None,
-                    'prev_page': page - 1 if page > 1 else None
-                },
-                'documents': documents
-            }
-
-            return jsonify(response_data), 200
-
-        except ValueError as e:
-            return jsonify({'error': f'Invalid parameter: {str(e)}'}), 400
-        except Exception as e:
-            print(f"ERROR in list_docs: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-
-    # TODO should this call a2rchi rather than connect to db directly?
-    # in any case, code-duplication should be elminated here
-    def search_docs(self):
-        """
-        API endpoint to search for the nearest documents to a given query with pagination.
-        Expects JSON input with:
-        - query (required): Search query string
-        - n_results (optional): Number of results to return (default: 5, max: 100)
-        - content_length (optional): Max content length in response (default: -1 for full content, max: 5000)
-        - include_full_content (optional): Whether to include full content (default: false)
-        Returns the most similar documents with their similarity scores.
-        """
-        # Check if ChromaDB endpoints are enabled
-        if not self.chat_app_config.get('enable_debug_chroma_endpoints', False):
-            return jsonify({'error': 'ChromaDB endpoints are disabled in configuration'}), 404
-
-        try:
-            # Get the query from request
-            data = request.json
-            query = data.get('query')
-            n_results = min(int(data.get('n_results', 5)), 100)  # Cap at 100
-            content_length = min(int(data.get('content_length', -1)), 5000) if data.get('content_length', -1) != -1 else -1  # Default -1 for full content
-            include_full_content = data.get('include_full_content', False)
-
-            if not query:
-                return jsonify({'error': 'Query parameter is required'}), 400
-
-            if n_results < 1:
-                return jsonify({'error': 'n_results must be >= 1'}), 400
-
-            if content_length < -1 or content_length == 0:
-                return jsonify({'error': 'content_length must be -1 (full content) or > 0'}), 400
-
-            # Connect to ChromaDB and create vectorstore
-            client = None
-            if self.services_config["chromadb"]["use_HTTP_chromadb_client"]:
-                client = chromadb.HttpClient(
-                    host=self.services_config["chromadb"]["chromadb_host"],
-                    port=self.services_config["chromadb"]["chromadb_port"],
-                    settings=Settings(allow_reset=True, anonymized_telemetry=False),
-                )
-            else:
-                client = chromadb.PersistentClient(
-                    path=self.global_config["LOCAL_VSTORE_PATH"],
-                    settings=Settings(allow_reset=True, anonymized_telemetry=False),
-                )
-
-            # Get the collection name and embedding model from chat
-            collection_name = self.chat.chain.collection_name
-            embedding_model = self.chat.chain.embedding_model
-
-            # Create vectorstore
-            vectorstore = Chroma(
-                client=client,
-                collection_name=collection_name,
-                embedding_function=embedding_model,
-            )
-
-            # Perform similarity search with scores
-            results = vectorstore.similarity_search_with_score(query, k=n_results)
-
-            # Format the response
-            documents = []
-            for doc, score in results:
-                # Handle content length based on parameters
-                if include_full_content or content_length == -1:
-                    content = doc.page_content
-                else:
-                    content = (doc.page_content[:content_length] + '...'
-                             if len(doc.page_content) > content_length
-                             else doc.page_content)
-
-                doc_info = {
-                    'content': content,
-                    'content_length': len(doc.page_content),  # Original content length
-                    'metadata': doc.metadata,
-                    'similarity_score': float(score)
-                }
-                documents.append(doc_info)
-
-            response_data = {
-                'query': query,
-                'search_params': {
-                    'n_results_requested': n_results,
-                    'n_results_returned': len(documents),
-                    'content_length': content_length,
-                    'include_full_content': include_full_content
-                },
-                'documents': documents
-            }
-
-            # Clean up
-            del vectorstore
-            del client
-
-            return jsonify(response_data), 200
-
-        except ValueError as e:
-            return jsonify({'error': f'Invalid parameter: {str(e)}'}), 400
-        except Exception as e:
-            print(f"ERROR in search_docs: {str(e)}")
-            return jsonify({'error': str(e)}), 500
-
     def list_conversations(self):
         """
         List all conversations, ordered by most recent first.
@@ -1481,7 +2808,7 @@ class FlaskAppWrapper(object):
             # get history of the conversation along with latest feedback state
             cursor.execute(SQL_QUERY_CONVO_WITH_FEEDBACK, (conversation_id, ))
             history_rows = cursor.fetchall()
-            history_rows = collapse_assistant_sequences(history_rows, sender_name=A2RCHI_SENDER, sender_index=0)
+            history_rows = collapse_assistant_sequences(history_rows, sender_name=ARCHI_SENDER, sender_index=0)
 
             conversation = {
                 'conversation_id': meta_row[0],
@@ -1573,6 +2900,448 @@ class FlaskAppWrapper(object):
             print(f"ERROR in delete_conversation: {str(e)}")
             return jsonify({'error': str(e)}), 500
 
+    # =========================================================================
+    # A/B Testing API Endpoints
+    # =========================================================================
+
+    def ab_create_comparison(self):
+        """
+        Create a new A/B comparison record linking two responses.
+
+        POST body:
+        - conversation_id: The conversation ID
+        - user_prompt_mid: Message ID of the user's question
+        - response_a_mid: Message ID of response A
+        - response_b_mid: Message ID of response B
+        - config_a_id: Config ID used for response A
+        - config_b_id: Config ID used for response B
+        - is_config_a_first: True if config A was the "first" config before randomization
+        - client_id: Client ID for authorization
+
+        Returns:
+            JSON with comparison_id
+        """
+        try:
+            data = request.json
+            conversation_id = data.get('conversation_id')
+            user_prompt_mid = data.get('user_prompt_mid')
+            response_a_mid = data.get('response_a_mid')
+            response_b_mid = data.get('response_b_mid')
+            config_a_id = data.get('config_a_id')
+            config_b_id = data.get('config_b_id')
+            is_config_a_first = data.get('is_config_a_first', True)
+            client_id = data.get('client_id')
+
+            # Validate required fields
+            missing = []
+            if not conversation_id:
+                missing.append('conversation_id')
+            if not user_prompt_mid:
+                missing.append('user_prompt_mid')
+            if not response_a_mid:
+                missing.append('response_a_mid')
+            if not response_b_mid:
+                missing.append('response_b_mid')
+            if not config_a_id:
+                missing.append('config_a_id')
+            if not config_b_id:
+                missing.append('config_b_id')
+            if not client_id:
+                missing.append('client_id')
+
+            if missing:
+                return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
+
+            # Create the comparison
+            comparison_id = self.chat.create_ab_comparison(
+                conversation_id=conversation_id,
+                user_prompt_mid=user_prompt_mid,
+                response_a_mid=response_a_mid,
+                response_b_mid=response_b_mid,
+                config_a_id=config_a_id,
+                config_b_id=config_b_id,
+                is_config_a_first=is_config_a_first,
+            )
+
+            return jsonify({
+                'success': True,
+                'comparison_id': comparison_id,
+            }), 200
+
+        except Exception as e:
+            logger.error(f"Error creating A/B comparison: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def ab_submit_preference(self):
+        """
+        Submit user's preference for an A/B comparison.
+
+        POST body:
+        - comparison_id: The comparison ID
+        - preference: 'a', 'b', or 'tie'
+        - client_id: Client ID for authorization
+
+        Returns:
+            JSON with success status
+        """
+        try:
+            data = request.json
+            comparison_id = data.get('comparison_id')
+            preference = data.get('preference')
+            client_id = data.get('client_id')
+
+            if not comparison_id:
+                return jsonify({'error': 'comparison_id is required'}), 400
+            if not preference:
+                return jsonify({'error': 'preference is required'}), 400
+            if preference not in ('a', 'b', 'tie'):
+                return jsonify({'error': 'preference must be "a", "b", or "tie"'}), 400
+            if not client_id:
+                return jsonify({'error': 'client_id is required'}), 400
+
+            # Update the preference
+            self.chat.update_ab_preference(comparison_id, preference)
+
+            return jsonify({
+                'success': True,
+                'comparison_id': comparison_id,
+                'preference': preference,
+            }), 200
+
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except Exception as e:
+            logger.error(f"Error submitting A/B preference: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def ab_get_pending(self):
+        """
+        Get the pending (unvoted) A/B comparison for a conversation.
+
+        Query params:
+        - conversation_id: The conversation ID
+        - client_id: Client ID for authorization
+
+        Returns:
+            JSON with comparison data or null if none pending
+        """
+        try:
+            conversation_id = request.args.get('conversation_id', type=int)
+            client_id = request.args.get('client_id')
+
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+            if not client_id:
+                return jsonify({'error': 'client_id is required'}), 400
+
+            comparison = self.chat.get_pending_ab_comparison(conversation_id)
+
+            return jsonify({
+                'success': True,
+                'comparison': comparison,
+            }), 200
+
+        except Exception as e:
+            logger.error(f"Error getting pending A/B comparison: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Agent Trace Endpoints
+    # =========================================================================
+
+    def get_trace(self, trace_id: str):
+        """
+        Get an agent trace by ID.
+
+        URL params:
+        - trace_id: The trace UUID
+
+        Returns:
+            JSON with trace data
+        """
+        try:
+            trace = self.chat.get_agent_trace(trace_id)
+            if trace is None:
+                return jsonify({'error': 'Trace not found'}), 404
+
+            return jsonify({
+                'success': True,
+                'trace': trace,
+            }), 200
+
+        except Exception as e:
+            logger.error(f"Error getting trace {trace_id}: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def get_trace_by_message(self, message_id: int):
+        """
+        Get agent trace by the final message ID.
+
+        URL params:
+        - message_id: The message ID
+
+        Returns:
+            JSON with trace data
+        """
+        try:
+            trace = self.chat.get_trace_by_message(message_id)
+            if trace is None:
+                return jsonify({'error': 'Trace not found for message'}), 404
+
+            return jsonify({
+                'success': True,
+                'trace': trace,
+            }), 200
+
+        except Exception as e:
+            logger.error(f"Error getting trace for message {message_id}: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def cancel_stream(self):
+        """
+        Cancel an active streaming request for a conversation.
+
+        POST body:
+        - conversation_id: The conversation ID
+        - client_id: Client ID for authorization
+
+        Returns:
+            JSON with cancellation status
+        """
+        try:
+            data = request.json
+            conversation_id = data.get('conversation_id')
+            client_id = data.get('client_id')
+
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+            if not client_id:
+                return jsonify({'error': 'client_id is required'}), 400
+
+            # Cancel any active traces for this conversation
+            cancelled_count = self.chat.cancel_active_traces(
+                conversation_id=conversation_id,
+                cancelled_by='user',
+                cancellation_reason='Cancelled by user request',
+            )
+
+            return jsonify({
+                'success': True,
+                'cancelled_count': cancelled_count,
+            }), 200
+
+        except Exception as e:
+            logger.error(f"Error cancelling stream for conversation {conversation_id}: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Data Viewer Endpoints
+    # =========================================================================
+
+    def data_viewer_page(self):
+        """Render the data viewer page."""
+        return render_template('data.html')
+
+    def list_data_documents(self):
+        """
+        List documents with per-chat enabled state.
+
+        Query params:
+        - conversation_id: Optional. The conversation ID for per-chat state.
+                          If omitted, shows all documents as enabled.
+        - source_type: Optional. Filter by "local", "web", "ticket", or "all".
+        - search: Optional. Search query for display_name and url.
+        - enabled: Optional. Filter by "all", "enabled", or "disabled".
+        - limit: Optional. Max results (default 100).
+        - offset: Optional. Pagination offset (default 0).
+
+        Returns:
+            JSON with documents list, total, enabled_count, limit, offset
+        """
+        try:
+            conversation_id = request.args.get('conversation_id')  # Optional now
+
+            source_type = request.args.get('source_type', 'all')
+            search = request.args.get('search', '')
+            enabled_filter = request.args.get('enabled', 'all')
+            limit = request.args.get('limit', 100, type=int)
+            offset = request.args.get('offset', 0, type=int)
+
+            # Clamp limit
+            limit = max(1, min(limit, 500))
+
+            result = self.chat.data_viewer.list_documents(
+                conversation_id=conversation_id,
+                source_type=source_type if source_type != 'all' else None,
+                search=search if search else None,
+                enabled_filter=enabled_filter if enabled_filter != 'all' else None,
+                limit=limit,
+                offset=offset,
+            )
+
+            return jsonify(result), 200
+
+        except Exception as e:
+            logger.error(f"Error listing data documents: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def get_data_document_content(self, document_hash: str):
+        """
+        Get document content for preview.
+
+        URL params:
+        - document_hash: The document's SHA-256 hash
+
+        Query params:
+        - max_size: Optional. Max content size (default 100000).
+
+        Returns:
+            JSON with hash, display_name, content, content_type, size_bytes, truncated
+        """
+        try:
+            max_size = request.args.get('max_size', 100000, type=int)
+            max_size = max(1000, min(max_size, 1000000))  # Clamp between 1KB and 1MB
+
+            result = self.chat.data_viewer.get_document_content(document_hash, max_size)
+            if result is None:
+                return jsonify({'error': 'Document not found'}), 404
+
+            return jsonify(result), 200
+
+        except Exception as e:
+            logger.error(f"Error getting document content for {document_hash}: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def enable_data_document(self, document_hash: str):
+        """
+        Enable a document for the current chat.
+
+        URL params:
+        - document_hash: The document's SHA-256 hash
+
+        POST body:
+        - conversation_id: The conversation ID
+
+        Returns:
+            JSON with success, hash, enabled
+        """
+        try:
+            data = request.json or {}
+            conversation_id = data.get('conversation_id')
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+
+            result = self.chat.data_viewer.enable_document(conversation_id, document_hash)
+            return jsonify(result), 200
+
+        except Exception as e:
+            logger.error(f"Error enabling document {document_hash}: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def disable_data_document(self, document_hash: str):
+        """
+        Disable a document for the current chat.
+
+        URL params:
+        - document_hash: The document's SHA-256 hash
+
+        POST body:
+        - conversation_id: The conversation ID
+
+        Returns:
+            JSON with success, hash, enabled
+        """
+        try:
+            data = request.json or {}
+            conversation_id = data.get('conversation_id')
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+
+            result = self.chat.data_viewer.disable_document(conversation_id, document_hash)
+            return jsonify(result), 200
+
+        except Exception as e:
+            logger.error(f"Error disabling document {document_hash}: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def bulk_enable_documents(self):
+        """
+        Enable multiple documents for the current chat.
+
+        POST body:
+        - conversation_id: The conversation ID
+        - hashes: List of document hashes to enable
+
+        Returns:
+            JSON with success, enabled_count
+        """
+        try:
+            data = request.json or {}
+            conversation_id = data.get('conversation_id')
+            hashes = data.get('hashes', [])
+
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+            if not isinstance(hashes, list):
+                return jsonify({'error': 'hashes must be a list'}), 400
+
+            result = self.chat.data_viewer.bulk_enable(conversation_id, hashes)
+            return jsonify(result), 200
+
+        except Exception as e:
+            logger.error(f"Error bulk enabling documents: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def bulk_disable_documents(self):
+        """
+        Disable multiple documents for the current chat.
+
+        POST body:
+        - conversation_id: The conversation ID
+        - hashes: List of document hashes to disable
+
+        Returns:
+            JSON with success, disabled_count
+        """
+        try:
+            data = request.json or {}
+            conversation_id = data.get('conversation_id')
+            hashes = data.get('hashes', [])
+
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+            if not isinstance(hashes, list):
+                return jsonify({'error': 'hashes must be a list'}), 400
+
+            result = self.chat.data_viewer.bulk_disable(conversation_id, hashes)
+            return jsonify(result), 200
+
+        except Exception as e:
+            logger.error(f"Error bulk disabling documents: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def get_data_stats(self):
+        """
+        Get statistics for the data viewer.
+
+        Query params:
+        - conversation_id: Optional. The conversation ID for per-chat stats.
+                          If omitted, shows stats for all documents as enabled.
+
+        Returns:
+            JSON with total_documents, enabled_documents, disabled_documents,
+            total_size_bytes, by_source_type, last_sync
+        """
+        try:
+            conversation_id = request.args.get('conversation_id')  # Optional now
+
+            result = self.chat.data_viewer.get_stats(conversation_id)
+            return jsonify(result), 200
+
+        except Exception as e:
+            logger.error(f"Error getting data stats: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
     def is_authenticated(self):
         """
         Keeps the state of the authentication.
@@ -1580,177 +3349,3 @@ class FlaskAppWrapper(object):
         Returns true if there has been a correct login authentication and false otherwise.
         """
         return 'logged_in' in session and session['logged_in']
-
-    #@app.route('/document_index/login', methods=['GET', 'POST'])
-    def login(self):
-        """
-        Method which governs the logging into the system. Relies on check_credentials function
-        """
-        if request.method == 'POST':
-            username = request.form['username']
-            password = request.form['password']
-
-            if check_credentials(username, password, self.salt, self.app.config['ACCOUNTS_FOLDER']):
-                session['logged_in'] = True
-                return redirect(url_for('index'))
-            else:
-                flash('Invalid credentials')
-
-        return render_template('login.html')
-
-
-    #@app.route('/document_index/logout')
-    def logout(self):
-        """
-        Method which is responsible for logout
-
-        This method is never explictly called, login sessions
-        are stored in the cookies.
-        """
-        session.pop('logged_in', None)
-
-        return redirect(url_for('login'))
-
-
-    #@app.route('/document_index/')
-    def document_index(self):
-        """
-        Methods which gets all the filenames in the UPLOAD_FOLDER and lists them
-        in the UI.
-
-        Note, this method must convert the file hashes (which is the name the files)
-        are stored under in the filesystem) to file names. It uses get_filename_from_hash
-        for this.
-        """
-        if not self.is_authenticated():
-            return redirect(url_for('login'))
-
-        sources_index = {}
-
-        for source_hash in self.catalog.metadata_index.keys():
-            metadata_source = self.catalog.get_metadata_for_hash(source_hash)
-            if not isinstance(metadata_source, dict):
-                logger.info("Metadata for hash %s missing or invalid; skipping", source_hash)
-                continue
-
-            source_type = metadata_source.get("source_type")
-            if not source_type:
-                logger.info("Metadata for hash %s missing source_type; skipping", source_hash)
-                continue
-
-            title = metadata_source.get("ticket_id") or metadata_source.get("url")
-            if not title:
-                title = metadata_source.get("display_name") or source_hash
-
-            sources_index.setdefault(source_type, []).append((source_hash, title))
-
-
-        return render_template('document_index.html', sources_index=sources_index.items())
-
-
-    #@app.route('/document_index/upload', methods=['POST'])
-    def upload(self):
-        """
-        Methods which governs uploading.
-
-        Does not allow uploading if the file is not of a valid file type or if the file
-        already exists in the filesystem.
-        """
-        if not self.is_authenticated():
-            return redirect(url_for('login'))
-
-        # check that there is a file selected and that the name is not null
-        if 'file' not in request.files:
-            flash('No file part')
-            return redirect(url_for('index'))
-
-        file = request.files['file']
-        if file.filename == '':
-            flash('No selected file')
-            return redirect(url_for('index'))
-
-        # check it is a valid file
-        file_extension = os.path.splitext(file.filename)[1]
-        if file and file_extension in self.global_config["ACCEPTED_FILES"]:
-
-            try:
-                resource = add_uploaded_file(target_dir=self.app.config['UPLOAD_FOLDER'],file=file, file_extension=file_extension)
-                self.scraper_manager.register_resource(target_dir=Path(self.app.config['UPLOAD_FOLDER']),resource=resource)
-                flash('File uploaded successfully')
-            except Exception:
-                flash(f'File under this name already exists. If you would like to upload a new file, please delete the old one.')
-
-        return redirect(url_for('index'))
-
-
-    #@app.route('/document_index/delete/<file_hash>')
-    def delete(self, file_hash):
-        """
-        Method which governs deleting
-
-        Technically can handle edge case where the file which is trying to be deleted
-        is not in the filesystem.
-        """
-        self.persistence.delete_resource(file_hash)
-        return redirect(url_for('index'))
-
-    #@app.route('/document_index/delete_source/<source_type>')
-    def delete_source(self, source_type):
-        """
-        Method to delete all documents of a specific source type
-        """
-
-        self.persistence.delete_by_metadata_filter("source_type", source_type)
-        return redirect(url_for('index'))
-
-    #@app.route('/document_index/upload_url', methods=['POST'])
-    def upload_url(self):
-        if not self.is_authenticated():
-            return redirect(url_for('login'))
-
-        url = request.form.get('url')
-        if url:
-            logger.info(f"Uploading the following URL: {url}")
-            try:
-                target_dir = Path(self.app.config['WEBSITE_FOLDER'])
-                resources = self.scraper_manager.web_scraper.scrape(url)
-                for resource in resources:
-                    self.scraper_manager.register_resource(target_dir, resource)
-                self.scraper_manager.persist_sources()
-                added_to_urls = True
-
-            except Exception as e:
-                logger.error(f"Failed to upload URL: {str(e)}")
-                added_to_urls = False
-
-            if added_to_urls:
-                flash('URL uploaded successfully')
-            else:
-                flash('Failed to add URL')
-        else:
-            flash('No URL provided')
-
-        return redirect(url_for('index'))
-
-
-    #@app.route('/document_index/load_document/<path:file_hash>')
-    def load_document(self, file_hash):
-
-        index = self.catalog.file_index
-        if file_hash in index.keys():
-            document = self.catalog.get_document_for_hash(file_hash)
-            metadata = self.catalog.get_metadata_for_hash(file_hash)
-
-            title = metadata['title'] if 'title' in metadata.keys() else metadata['display_name']
-            return jsonify({'document':document,
-                            'display_name':metadata['display_name'],
-                            'source_type':metadata['source_type'],
-                            'original_url':metadata['url'],
-                            'title':title})
-
-        else:
-            return jsonify({'document':"Document not found",
-                            'display_name':"Error",
-                            'source_type':'null',
-                            'original_url':"no_url",
-                            'title':'Not found'})

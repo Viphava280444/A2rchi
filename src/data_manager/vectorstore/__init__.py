@@ -1,3 +1,3 @@
-from .manager import SUPPORTED_DISTANCE_METRICS, VectorStoreManager
+from src.data_manager.vectorstore.postgres_vectorstore import PostgresVectorStore
 
-__all__ = ["VectorStoreManager", "SUPPORTED_DISTANCE_METRICS"]
+__all__ = ["PostgresVectorStore"]

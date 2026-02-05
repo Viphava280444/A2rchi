@@ -36,7 +36,7 @@ class SourceRegistry:
                 description="SSO-backed web crawling",
                 required_secrets=["SSO_USERNAME", "SSO_PASSWORD"],
                 required_config_fields=[
-                    "data_manager.sources.sso.sso_class",
+                    "data_manager.sources.links.selenium_scraper.selenium_class",
                 ],
                 depends_on=["links"],
             )

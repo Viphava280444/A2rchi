@@ -1,1 +1,1 @@
-Scripts to analyze the output of the `a2rchi evaluate` benchmarking.
+Scripts to analyze the output of the `archi evaluate` benchmarking.

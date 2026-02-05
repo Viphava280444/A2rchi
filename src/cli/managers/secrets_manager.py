@@ -145,6 +145,21 @@ class SecretsManager:
             except KeyError:
                 # should never happen if validate_secrets() was called first...
                 raise ValueError(f"Secret '{secret_name}' is required but not found in .env file")
+        
+        # Also write a .env file for compose environment variable interpolation
+        # This is needed for Podman compatibility (Docker secrets don't work reliably with podman-compose)
+        self.write_env_file(target_dir, secrets)
+            
+    def write_env_file(self, target_dir: Path, secrets: Set[str]) -> None:
+        """Write a .env file for compose environment variable interpolation"""
+        env_file = target_dir / ".env"
+        with open(env_file, 'w') as f:
+            for secret_name in secrets:
+                try:
+                    secret_value = self.get_secret(secret_name)
+                    f.write(f"{secret_name}={secret_value}\n")
+                except KeyError:
+                    pass  # Skip secrets not in the env file
             
     def list_available_secrets(self) -> List[str]:
         """List all secrets available in the .env file (for debugging)"""

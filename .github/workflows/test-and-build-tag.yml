@@ -1,8 +1,8 @@
 name: Test and Build Tag
 
 env:
-  A2RCHI_DIR: ${{ github.workspace }}/a2rchi-local
-  REGISTRY_PREFIX: a2rchi
+  ARCHI_DIR: ${{ github.workspace }}/archi-local
+  REGISTRY_PREFIX: archi
 
 on:
   workflow_dispatch:
@@ -94,20 +94,20 @@ jobs:
         run: chmod +x scripts/dev/*.sh
 
       - name: Point Dockerfiles to versioned base images
-        run: python scripts/dev/update_service_base_images.py "${{ needs.build-images.outputs.tag }}"
+        run: python scripts/dev/update_service_base_images.py --tag "${{ needs.build-images.outputs.tag }}" --switch-source dockerhub
 
       - name: Run smoke deployment
         uses: ./.github/actions/run-smoke
         with:
           deployment-name: release-${{ github.run_id }}
-          extra-env: A2RCHI_COMPOSE_UP_FLAGS=--build --pull 
+          extra-env: ARCHI_COMPOSE_UP_FLAGS=--build --pull 
           config-path: tests/pr_preview_config/pr_preview_config.yaml
-          config-destination: configs/ci/ci_config.yaml
+          config-destination: configs/ci/ci_config.generated.yaml
           env-file: .env
           services: chatbot
           hostmode: "true"
-          wait-url: http://localhost:27861/api/health
-          base-url: http://localhost:27861
+          wait-url: http://localhost:2786/api/health
+          base-url: http://localhost:2786
           use-podman: "true"
 
       - name: Commit Dockerfile base image updates
@@ -160,7 +160,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "$DOCKERHUB_TOKEN" | docker login docker.io --username "$DOCKERHUB_USERNAME" --password-stdin
-          for image in ${REGISTRY_PREFIX}/a2rchi-python-base ${REGISTRY_PREFIX}/a2rchi-pytorch-base; do
+          for image in ${REGISTRY_PREFIX}/archi-python-base ${REGISTRY_PREFIX}/archi-pytorch-base; do
             # Pull the versioned image and re-tag as latest
             docker pull "docker.io/$image:$VERSION_TAG"
             docker tag "docker.io/$image:$VERSION_TAG" "docker.io/$image:latest"

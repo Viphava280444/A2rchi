@@ -6,23 +6,21 @@ from threading import Thread
 import requests
 from flask import Flask
 
-from src.a2rchi.a2rchi import A2rchi
+from src.archi.archi import archi
 from src.data_manager.data_manager import DataManager
-from src.interfaces.uploader_app.app import FlaskAppWrapper
-from src.utils.config_loader import load_config
 from src.utils.env import read_secret
 from src.utils.logging import get_logger
+from src.utils.config_access import get_full_config
 
 logger = get_logger(__name__)
 
 class MattermostAIWrapper:
     def __init__(self):
         # initialize and update vector store
-        self.data_manager = DataManager()
-        self.data_manager.update_vectorstore()
+        self.data_manager = DataManager(run_ingestion=False)
 
         # intialize chain
-        self.a2rchi = A2rchi()
+        self.archi = archi()
 
     def __call__(self, post):
 
@@ -32,11 +30,8 @@ class MattermostAIWrapper:
         post_str = post['message']
         formatted_history.append(("User", post_str)) 
 
-        # update vector store
-        self.data_manager.update_vectorstore()
-
         # call chain
-        answer = self.a2rchi(formatted_history)["answer"]
+        answer = self.archi(formatted_history)["answer"]
         logger.debug('ANSWER = ',answer)
 
         return answer, post_str
@@ -52,7 +47,7 @@ class Mattermost:
 
         logger.info('Mattermost::INIT')
 
-        self.mattermost_config = load_config()["utils"].get("mattermost", None)
+        self.mattermost_config = get_full_config().get("utils", {}).get("mattermost", None)
         
         # mattermost webhook for reading questions/sending responses
         self.mattermost_url = 'https://mattermost.web.cern.ch/'
@@ -141,9 +136,9 @@ class Mattermost:
         r = requests.get(self.mattermost_url + content, headers=self.mattermost_headers)
         data = r.json()
         posts = data.get('posts', {})
-        excluded_a2rchi_id = "ajb6wyizpinqir7m16owntod7o"
+        excluded_archi_id = "ajb6wyizpinqir7m16owntod7o"
 
-        filtered_posts = self.filter_posts(posts, excluded_user_id=excluded_a2rchi_id)
+        filtered_posts = self.filter_posts(posts, excluded_user_id=excluded_archi_id)
         sorted_posts = sorted(filtered_posts, key=lambda x: x['create_at'], reverse=True)
 
         if sorted_posts:

@@ -19,8 +19,8 @@ from urllib.request import Request, urlopen
 
 
 DEFAULT_REPOSITORIES: Sequence[str] = (
-    "a2rchi/a2rchi-python-base",
-    "a2rchi/a2rchi-pytorch-base",
+    "archi/archi-python-base",
+    "archi/archi-pytorch-base",
 )
 
 
@@ -138,7 +138,7 @@ def prune_by_prefix(client: DockerHubClient, repositories: Sequence[str], prefix
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage Docker Hub tags for A2rchi images.")
+    parser = argparse.ArgumentParser(description="Manage Docker Hub tags for archi images.")
     parser.add_argument("--username", help="Docker Hub username (defaults to DOCKERHUB_USERNAME env var).")
     parser.add_argument(
         "--password",

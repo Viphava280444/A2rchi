@@ -3,6 +3,7 @@ import os
 import yaml
 from pathlib import Path
 
+from src.utils.env import read_secret
 from src.utils.logging import get_logger
 from src.data_manager.collectors.persistence import PersistenceService
 from src.data_manager.collectors.scrapers.scraped_resource import \
@@ -64,7 +65,13 @@ def get_filename_from_hash(hash_string, data_path, filehashes_yaml_file="manual_
 
 
 def remove_url_from_sources(url: str, sources_path: str):
-    persistence = PersistenceService(sources_path)
+    from src.utils.config_access import get_services_config
+    services_cfg = get_services_config()
+    pg_config = {
+        "password": read_secret("PG_PASSWORD"),
+        **services_cfg["postgres"],
+    }
+    persistence = PersistenceService(sources_path, pg_config=pg_config)
     persistence.delete_by_metadata_filter("url", url)
 
 

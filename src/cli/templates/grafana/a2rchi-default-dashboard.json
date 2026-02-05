@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Charts tracking A2rchi's usage.",
+  "description": "Charts tracking archi's usage.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
@@ -27,7 +27,7 @@
         "type": "postgres",
         "uid": "P44368ADAD746BC27"
       },
-      "description": "Number of queries handled by A2rchi per-hour.",
+      "description": "Number of queries handled by archi per-hour.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -188,7 +188,7 @@
           "editorMode": "code",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT\n  t.server_received_msg_ts AS time,\n  cfg.config_name AS metric,\n  EXTRACT(EPOCH FROM t.msg_duration) AS value\nFROM timing t\nJOIN conversations c ON t.mid = c.message_id\nJOIN configs cfg ON c.conf_id = cfg.config_id\nWHERE $__timeFilter(t.server_received_msg_ts)\nORDER BY time",
+          "rawSql": "SELECT\n  t.server_received_msg_ts AS time,\n  COALESCE(c.model_used, 'unknown') AS metric,\n  EXTRACT(EPOCH FROM t.msg_duration) AS value\nFROM timing t\nJOIN conversations c ON t.mid = c.message_id\nWHERE $__timeFilter(t.server_received_msg_ts)\nORDER BY time",
           "refId": "A",
           "sql": {
             "columns": [
@@ -210,7 +210,7 @@
           "table": "timing"
         }
       ],
-      "title": "A2rchi Response Time Histogram",
+      "title": "archi Response Time Histogram",
       "type": "histogram"
     },
     {
@@ -325,7 +325,7 @@
           "format": "table",
           "hide": false,
           "rawQuery": true,
-          "rawSql": "WITH msg_to_config AS (\n  SELECT c.message_id, cfg.config_name\n  FROM conversations c\n  JOIN configs cfg ON c.conf_id = cfg.config_id\n),\nfeedback_by_config AS (\n  SELECT f.feedback,\n         mtc.config_name\n  FROM feedback f\n  JOIN msg_to_config mtc ON f.mid = mtc.message_id\n  WHERE f.feedback IN ('like', 'dislike')\n)\nSELECT \n  COUNT(*) AS count,\n  feedback || '_' || config_name AS feedback,\n  config_name\nFROM feedback_by_config\nGROUP BY feedback, config_name\nORDER BY config_name,\n         CASE feedback WHEN 'like' THEN 1 ELSE 2 END;\n",
+          "rawSql": "WITH msg_to_model AS (\n  SELECT c.message_id,\n         COALESCE(c.model_used, 'unknown') AS model_name\n  FROM conversations c\n),\nfeedback_by_model AS (\n  SELECT f.feedback,\n         mtm.model_name\n  FROM feedback f\n  JOIN msg_to_model mtm ON f.mid = mtm.message_id\n  WHERE f.feedback IN ('like', 'dislike')\n)\nSELECT \n  COUNT(*) AS count,\n  feedback || '_' || model_name AS feedback,\n  model_name\nFROM feedback_by_model\nGROUP BY feedback, model_name\nORDER BY model_name,\n         CASE feedback WHEN 'like' THEN 1 ELSE 2 END;\n",
           "refId": "A",
           "sql": {
             "columns": [
@@ -604,7 +604,7 @@
           },
           "editorMode": "code",
           "rawQuery": true,
-          "rawSql": "WITH cleaned AS (\n  SELECT\n    a2rchi_service AS service,\n    conversation_id,\n    sender,\n    ts,\n    message_id,\n    regexp_replace(content, '<[^>]*>', '', 'g')::text AS clean_content,\n    link AS top_link,\n    context\n  FROM conversations\n)\nSELECT \n  service, \n  conversation_id, \n  sender, \n  ts, \n  CASE \n    WHEN service = 'Chatbot' THEN\n      clean_content || E'\\n\\n \\n\\nHistory:\\n\\n' ||\n      COALESCE((\n        SELECT string_agg(c2.sender || ': ' || c2.clean_content, E'\\n\\n' ORDER BY c2.message_id DESC)\n        FROM cleaned c2 \n        WHERE c2.conversation_id = cleaned.conversation_id \n        AND c2.message_id < cleaned.message_id\n      ), '')\n    ELSE clean_content\n  END AS message,\n  top_link, \n  context\nFROM cleaned\nWHERE ts >= $__timeFrom() AND ts < $__timeTo()\nORDER BY ts DESC\nLIMIT 100",
+          "rawSql": "WITH cleaned AS (\n  SELECT\n    archi_service AS service,\n    conversation_id,\n    sender,\n    ts,\n    message_id,\n    regexp_replace(content, '<[^>]*>', '', 'g')::text AS clean_content,\n    link AS top_link,\n    context\n  FROM conversations\n)\nSELECT \n  service, \n  conversation_id, \n  sender, \n  ts, \n  CASE \n    WHEN service = 'Chatbot' THEN\n      clean_content || E'\\n\\n \\n\\nHistory:\\n\\n' ||\n      COALESCE((\n        SELECT string_agg(c2.sender || ': ' || c2.clean_content, E'\\n\\n' ORDER BY c2.message_id DESC)\n        FROM cleaned c2 \n        WHERE c2.conversation_id = cleaned.conversation_id \n        AND c2.message_id < cleaned.message_id\n      ), '')\n    ELSE clean_content\n  END AS message,\n  top_link, \n  context\nFROM cleaned\nWHERE ts >= $__timeFrom() AND ts < $__timeTo()\nORDER BY ts DESC\nLIMIT 100",
           "sql": {
             "columns": [],
             "groupBy": [],
@@ -629,7 +629,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "A2rchi Usage",
+  "title": "archi Usage",
   "uid": "faf20efc-ffe5-48ae-9a26-debe655bf5a8",
   "version": 2,
   "weekStart": ""

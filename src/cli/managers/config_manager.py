@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 STATIC_FIELDS = ['global','services']
 
 class ConfigurationManager:
-    """Manages A2rchi configuration loading and validation"""
+    """Manages archi configuration loading and validation"""
     
     def __init__(self, config_paths_list: List[str], env):
         self.configs = []
@@ -41,6 +41,9 @@ class ConfigurationManager:
 
         if not config:
             raise ValueError("Configuration file is empty or invalid")
+
+        # Track origin for relative-path resolution (e.g., prompts).
+        config["_config_path"] = str(config_filepath)
 
         return config
     
@@ -71,7 +74,7 @@ class ConfigurationManager:
         # Base fields always required
         requirements = [
             'name', 
-            'a2rchi.pipelines'
+            'archi.pipelines'
         ]
 
         # Services that have additional required fields
@@ -101,14 +104,14 @@ class ConfigurationManager:
     
     def _get_active_pipeline_requirements(self,config) -> List[str]:
         """Get required prompt and/or model fields for the active pipeline"""
-        pipeline_names = config.get('a2rchi', {}).get('pipelines', "")
+        pipeline_names = config.get('archi', {}).get('pipelines', "")
         pipeline_requirements = []
         for pipeline_name in pipeline_names:
-            required_prompts = config.get('a2rchi', {}).get('pipeline_map', {}).get(pipeline_name, {}).get('prompts', {}).get('required', {})
-            required_models = config.get('a2rchi', {}).get('pipeline_map', {}).get(pipeline_name, {}).get('models', {}).get('required', {})
+            required_prompts = config.get('archi', {}).get('pipeline_map', {}).get(pipeline_name, {}).get('prompts', {}).get('required', {})
+            required_models = config.get('archi', {}).get('pipeline_map', {}).get(pipeline_name, {}).get('models', {}).get('required', {})
         
-            pipeline_requirements.extend([f'a2rchi.pipeline_map.{pipeline_name}.prompts.required.{prompt_name}' for prompt_name in required_prompts.keys()])
-            pipeline_requirements.extend([f'a2rchi.pipeline_map.{pipeline_name}.models.required.{model_name}' for model_name in required_models.keys()])
+            pipeline_requirements.extend([f'archi.pipeline_map.{pipeline_name}.prompts.required.{prompt_name}' for prompt_name in required_prompts.keys()])
+            pipeline_requirements.extend([f'archi.pipeline_map.{pipeline_name}.models.required.{model_name}' for model_name in required_models.keys()])
         
         return pipeline_requirements
     
@@ -236,9 +239,9 @@ class ConfigurationManager:
         """Get the active pipeline configuration"""
         pipeline_configs = []
         for config in self.configs:
-            pipeline_names = config.get("a2rchi", {}).get("pipelines")
+            pipeline_names = config.get("archi", {}).get("pipelines")
             for pipeline_name in pipeline_names:
-                pipeline_map = config.get("a2rchi", {}).get("pipeline_map", {})
+                pipeline_map = config.get("archi", {}).get("pipeline_map", {})
                 pipeline_configs.append(pipeline_map.get(pipeline_name, {}))
 
         if len(pipeline_configs)==0:
@@ -275,9 +278,9 @@ class ConfigurationManager:
         return self.input_list
     
     def _get_all_models(self, config): 
-        pipelines = config.get('a2rchi', {}).get('pipelines', [])
+        pipelines = config.get('archi', {}).get('pipelines', [])
 
-        file_models = [config.get('a2rchi', {}).get(pipeline, {}).get('models', {}) for pipeline in pipelines]
+        file_models = [config.get('archi', {}).get(pipeline, {}).get('models', {}) for pipeline in pipelines]
 
         unique_models_used = reduce(lambda acc,b:
                 acc | set(b.get('required', {}).values()) | set(b.get('optional', {}).values()),
