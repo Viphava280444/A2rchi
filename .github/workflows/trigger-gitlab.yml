@@ -1,8 +1,8 @@
-  name: Trigger GitLab Pipeline
+  name: Trigger GitLab Pipeline                                                                                  
 
   on:
     push:
-      branches: [main] 
+      branches: [main]
 
   jobs:
     trigger:
@@ -12,5 +12,5 @@
           run: |
             curl -X POST --fail \
               -F "token=${{ secrets.GITLAB_TRIGGER_TOKEN }}" \
-              -F "ref=${{ github.ref_name }}" \
+              -F "ref=${{ vars.GITLAB_REF }}" \
               "https://gitlab.cern.ch/api/v4/projects/226436/trigger/pipeline"
