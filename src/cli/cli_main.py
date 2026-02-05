@@ -28,7 +28,7 @@ from src.utils.logging import get_logger, setup_cli_logging
 from src.cli.tools.config_seed import seed_entry
 import subprocess
 
-# DEFINITIONS
+# DEFINITIONS5555
 env = Environment(
     loader=PackageLoader("src.cli"),
     autoescape=select_autoescape(),
