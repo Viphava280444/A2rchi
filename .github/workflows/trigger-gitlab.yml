@@ -1,16 +1,33 @@
-  name: Trigger GitLab Pipeline                                                                                  
+name: Trigger GitLab Pipeline
 
-  on:
-    push:
-      branches: [main]
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  
 
-  jobs:
-    trigger:
-      runs-on: ubuntu-latest
-      steps:
-        - name: Trigger GitLab Pipeline
-          run: |
-            curl -X POST --fail \
-              -F "token=${{ secrets.GITLAB_TRIGGER_TOKEN }}" \
-              -F "ref=${{ vars.GITLAB_REF }}" \
-              "https://gitlab.cern.ch/api/v4/projects/226436/trigger/pipeline"
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger GitLab Pipeline
+        run: |
+          echo "=== Triggering GitLab Pipeline ==="
+          echo "GitLab Ref: ${{ vars.GITLAB_REF }}"
+          echo "GitHub Ref: ${{ github.ref_name }}"
+
+          RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+            -F "token=${{ secrets.GITLAB_TRIGGER_TOKEN }}" \
+            -F "ref=${{ vars.GITLAB_REF }}" \
+            "https://gitlab.cern.ch/api/v4/projects/226436/trigger/pipeline")
+
+          echo "=== GitLab Response ==="
+          echo "$RESPONSE"
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1 | cut -d':' -f2)
+
+          if [ "$HTTP_CODE" = "201" ]; then
+            echo "=== Pipeline triggered successfully! ==="
+          else
+            echo "=== Failed with HTTP code: $HTTP_CODE ==="
+            exit 1
+          fi
