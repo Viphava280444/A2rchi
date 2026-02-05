@@ -4,7 +4,6 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
-
 concurrency:
   group: pr-preview-${{ github.event.pull_request.number }}
   cancel-in-progress: true
@@ -34,8 +33,8 @@ jobs:
     permissions:
       contents: read
     env:
-      A2RCHI_DIR: ${{ github.workspace }}/a2rchi-local
- 
+      ARCHI_DIR: ${{ github.workspace }}/archi-local
+
     outputs:
       changed: ${{ steps.detect.outputs.changed }}
       tag: ${{ steps.detect.outputs.tag }}
@@ -48,12 +47,12 @@ jobs:
       - name: Detect base image changes
         id: detect
         env:
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          MAIN_REF: main
         run: |
           set -euo pipefail
-          git fetch --no-tags origin "$BASE_REF"
-          FILES="$(git diff --name-only "origin/${BASE_REF}" HEAD || true)"
+          git fetch --no-tags origin "$MAIN_REF"
+          FILES="$(git diff --name-only "origin/${MAIN_REF}...HEAD" || true)"
           TAG="pr-${PR_NUMBER}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           PATTERN='^(requirements/(?:cpu|gpu)-requirementsHEADER\.txt|requirements/requirements-base\.txt|src/cli/templates/dockerfiles/base-[^/]+/Dockerfile)'
@@ -76,14 +75,14 @@ jobs:
           python-version: "3.11"
 
       - name: Set up Python (Self-hosted)
-        if: ${{ contains(runner.name, 'submit') && steps.detect.outputs.changed == 'true' }} 
+        if: ${{ contains(runner.name, 'submit') && steps.detect.outputs.changed == 'true' }}
         run: |
           export PYENV_ROOT="$HOME/.pyenv"
           export PATH="$PYENV_ROOT/bin:$PATH"
           eval "$(pyenv init -)"
           python3 --version
 
-      - name: Install a2rchi CLI
+      - name: Install archi CLI
         if: steps.detect.outputs.changed == 'true'
         run: |
           python -m pip install --upgrade pip
@@ -97,14 +96,6 @@ jobs:
         if: steps.detect.outputs.changed == 'true'
         run: scripts/dev/build_docker_images.sh "${{ steps.detect.outputs.tag }}"
 
-      - name: Push updated base images
-        if: steps.detect.outputs.changed == 'true'
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          PUSH_LATEST: "false"
-        run: scripts/dev/push_docker_images.sh "${{ steps.detect.outputs.tag }}"
-
   preview:
     runs-on: [self-hosted]
     needs: build-base-images
@@ -112,7 +103,7 @@ jobs:
       contents: read
       pull-requests: write
     env:
-      A2RCHI_DIR: ${{ github.workspace }}/a2rchi-local
+      ARCHI_DIR: ${{ github.workspace }}/archi-local
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -120,30 +111,43 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python (GitHub runner)
-        if: ${{ !contains(runner.name, 'submit') && steps.detect.outputs.changed == 'true' }}
+        if: ${{ !contains(runner.name, 'submit') }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Set up Python (Self-hosted)
-        if: ${{ contains(runner.name, 'submit') && steps.detect.outputs.changed == 'true' }}
+        if: ${{ contains(runner.name, 'submit') }}
         run: |
           export PYENV_ROOT="$HOME/.pyenv"
           export PATH="$PYENV_ROOT/bin:$PATH"
           eval "$(pyenv init -)"
           python3 --version
 
-      - name: Install a2rchi CLI
+      - name: Install archi CLI
         run: |
+          python3 -m venv /tmp/ci-venv
+          . /tmp/ci-venv/bin/activate
           python -m pip install --upgrade pip
           pip install ".[all]" || pip install .
 
+      - name: Install docker-compose (for act/local testing)
+        if: ${{ !contains(runner.name, 'submit') }}
+        run: |
+          curl -SL https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+          chmod +x /usr/local/bin/docker-compose
+          docker-compose version
+
       - name: Prepare base image references
         if: needs.build-base-images.outputs.changed == 'true'
-        run: python scripts/dev/update_service_base_images.py --tag "${{ needs.build-base-images.outputs.tag }}" --switch-source dockerhub
+        run: |
+          . /tmp/ci-venv/bin/activate
+          python scripts/dev/update_service_base_images.py --tag "${{ needs.build-base-images.outputs.tag }}" --switch-source localhost --orig-tag all
 
       - name: Verify MkDocs build
-        run: mkdocs build --config-file docs/mkdocs.yml --strict
+        run: |
+          . /tmp/ci-venv/bin/activate
+          mkdocs build --config-file docs/mkdocs.yml --strict
 
       - name: Clean up MkDocs build artifacts
         run: rm -rf site
@@ -153,21 +157,22 @@ jobs:
         with:
           deployment-name: manual-${{ github.run_id }}
           config-path: tests/pr_preview_config/pr_preview_config.yaml
-          config-destination: configs/ci/ci_config.yaml
-          env-file: .env
+          config-destination: configs/ci/ci_config.generated.yaml
           services: chatbot
           hostmode: "true"
-          wait-url: http://localhost:27861/api/health
-          base-url: http://localhost:27861
-          extra-env: A2RCHI_COMPOSE_UP_FLAGS=--build --pull
-          use-podman: "true"
+          wait-url: http://localhost:2786/api/health
+          base-url: http://localhost:2786
+          extra-env: ARCHI_COMPOSE_UP_FLAGS=--build
+          use-podman: ${{ contains(runner.name, 'submit') }}
 
-      - name: Delete PR preview Docker tags
+      - name: Cleanup local base images
         if: ${{ always() && needs.build-base-images.outputs.changed == 'true' }}
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          TAG: ${{ needs.build-base-images.outputs.tag }}
         run: |
           set -euo pipefail
-          python scripts/dev/manage_docker_tags.py delete-tag --tag "${TAG}"
+          TAG="${{ needs.build-base-images.outputs.tag }}"
+          echo "Cleaning up local base images with tag: $TAG"
+          docker rmi "localhost/archi/archi-python-base:${TAG}" || true
+          docker rmi "localhost/archi/archi-pytorch-base:${TAG}" || true
+          docker rmi "localhost/archi/archi-python-base:latest" || true
+          docker rmi "localhost/archi/archi-pytorch-base:latest" || true
+          echo "Cleanup complete"

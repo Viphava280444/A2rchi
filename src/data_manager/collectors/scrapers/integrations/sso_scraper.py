@@ -6,7 +6,7 @@ import re
 import time
 import urllib.parse
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -15,7 +15,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from src.data_manager.collectors.scrapers.scraped_resource import \
-    ScrapedResource
+    ScrapedResource, BrowserIntermediaryResult
 from src.utils.env import read_secret
 from src.utils.logging import get_logger
 
@@ -264,6 +264,25 @@ class SSOScraper(ABC):
         except Exception as e:
             logger.warning(f"Error during authentication: {e}")
             return None
+
+    def authenticate(self, url):
+        """Complete authentication flow and navigate to target URL."""
+        try:
+            if not self.driver:
+                self.setup_driver()
+                
+            # First navigate to trigger SSO
+            self.driver.get(url)
+            
+            # Login
+            if self.login():
+                # Navigate back to target page
+                return self.driver.get_cookies()
+            else:
+                return None
+        except Exception as e:
+            logger.warning(f"Error during authentication: {e}")
+            return None
         
     def __enter__(self):
         """Context manager entry point."""
@@ -316,11 +335,11 @@ class CERNSSOScraper(SSOScraper):
 class SSOCollector:
     """Collects resources behind SSO-protected URLs using configured scrapers."""
 
-    def __init__(self, sso_config: Dict[str, Dict]) -> None:
-        self._config = sso_config or {}
+    def __init__(self, selenium_config: Dict[str, Dict]) -> None:
+        self._config = selenium_config or {}
         self._enabled = self._config.get("enabled", False)
-        self._class_name = self._config.get("sso_class", "")
-        self._class_map = self._config.get("sso_class_map", {})
+        self._class_name = self._config.get("selenium_class", "")
+        self._class_map = self._config.get("selenium_class_map", {})
 
     def collect(self, url: str) -> List[ScrapedResource]:
         if not self._enabled:

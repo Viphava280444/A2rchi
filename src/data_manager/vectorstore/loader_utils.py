@@ -8,7 +8,6 @@ from langchain_community.document_loaders import (
     BSHTMLLoader,
     PyPDFLoader,
     PythonLoader,
-    UnstructuredMarkdownLoader,
 )
 from langchain_community.document_loaders.text import TextLoader
 from src.utils.logging import get_logger
@@ -25,10 +24,8 @@ def select_loader(file_path: str | Path):
     path = Path(file_path)
     _, file_extension = path.suffix, path.suffix
     file_extension = file_extension.lower()
-    if file_extension in {".txt", ".c", ".C"}:
+    if file_extension in {".txt", ".c", ".C", ".sh", ".h", ".php", ".yaml", ".yml", ".json", ".csv", ".tsv", ".log", ".rst", ".md"}:
         return TextLoader(str(path))
-    if file_extension == ".md":
-        return UnstructuredMarkdownLoader(str(path))
     if file_extension == ".py":
         return PythonLoader(str(path))
     if file_extension == ".html":
@@ -36,7 +33,7 @@ def select_loader(file_path: str | Path):
     if file_extension == ".pdf":
         return PyPDFLoader(str(path))
 
-    logger.debug("No loader available for %s", path)
+    logger.error("No loader available for %s", path)
     return None
 
 

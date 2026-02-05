@@ -3,15 +3,19 @@ import getpass
 import os
 
 from src.interfaces.chat_app.document_utils import add_username_password
-from src.utils.config_loader import load_config
 from src.utils.env import read_secret
 from src.utils.logging import get_logger, setup_logging
+from src.utils.postgres_service_factory import PostgresServiceFactory
+from src.utils.config_access import get_global_config
 
 setup_logging()
 logger = get_logger(__name__)
 
 # load config and create accounts path if it doesn't exist
-global_config = load_config()["global"]
+factory = PostgresServiceFactory.from_env(password_override=read_secret("PG_PASSWORD"))
+PostgresServiceFactory.set_instance(factory)
+
+global_config = get_global_config()
 os.makedirs(global_config["ACCOUNTS_PATH"], exist_ok=True)
 
 # read salt

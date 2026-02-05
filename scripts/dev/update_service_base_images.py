@@ -13,13 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DOCKERFILES_DIR = PROJECT_ROOT / "src" / "cli" / "templates" / "dockerfiles"
 
 BASE_IMAGE_MAP = {
-    "python": "a2rchi-python-base",
-    "pytorch": "a2rchi-pytorch-base",
+    "python": "archi-python-base",
+    "pytorch": "archi-pytorch-base",
 }
 
 SOURCE_PREFIXES = {
-    "localhost": "localhost/a2rchi/",
-    "dockerhub": "docker.io/a2rchi/",
+    "localhost": "localhost/archi/",
+    "dockerhub": "docker.io/archi/",
 }
 
 
@@ -83,7 +83,7 @@ def _update_line(line: str, base_name: str, options: UpdateOptions) -> Tuple[str
     if not stripped.startswith("FROM "):
         return line, False
 
-    match = re.match(r"(?P<intro>\s*FROM\s+)(?P<image>\S+)(?P<suffix>.*)", core)
+    match = re.match(r"(?P<intro>\s*FROM\s+(?:--platform=\S+\s+)?)(?P<image>\S+)(?P<suffix>.*)", core)
     if not match:
         return line, False
 
@@ -139,7 +139,7 @@ def update_base_tags(options: UpdateOptions) -> None:
 def parse_args() -> UpdateOptions:
     parser = argparse.ArgumentParser(description="Point service Dockerfiles at the given base image tag.")
     parser.add_argument("--tag", help="Base image tag to reference, e.g. v1.2.3")
-    parser.add_argument("--orig-tag", help="Only update lines currently using this tag", default="latest")
+    parser.add_argument("--orig-tag", help="Only update lines using this tag (use 'all' to match any)", default="latest")
     parser.add_argument(
         "--switch-source",
         choices=sorted(SOURCE_PREFIXES),
@@ -153,9 +153,12 @@ def parse_args() -> UpdateOptions:
         help="Base images to update",
     )
     args = parser.parse_args()
+    orig_tag = args.orig_tag
+    if orig_tag in ("all", ""):
+        orig_tag = None
     return UpdateOptions(
         tag=args.tag,
-        orig_tag=args.orig_tag,
+        orig_tag=orig_tag,
         switch_source=args.switch_source,
         bases=args.bases,
     )

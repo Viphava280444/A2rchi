@@ -61,7 +61,7 @@ class DeploymentPlan:
 
         # Track services in a consistent order for template rendering
         self.services: Dict[str, ServiceState] = {
-            "chromadb": ServiceState(),
+            "data-manager": ServiceState(),
             "postgres": ServiceState(),
             "chatbot": ServiceState(),
             "grafana": ServiceState(),
@@ -98,7 +98,7 @@ class DeploymentPlan:
             if state.enabled and state.volume_name:
                 volumes.add(state.volume_name)
         if self.gpu_ids:
-            volumes.add("a2rchi-models")
+            volumes.add("archi-models")
         return sorted(volumes)
 
     def get_required_secrets(self) -> List[str]:

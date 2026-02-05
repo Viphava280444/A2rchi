@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>archi - Data Viewer</title>
+  
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  
+  <!-- Syntax highlighting -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  
+  <!-- Markdown rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@9.0.0/marked.min.js"></script>
+  
+  <!-- App styles -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='chat.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='data.css') }}">
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='images/archi_notext.png') }}">
+</head>
+<body>
+  <div class="data-app">
+    <!-- Header -->
+    <header class="data-header">
+      <div class="header-left">
+        <a href="/chat" class="back-link" title="Back to Chat">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M19 12H5M12 19l-7-7 7-7"></path>
+          </svg>
+          <span>Chat</span>
+        </a>
+      </div>
+      <div class="header-center">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="header-icon">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <polyline points="14 2 14 8 20 8"></polyline>
+          <line x1="16" y1="13" x2="8" y2="13"></line>
+          <line x1="16" y1="17" x2="8" y2="17"></line>
+          <polyline points="10 9 9 9 8 9"></polyline>
+        </svg>
+        <h1>Data Sources</h1>
+      </div>
+      <div class="header-right">
+        <button class="refresh-btn" title="Refresh">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Stats Bar -->
+    <div class="stats-bar">
+      <div class="stat-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+          <polyline points="14 2 14 8 20 8"></polyline>
+        </svg>
+        <span class="stat-label">Documents:</span>
+        <span class="stat-value" id="stat-enabled">--</span>
+        <span class="stat-separator">/</span>
+        <span class="stat-value" id="stat-total">--</span>
+        <span class="stat-suffix">enabled</span>
+      </div>
+      <div class="stat-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+        </svg>
+        <span class="stat-label">Size:</span>
+        <span class="stat-value" id="stat-size">--</span>
+      </div>
+      <div class="stat-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"></circle>
+          <polyline points="12 6 12 12 16 14"></polyline>
+        </svg>
+        <span class="stat-label">Last sync:</span>
+        <span class="stat-value" id="stat-sync">--</span>
+      </div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="data-content">
+      <!-- Document List Panel -->
+      <div class="document-list-panel">
+        <div class="list-controls">
+          <div class="search-box">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="11" cy="11" r="8"></circle>
+              <path d="M21 21l-4.35-4.35"></path>
+            </svg>
+            <input type="text" id="search-input" placeholder="Search documents..." aria-label="Search documents">
+          </div>
+          <div class="filter-controls">
+            <select id="source-filter" class="filter-select" aria-label="Filter by source type">
+              <option value="all">All Types</option>
+              <option value="local">Local Files</option>
+              <option value="web">Web Pages</option>
+              <option value="ticket">Tickets</option>
+            </select>
+            <select id="enabled-filter" class="filter-select" aria-label="Filter by enabled state">
+              <option value="all">All</option>
+              <option value="enabled">Enabled</option>
+              <option value="disabled">Disabled</option>
+            </select>
+          </div>
+          <div class="bulk-actions">
+            <button class="bulk-btn bulk-enable" title="Enable all filtered">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="20 6 9 17 4 12"></polyline>
+              </svg>
+              Enable All
+            </button>
+            <button class="bulk-btn bulk-disable" title="Disable all filtered">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+              </svg>
+              Disable All
+            </button>
+          </div>
+        </div>
+        
+        <div class="document-list" id="document-list">
+          <div class="loading-state">
+            <div class="spinner"></div>
+            <span>Loading documents...</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Preview Panel -->
+      <div class="preview-panel">
+        <div class="preview-empty" id="preview-empty">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+          </svg>
+          <p>Select a document to preview</p>
+        </div>
+        
+        <div class="preview-content" id="preview-content" style="display: none;">
+          <div class="preview-header">
+            <div class="preview-title">
+              <span class="preview-icon" id="preview-icon"></span>
+              <h2 id="preview-name">Document Name</h2>
+            </div>
+            <div class="preview-toggle">
+              <label class="toggle-switch">
+                <input type="checkbox" id="preview-enabled" checked>
+                <span class="toggle-slider"></span>
+              </label>
+              <span class="toggle-label" id="toggle-label">Enabled</span>
+            </div>
+          </div>
+          
+          <div class="preview-metadata">
+            <div class="meta-item">
+              <span class="meta-label">Source:</span>
+              <span class="meta-value" id="preview-source">--</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">URL:</span>
+              <span class="meta-value" id="preview-url">--</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">Size:</span>
+              <span class="meta-value" id="preview-size">--</span>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">Ingested:</span>
+              <span class="meta-value" id="preview-date">--</span>
+            </div>
+          </div>
+          
+          <div class="preview-body">
+            <div class="content-loading" id="content-loading" style="display: none;">
+              <div class="spinner"></div>
+              <span>Loading content...</span>
+            </div>
+            <div class="content-viewer" id="content-viewer"></div>
+            <div class="content-truncated" id="content-truncated" style="display: none;">
+              <span>Content truncated</span>
+              <button class="show-more-btn" id="show-more-btn">Show full content</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container"></div>
+  </div>
+
+  <script src="{{ url_for('static', filename='data.js') }}"></script>
+</body>
+</html>

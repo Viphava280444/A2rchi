@@ -1,23 +1,23 @@
-# Basic configuration file for a A2RCHI deployment
+# Basic configuration file for a Archi deployment
 # with a chat app interface, agent, and
-# a ChromaDB instance for document storage.
+# PostgreSQL with pgvector for document storage.
 # The LLM is used through an existing Ollama server.
 #
 # run with:
-# a2rchi create --name my-a2rchi-agent --config examples/deployments/basic-agent/config.yaml --services chatbot --hostmode
+# archi create --name my-archi-agent --config examples/deployments/basic-agent/config.yaml --services chatbot --hostmode
 
-name: my_a2rchi
+name: my_archi
 
 services:
+  data_manager:
+    port: 7872
   chat_app:
     pipeline: CMSCompOpsAgent
     trained_on: "My data"
     port: 7868
     external_port: 7868
-  chromadb:
-    # running in hostmode, want to avoid taking the default chromadb port (8000) since it's usually taken by host already
-    chromadb_port: 8003
-    chromadb_external_port: 8003
+  vectorstore:
+    backend: postgres  # PostgreSQL with pgvector (only supported backend)
 
 data_manager:
   sources:
@@ -26,9 +26,17 @@ data_manager:
         - examples/deployments/basic-agent/miscellanea.list
   embedding_name: HuggingFaceEmbeddings
 
-a2rchi:
+archi:
   pipelines:
     - CMSCompOpsAgent
+  providers:
+    local:
+      enabled: true
+      base_url: http://submit76.mit.edu:7870 # make sure this matches your ollama server URL!
+      mode: ollama
+      default_model: "qwen3:32b" # make sure this matches a model you have downloaded locally with ollama
+      models:
+        - "qwen3:32b"
   pipeline_map:
     CMSCompOpsAgent:
       prompts:
@@ -36,9 +44,4 @@ a2rchi:
           agent_prompt: examples/deployments/basic-agent/agent.prompt
       models:
         required:
-          agent_model: OllamaInterface
-  model_class_map:
-    OllamaInterface:
-      kwargs:
-        url: http://submit76.mit.edu:7870 # make sure this matches your ollama server URL!
-        base_model: "qwen3:32b" # make sure this matches a model you have downloaded locally with ollama
+          agent_model: local/qwen3:32b

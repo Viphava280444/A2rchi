@@ -6,11 +6,9 @@ global:
 data_manager:
   input_lists:
     - examples/deployments/grading/course_materials.list
-  chromadb_port: 8000
-  chromadb_external_port: 8001
   embedding_name: HuggingFaceEmbeddings
 
-a2rchi:
+archi:
   pipeline: GradingPipeline
   pipeline_map:
     GradingPipeline:

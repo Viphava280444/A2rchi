@@ -17,16 +17,16 @@ from ragas.llms import LangchainLLMWrapper
 from ragas.metrics import (answer_relevancy, context_precision, context_recall,
                            faithfulness)
 
-from src.a2rchi.a2rchi import A2rchi
-from src.a2rchi.models import HuggingFaceOpenLLM
-from src.data_manager.data_manager import DataManager
+from src.archi.archi import archi
+from src.archi.providers import get_model
 from src.utils.env import read_secret
 from src.utils.logging import get_logger, setup_logging
 from src.utils.generate_benchmark_report import parse_benchmark_results, format_html_output
+from src.utils.postgres_service_factory import PostgresServiceFactory
 
-CONFIG_PATH = "/root/A2rchi/config.yaml"
-OUTPUT_PATH = "/root/A2rchi/benchmarks"
-EXTRA_METADATA_PATH = "/root/A2rchi/git_info.yaml"
+CONFIG_PATH = "/root/archi/config.yaml"
+OUTPUT_PATH = "/root/archi/benchmarks"
+EXTRA_METADATA_PATH = "/root/archi/git_info.yaml"
 OUTPUT_DIR = Path(OUTPUT_PATH)
 
 setup_logging()
@@ -36,6 +36,9 @@ os.environ['OPENAI_API_KEY'] = read_secret("OPENAI_API_KEY")
 os.environ['ANTHROPIC_API_KEY'] = read_secret("ANTHROPIC_API_KEY")
 os.environ['HUGGING_FACE_HUB_TOKEN'] = read_secret("HUGGING_FACE_HUB_TOKEN")
 
+factory = PostgresServiceFactory.from_env(password_override=os.environ.get("PG_PASSWORD"))
+PostgresServiceFactory.set_instance(factory)
+
 
 class ResultHandler:
     results = [] # store the results for each config
@@ -43,9 +46,9 @@ class ResultHandler:
 
     @staticmethod
     def map_prompts(config: Dict[str, Any]):
-        pipe = config.get('a2rchi', {}).get('pipelines')[0]
+        pipe = config.get('archi', {}).get('pipelines')[0]
 
-        prompts = config.get('a2rchi',{}).get('pipeline_map').get(pipe).get('prompts')
+        prompts = config.get('archi',{}).get('pipeline_map').get(pipe).get('prompts')
 
         for _, prompts in prompts.items():
             for prompt_name, file_path in prompts.items():
@@ -131,7 +134,6 @@ class Benchmarker:
         self.previous_input_list = []
         self.chain = None 
         self.config = None 
-        self.data_manager = None 
         self.current_config = None 
 
         self.load_new_configuration()
@@ -150,19 +152,9 @@ class Benchmarker:
         if self.current_config == 'FINISHED': return
         with open(self.current_config, "r") as f:
             config = yaml.safe_load(f)
-        current_input_list = config.get('data_manager', {}).get('sources', {}).get('links', {}).get('input_lists', [])
 
         with open(CONFIG_PATH, 'w') as f: 
             yaml.dump(config, stream=f)
-
-        # for now we just reset the datamanager entirely every time,
-        # in the future we should add support for hot config swapping so 
-        # documents dont need to be reinputted unnecessarily
-        if self.data_manager:
-            del self.data_manager
-        self.data_manager = DataManager()
-        self.data_manager.update_vectorstore()
-        self.previous_input_list = current_input_list
 
         del self.chain
         self.config = config 
@@ -174,9 +166,9 @@ class Benchmarker:
 
         # for now it only uses one pipeline (the first one) but maybe later we make this work for mulitple
         logger.info(f"loaded new configuration: {self.current_config}")
-        pipeline = config.get('a2rchi').get('pipelines')[0]
+        pipeline = config.get('archi').get('pipelines')[0]
 
-        self.chain = A2rchi(pipeline) 
+        self.chain = archi(pipeline) 
 
 
     def get_ragas_llm_evaluator(self):
@@ -193,7 +185,8 @@ class Benchmarker:
                 base_url = provider_settings['base_url']
                 return ChatOllama(model=model_name, base_url=base_url,num_predict=-2,model_kwargs={'format': 'json'})
             case "huggingface":
-                return HuggingFaceOpenLLM(base_model=model_name)
+                base_url = provider_settings.get("base_url") or "http://localhost:8000/v1"
+                return get_model("local", model_name, base_url=base_url, local_mode="openai_compat")
             case "anthropic":
                 from langchain_anthropic import ChatAnthropic
                 return ChatAnthropic(model=model_name)
@@ -228,7 +221,7 @@ class Benchmarker:
         n_sources = len(question_item.get('sources', []))
         if not match_fields:
             # hardcode a default if nothing is provided
-            match_fields = ['display_name'] * n_sources
+            match_fields = ['file_name'] * n_sources
         elif len(match_fields) == 1 and n_sources > 1:
             # expand single field to all sources
             match_fields = match_fields * n_sources
@@ -283,11 +276,13 @@ class Benchmarker:
                             'type': 'tool_call',
                             'tool_name': tool_call.get('name'),
                             'tool_args': tool_call.get('args',{}).get('query', 'No query found.'),
+                            'total_duration': getattr(msg, 'response_metadata', {}).get('total_duration', None),
                         })
                 elif hasattr(msg, 'content'):
                     formatted_messages.append({
                         'type': 'ai_message',
                         'content': msg.content,
+                        'total_duration': getattr(msg, 'response_metadata', {}).get('total_duration', None),
                     })
             elif type(msg) is HumanMessage:
                 # we don't store these...

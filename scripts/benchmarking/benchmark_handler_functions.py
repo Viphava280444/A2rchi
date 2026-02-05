@@ -333,18 +333,18 @@ class output_handler:
     
     def get_models_configs(self, name):
         config = self.config_info[name]
-        pipeline_name = config.get('a2rchi').get('pipelines')[0]
+        pipeline_name = config.get('archi').get('pipelines')[0]
 
-        return config.get('a2rchi').get('pipeline_map').get(pipeline_name).get('models')
+        return config.get('archi').get('pipeline_map').get(pipeline_name).get('models')
 
-    def get_model_class_map(self, name):
+    def get_providers(self, name):
         config = self.config_info[name]
-        return config.get('model_class_map') 
+        return (config.get('archi') or {}).get('providers', {})
 
     def get_prompts(self, name):
         config = self.config_info[name]
-        pipeline_name = config.get('a2rchi').get('pipelines')[0]
-        return config.get('a2rchi').get('pipeline_map').get(pipeline_name).get('prompts')
+        pipeline_name = config.get('archi').get('pipelines')[0]
+        return config.get('archi').get('pipeline_map').get(pipeline_name).get('prompts')
 
     def get_dfs(self):
         return self.dfs

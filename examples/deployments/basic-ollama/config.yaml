@@ -1,45 +1,58 @@
-# Basic configuration file for a A2RCHI deployment
+# Basic configuration file for a Archi deployment
 # with a chat app interface, a QA pipeline, and
-# a ChromaDB instance for document storage.
+# PostgreSQL with pgvector for document storage.
 # The LLM is used through an existing Ollama server.
 #
 # run with:
-# a2rchi create --name my-a2rchi-ollama --config examples/deployments/basic-ollama/config.yaml --services chatbot --hostmode
+# archi create --name my-archi-ollama --config examples/deployments/basic-ollama/config.yaml --services chatbot --hostmode
 
-name: my_a2rchi
+name: my_archi
 
 services:
   chat_app:
+    pipeline: CMSCompOpsAgent
     trained_on: "My data"
-    port: 7868
-    external_port: 7868
-  chromadb:
-    # running in hostmode, want to avoid taking the default chromadb port (8000) since it's usually taken by host already
-    chromadb_port: 8003
-    chromadb_external_port: 8003
+    port: 7866
+    external_port: 7866
+  vectorstore:
+    backend: postgres  # PostgreSQL with pgvector (only supported backend)
+  data_manager:
+    port: 7889
+    external_port: 7889
 
 data_manager:
   sources:
+    jira:
+      max_tickets: 10
+      url: https://its.cern.ch/jira/
+      projects:
+        - "CMSPROD"
     links:
       input_lists:
         - examples/deployments/basic-ollama/miscellanea.list
+    redmine:
+      url: https://cleo.mit.edu
+      projects:
+        - emails-to-ticket
   embedding_name: HuggingFaceEmbeddings
 
-a2rchi:
+archi:
   pipelines:
-    - QAPipeline
+    - CMSCompOpsAgent
+  providers:
+    local:
+      enabled: true
+      base_url: http://localhost:7870 # make sure this matches your ollama server URL!
+      mode: ollama
+      default_model: "qwen3:32b" # make sure this matches a model you have downloaded locally with ollama
+      models:
+        - "gpt-oss:120b"
+        - "qwen3:32b"
   pipeline_map:
-    QAPipeline:
+    CMSCompOpsAgent:
       prompts:
         required:
-          condense_prompt: examples/deployments/basic-ollama/condense.prompt
-          chat_prompt: examples/deployments/basic-ollama/qa.prompt
+          agent_prompt: examples/deployments/basic-ollama/agent.prompt
       models:
         required:
-          chat_model: OllamaInterface
-          condense_model: OllamaInterface
-  model_class_map:
-    OllamaInterface:
-      kwargs:
-        url: http://localhost:7870 # make sure this matches your ollama server URL!
-        base_model: "gemma3" # make sure this matches a model you have downloaded locally with ollama
+          agent_model: local/qwen3:32b

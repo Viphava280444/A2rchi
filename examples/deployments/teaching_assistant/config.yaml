@@ -1,16 +1,18 @@
-# Basic configuration file for a A2RCHI deployment
+# Basic configuration file for a Archi deployment
 # with a chat app interface, a QA pipeline, and
-# a ChromaDB instance for document storage.
+# PostgreSQL with pgvector for document storage.
 # The LLM is a locally hosted VLLM instance on GPUs.
 #
 # run with:
-# a2rchi create --name my-a2rchi --config examples/deployments/teaching_assistant/config.yaml --podman --services chatbot --gpu-ids=all
+# archi create --name my-archi --config examples/deployments/teaching_assistant/config.yaml --podman --services chatbot --gpu-ids=all
 
-name: my_a2rchi
+name: my_archi
 
 services:
   chat_app:
     trained_on: "My data"
+  vectorstore:
+    backend: postgres  # PostgreSQL with pgvector (only supported backend)
    
 data_manager:
   sources:
@@ -19,9 +21,17 @@ data_manager:
         - examples/deployments/teaching_assistant/course_materials.list
   embedding_name: HuggingFaceEmbeddings
 
-a2rchi:
+archi:
   pipelines:
     - QAPipeline
+  providers:
+    local:
+      enabled: true
+      base_url: http://localhost:8000/v1  # VLLM/OpenAI-compatible endpoint
+      mode: openai_compat
+      default_model: "Qwen/Qwen2.5-7B-Instruct-1M"
+      models:
+        - "Qwen/Qwen2.5-7B-Instruct-1M"
   pipeline_map:
     QAPipeline:
       prompts:
@@ -30,14 +40,5 @@ a2rchi:
           chat_prompt: examples/deployments/teaching_assistant/teaching_assistant.prompt
       models:
         required:
-          chat_model: VLLM
-          condense_model: VLLM
-  model_class_map:
-    VLLM:
-      kwargs:
-        base_model: 'Qwen/Qwen2.5-7B-Instruct-1M'
-        quantization: True
-        max_model_len: 32768
-        tensor_parallel_size: 2
-        repetition_penalty: 1.0
-        gpu_memory_utilization: 0.5
+          chat_model: local/Qwen/Qwen2.5-7B-Instruct-1M
+          condense_model: local/Qwen/Qwen2.5-7B-Instruct-1M

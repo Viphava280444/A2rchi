@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM docker.io/a2rchi/a2rchi-python-base:latest 
-RUN mkdir -p /root/A2rchi
-WORKDIR /root/A2rchi
+RUN mkdir -p /root/archi
+WORKDIR /root/archi
 
 COPY LICENSE LICENSE
 
@@ -21,8 +21,7 @@ RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.36.0/ge
     && chmod +x /usr/local/bin/geckodriver \
     && rm "geckodriver-v0.36.0-linux64.tar.gz"
 
-COPY a2rchi_code src
-COPY prompts prompts
+COPY archi_code src
 COPY configs configs
 COPY pyproject.toml pyproject.toml
 COPY git_info.yaml git_info.yaml
@@ -32,7 +31,8 @@ COPY weblists weblists
 RUN pip install --upgrade pip && pip install .
 RUN pip install pandas
 RUN pip install ragas==0.3.5
+RUN pip install langchain-openai==1.0.1
 
-RUN chmod g+rx /root; chmod -R g+w /root/A2rchi/src/interfaces
+RUN chmod g+rx /root; chmod -R g+w /root/archi/src/interfaces
 
 CMD ["python", "-u", "src/bin/service_benchmark.py"] 

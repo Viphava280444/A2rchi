@@ -1,15 +1,17 @@
 import copy
 import os
 import shutil
+import socket
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from jinja2 import Environment
 
 from src.cli.service_registry import service_registry
 from src.cli.utils.service_builder import DeploymentPlan
+from src.cli.utils.grafana_styling import assign_feedback_palette
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -18,10 +20,10 @@ logger = get_logger(__name__)
 # Template file constants
 BASE_CONFIG_TEMPLATE = "base-config.yaml"
 BASE_COMPOSE_TEMPLATE = "base-compose.yaml"
-BASE_INIT_SQL_TEMPLATE = "base-init.sql"
+BASE_INIT_SQL_TEMPLATE = "init.sql"  # PostgreSQL + pgvector schema
 BASE_GRAFANA_DATASOURCES_TEMPLATE = "grafana/datasources.yaml"
 BASE_GRAFANA_DASHBOARDS_TEMPLATE = "grafana/dashboards.yaml"
-BASE_GRAFANA_A2RCHI_DEFAULT_DASHBOARDS_TEMPLATE = "grafana/a2rchi-default-dashboard.json"
+BASE_GRAFANA_ARCHI_DEFAULT_DASHBOARDS_TEMPLATE = "grafana/archi-default-dashboard.json"
 BASE_GRAFANA_CONFIG_TEMPLATE = "grafana/grafana.ini"
 
 
@@ -94,8 +96,9 @@ class TemplateContext:
 class TemplateManager:
     """Manages template rendering and file preparation using service registry"""
 
-    def __init__(self, jinja_env: Environment):
+    def __init__(self, jinja_env: Environment, verbosity: int):
         self.env = jinja_env
+        self.global_verbosity = verbosity
         self.registry = service_registry
         self._service_hooks: Dict[str, Callable[[TemplateContext], None]] = {
             "grafana": self._render_grafana_assets,
@@ -146,7 +149,35 @@ class TemplateManager:
 
     # individual stages
     def _stage_prompts(self, context: TemplateContext) -> None:
+        # Copy default prompt templates (condense/, chat/, system/ structure)
+        self._copy_default_prompts(context)
+        # Collect pipeline-specific prompt mappings
         context.prompt_mappings = self._collect_prompt_mappings(context)
+
+    def _copy_default_prompts(self, context: TemplateContext) -> None:
+        """Copy default prompt templates to deployment for PromptService."""
+        # Source from examples/defaults/prompts/ (not source code)
+        repo_root = Path(__file__).parent.parent.parent.parent
+        defaults_prompts_dir = repo_root / "examples" / "defaults" / "prompts"
+        # Deploy to data/prompts/ (admin-editable location)
+        deployment_prompts_dir = context.base_dir / "data" / "prompts"
+        
+        if not defaults_prompts_dir.exists():
+            logger.warning(f"Default prompts directory not found: {defaults_prompts_dir}")
+            return
+        
+        # Copy the entire prompts directory structure (condense/, chat/, system/)
+        for prompt_type in ["condense", "chat", "system"]:
+            src_dir = defaults_prompts_dir / prompt_type
+            dst_dir = deployment_prompts_dir / prompt_type
+            
+            if src_dir.exists():
+                dst_dir.mkdir(parents=True, exist_ok=True)
+                for prompt_file in src_dir.glob("*.prompt"):
+                    dst_file = dst_dir / prompt_file.name
+                    if not dst_file.exists():  # Don't overwrite existing prompts
+                        shutil.copyfile(prompt_file, dst_file)
+                        logger.debug(f"Copied default prompt: {prompt_type}/{prompt_file.name}")
 
     def _stage_configs(self, context: TemplateContext) -> None:
         self._render_config_files(context)
@@ -187,22 +218,35 @@ class TemplateManager:
 
     # prompt preparation
     def _collect_prompt_mappings(self, context: TemplateContext) -> Dict[str, Dict[str, str]]:
-        prompts_path = context.base_dir / "prompts"
-        prompts_path.mkdir(exist_ok=True)
+        # Config-specified prompts go to data/prompts/ (same as default prompts)
+        prompts_path = context.base_dir / "data" / "prompts"
+        prompts_path.mkdir(parents=True, exist_ok=True)
 
         configs = context.config_manager.get_configs()
         prompt_mappings: Dict[str, Dict[str, str]] = {}
         for config in configs:
             name = config["name"]
-            pipeline_names = config.get("a2rchi", {}).get("pipelines") or []
+            config_path = config.get("_config_path")
+            config_dir = Path(config_path).expanduser().parent if config_path else None
+            pipeline_names = config.get("archi", {}).get("pipelines") or []
             for pipeline_name in pipeline_names:
-                pipeline_config = config.get("a2rchi", {}).get("pipeline_map", {}).get(pipeline_name, {})
+                pipeline_config = config.get("archi", {}).get("pipeline_map", {}).get(pipeline_name, {})
                 prompts_config = pipeline_config.get("prompts", {})
-                prompt_mappings[name] = self._copy_pipeline_prompts(context.base_dir, prompts_config)
+                prompt_mappings[name] = self._copy_pipeline_prompts(
+                    context.base_dir,
+                    prompts_config,
+                    config_dir=config_dir,
+                )
 
         return prompt_mappings
 
-    def _copy_pipeline_prompts(self, base_dir: Path, prompts_config: Dict[str, Any]) -> Dict[str, str]:
+    def _copy_pipeline_prompts(
+        self,
+        base_dir: Path,
+        prompts_config: Dict[str, Any],
+        *,
+        config_dir: Optional[Path] = None,
+    ) -> Dict[str, str]:
         prompt_mappings: Dict[str, str] = {}
 
         for _, section_prompts in prompts_config.items():
@@ -214,15 +258,19 @@ class TemplateManager:
                     continue
 
                 source_path = Path(prompt_path).expanduser()
+                if not source_path.is_absolute() and config_dir:
+                    # Prefer config-relative paths but fall back to CWD if it already exists.
+                    if not source_path.exists():
+                        source_path = (config_dir / source_path).resolve()
                 if not source_path.exists():
                     logger.warning(f"Prompt file not found: {prompt_path}")
                     continue
 
-                target_path = base_dir / "prompts" / source_path.name
+                target_path = base_dir / "data" / "prompts" / source_path.name
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source_path, target_path)
 
-                prompt_mappings[prompt_key] = f"/root/A2rchi/prompts/{source_path.name}"
+                prompt_mappings[prompt_key] = f"/root/archi/data/prompts/{source_path.name}"
                 logger.debug(f"Copied prompt {prompt_key} to {target_path}")
 
         return prompt_mappings
@@ -232,17 +280,18 @@ class TemplateManager:
         configs_path = context.base_dir / "configs"
         configs_path.mkdir(exist_ok=True)
 
-        a2rchi_configs = context.config_manager.get_configs()
-        for a2rchi_config in a2rchi_configs:
-            name = a2rchi_config["name"]
-            updated_config = copy.deepcopy(a2rchi_config)
+        archi_configs = context.config_manager.get_configs()
+        single_mode = len(archi_configs) == 1
+        for archi_config in archi_configs:
+            name = archi_config["name"]
+            updated_config = copy.deepcopy(archi_config)
 
             prompt_mapping = context.prompt_mappings.get(name, {})
-            pipeline_names = updated_config.get("a2rchi", {}).get("pipelines") or []
+            pipeline_names = updated_config.get("archi", {}).get("pipelines") or []
 
             for pipeline_name in pipeline_names:
                 pipeline_config = (
-                    updated_config.get("a2rchi", {}).get("pipeline_map", {}).get(pipeline_name, {})
+                    updated_config.get("archi", {}).get("pipeline_map", {}).get(pipeline_name, {})
                 )
                 prompts_config = pipeline_config.get("prompts", {})
 
@@ -259,19 +308,15 @@ class TemplateManager:
 
             if context.plan.host_mode:
                 updated_config["host_mode"] = context.plan.host_mode
-                chroma_cfg = updated_config.get("services", {}).get("chromadb", {})
-                external_port = chroma_cfg.get("chromadb_external_port")
-                if external_port:
-                    updated_config.setdefault("services", {}).setdefault("chromadb", {})[
-                        "chromadb_port"
-                    ] = external_port
+                self._apply_host_mode_port_overrides(updated_config)
 
             config_template = self.env.get_template(BASE_CONFIG_TEMPLATE)
             config_rendered = config_template.render(verbosity=context.plan.verbosity, **updated_config)
 
-            with open(configs_path / f"{name}.yaml", "w") as f:
+            target_name = "config.yaml" if single_mode else f"{name}.yaml"
+            with open(configs_path / target_name, "w") as f:
                 f.write(config_rendered)
-            logger.info(f"Rendered configuration file {configs_path / name}.yaml")
+            logger.info(f"Rendered configuration file {configs_path / target_name}")
 
     # service-specific assets
     def _render_grafana_assets(self, context: TemplateContext) -> None:
@@ -296,22 +341,14 @@ class TemplateManager:
         with open(grafana_dir / "dashboards.yaml", "w") as f:
             f.write(dashboards)
 
-        a2rchi_config = context.config_manager.get_configs()[0]
-        pipeline_name = a2rchi_config.get("a2rchi", {}).get("pipeline")
-        pipeline_config = (
-            a2rchi_config.get("a2rchi", {})
-            .get("pipeline_map", {})
-            .get(pipeline_name, {}) if pipeline_name else {}
-        )
-        models_config = pipeline_config.get("models", {})
-        model_name = next(iter(models_config.values())) if models_config else "DumbLLM"
+        configs = context.config_manager.get_configs()
+        palette = assign_feedback_palette(configs)
 
-        dashboard_template = self.env.get_template(BASE_GRAFANA_A2RCHI_DEFAULT_DASHBOARDS_TEMPLATE)
+        dashboard_template = self.env.get_template(BASE_GRAFANA_ARCHI_DEFAULT_DASHBOARDS_TEMPLATE)
         dashboard = dashboard_template.render(
-            prod_config_name=context.plan.name,
-            prod_model_name=model_name,
+            feedback_palette=palette,
         )
-        with open(grafana_dir / "a2rchi-default-dashboard.json", "w") as f:
+        with open(grafana_dir / "archi-default-dashboard.json", "w") as f:
             f.write(dashboard)
 
         config_template = self.env.get_template(BASE_GRAFANA_CONFIG_TEMPLATE)
@@ -320,8 +357,8 @@ class TemplateManager:
             f.write(grafana_config)
 
     def _copy_grader_assets(self, context: TemplateContext) -> None:
-        a2rchi_config = context.config_manager.get_configs()[0]
-        grader_config = a2rchi_config.get("services", {}).get("grader_app", {})
+        archi_config = context.config_manager.get_configs()[0]
+        grader_config = archi_config.get("services", {}).get("grader_app", {})
 
         users_csv_dir = grader_config.get("local_users_csv_dir")
         if users_csv_dir:
@@ -345,22 +382,54 @@ class TemplateManager:
         grafana_pg_password = (
             context.secrets_manager.get_secret("GRAFANA_PG_PASSWORD") if grafana_enabled else ""
         )
-
+        
+        # PostgreSQL + pgvector schema
         init_sql_template = self.env.get_template(BASE_INIT_SQL_TEMPLATE)
+        
+        # Get embedding dimensions from data_manager config
+        data_manager_config = context.config_manager.config.get("data_manager", {})
+        embedding_class_map = data_manager_config.get("embedding_class_map", {})
+        embedding_name = data_manager_config.get("embedding_name", "all-MiniLM-L6-v2")
+        
+        # Default dimensions based on common embedding models
+        default_dimensions = {
+            "all-MiniLM-L6-v2": 384,
+            "text-embedding-ada-002": 1536,
+            "text-embedding-3-small": 1536,
+            "text-embedding-3-large": 3072,
+        }
+        embedding_dimensions = default_dimensions.get(embedding_name, 384)
+        
+        # Allow override from config
+        if embedding_name in embedding_class_map:
+            embedding_dimensions = embedding_class_map[embedding_name].get(
+                "dimensions", embedding_dimensions
+            )
+        
         init_sql = init_sql_template.render(
             use_grafana=grafana_enabled,
             grafana_pg_password=grafana_pg_password,
+            embedding_dimensions=embedding_dimensions,
+            # Vector index settings (optional overrides)
+            vector_index_type=data_manager_config.get("vector_index_type", "hnsw"),
+            vector_index_hnsw_m=data_manager_config.get("vector_index_hnsw_m", 16),
+            vector_index_hnsw_ef=data_manager_config.get("vector_index_hnsw_ef", 64),
         )
-
         dest = context.base_dir / "init.sql"
+
         with open(dest, "w") as f:
             f.write(init_sql)
         logger.debug(f"Wrote PostgreSQL init script to {dest}")
 
+
     def _render_compose_file(self, context: TemplateContext) -> None:
         template_vars = context.plan.to_template_vars()
-        template_vars.update(self._extract_port_config(context))
+        port_config = self._extract_port_config(context)
+        allow_port_reuse = context.get_option("allow_port_reuse", False)
+        self._check_ports_available(context, port_config, allow_port_reuse=allow_port_reuse)
+        template_vars.update(port_config)
         template_vars.setdefault("postgres_port", context.config_manager.config.get("services", {}).get("postgres", {}).get("port", 5432))
+        template_vars.setdefault("verbosity", self.global_verbosity)
 
         template_vars["app_version"] = get_git_version()
 
@@ -381,40 +450,155 @@ class TemplateManager:
 
     def _extract_port_config(self, context: TemplateContext) -> Dict[str, Any]:
         port_config: Dict[str, Any] = {}
+        host_mode = context.plan.host_mode
+        base_config = (context.config_manager.get_configs() or [{}])[0]
 
         for service_name, service_def in self.registry.get_all_services().items():
-            if service_def.default_host_port:
-                port_config[f"{service_name}_port_host"] = service_def.default_host_port
-            if service_def.default_container_port:
-                port_config[f"{service_name}_port_container"] = service_def.default_container_port
+            key_prefix = service_name.replace("-", "_")
+            host_port = service_def.default_host_port
+            container_port = service_def.default_container_port
 
             if service_def.port_config_path:
                 try:
-                    config_value: Any = context.config_manager.get_configs()[0]
+                    config_value: Any = base_config
                     for key in service_def.port_config_path.split('.'):
                         config_value = config_value[key]
 
-                    if isinstance(config_value, dict):
-                        host_port = config_value.get('external_port', service_def.default_host_port)
-                        container_port = config_value.get('port', service_def.default_container_port)
-                    else:
-                        host_port = config_value
-                        container_port = service_def.default_container_port
-
-                    if host_port:
-                        port_config[f"{service_name}_port_host"] = host_port
-                    if container_port:
-                        port_config[f"{service_name}_port_container"] = container_port
+                    host_port, container_port = self._resolve_ports_from_config(
+                        config_value,
+                        host_mode=host_mode,
+                        host_default=host_port,
+                        container_default=container_port,
+                    )
                 except (KeyError, TypeError):
-                    continue
+                    pass
+
+            if host_port:
+                port_config[f"{key_prefix}_port_host"] = host_port
+            if container_port:
+                port_config[f"{key_prefix}_port_container"] = container_port
 
         return port_config
 
+    def _check_ports_available(self, context: TemplateContext, port_config: Dict[str, Any], *, allow_port_reuse: bool = False) -> None:
+        host_mode = context.plan.host_mode
+        enabled_services = context.plan.get_enabled_services()
+        base_config = (context.config_manager.get_configs() or [{}])[0]
+        services_cfg = base_config.get("services", {}) if isinstance(base_config, dict) else {}
+
+        port_usages: List[tuple[int, str, Optional[str]]] = []
+        for service_name in enabled_services:
+            if service_name not in self.registry.get_all_services():
+                continue
+            key_prefix = service_name.replace("-", "_")
+            host_port = port_config.get(f"{key_prefix}_port_host")
+            if host_port is None:
+                continue
+            service_def = self.registry.get_service(service_name)
+            config_hint = self._service_port_config_hint(service_def, host_mode)
+            port_usages.append(
+                (self._normalize_port(host_port, service_name, config_hint), service_name, config_hint)
+            )
+
+        if host_mode and context.plan.get_service("postgres").enabled:
+            postgres_port = services_cfg.get("postgres", {}).get("port", 5432)
+            port_usages.append(
+                (self._normalize_port(postgres_port, "postgres", "services.postgres.port"), "postgres", "services.postgres.port")
+            )
+
+        if not port_usages:
+            return
+
+        port_to_services: Dict[int, List[tuple[str, Optional[str]]]] = {}
+        for port, service_name, config_hint in port_usages:
+            port_to_services.setdefault(port, []).append((service_name, config_hint))
+
+        errors: List[str] = []
+        for port, services in sorted(port_to_services.items()):
+            if len(services) > 1:
+                details = ", ".join(
+                    f"{service} ({hint})" if hint else service for service, hint in services
+                )
+                errors.append(f"Port {port} is assigned to multiple services: {details}")
+
+        if not allow_port_reuse:
+            for port, services in sorted(port_to_services.items()):
+                error = self._probe_port(port)
+                if error:
+                    details = ", ".join(
+                        f"{service} ({hint})" if hint else service for service, hint in services
+                    )
+                    errors.append(f"Port {port} is already in use ({details}): {error}")
+
+        if errors:
+            raise ValueError("Port check failed:\n" + "\n".join(errors))
+
+    def _service_port_config_hint(self, service_def, host_mode: bool) -> Optional[str]:
+        if not service_def.port_config_path:
+            return None
+        suffix = "port" if host_mode else "external_port"
+        return f"{service_def.port_config_path}.{suffix}"
+
+    def _normalize_port(self, port: Any, service_name: str, config_hint: Optional[str]) -> int:
+        try:
+            port_value = int(port)
+        except (TypeError, ValueError):
+            location = f" ({config_hint})" if config_hint else ""
+            raise ValueError(f"Invalid port value '{port}' for {service_name}{location}")
+
+        if port_value < 1 or port_value > 65535:
+            location = f" ({config_hint})" if config_hint else ""
+            raise ValueError(f"Port out of range for {service_name}{location}: {port_value}")
+
+        return port_value
+
+    def _probe_port(self, port: int) -> Optional[str]:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("0.0.0.0", port))
+            except OSError as exc:
+                return str(exc)
+        return None
+
     def _get_grader_rubrics(self, config_manager) -> List[str]:
-        a2rchi_config = config_manager.get_configs()[0]
-        grader_config = a2rchi_config.get('services', {}).get('grader_app', {})
+        archi_config = config_manager.get_configs()[0]
+        grader_config = archi_config.get('services', {}).get('grader_app', {})
         num_problems = grader_config.get('num_problems', 1)
         return [f"solution_with_rubric_{i}" for i in range(1, num_problems + 1)]
+
+    def _apply_host_mode_port_overrides(self, config: Dict[str, Any]) -> None:
+        """Normalize service ports in host mode using port/external_port only."""
+        services_cfg = config.get("services", {})
+        if not isinstance(services_cfg, dict):
+            return
+
+        for service_cfg in services_cfg.values():
+            if not isinstance(service_cfg, dict):
+                continue
+
+            external = service_cfg.get("external_port")
+            if external is not None:
+                service_cfg["port"] = external
+
+    def _resolve_ports_from_config(
+        self,
+        config_value: Any,
+        *,
+        host_mode: bool,
+        host_default: Optional[int],
+        container_default: Optional[int],
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Extract host/container ports using the standardized keys."""
+        host_port = host_default
+        container_port = container_default
+
+        if isinstance(config_value, dict):
+            container_port = config_value.get("port", container_port)
+            host_port = container_port if host_mode else config_value.get("external_port", host_port)
+        else:
+            host_port = config_value
+
+        return host_port, container_port
 
     # input list / source copying helpers
     def _copy_web_input_lists(self, context: TemplateContext) -> None:
@@ -451,7 +635,7 @@ class TemplateManager:
             repo_root = Path(__file__).resolve()
 
         source_files = [
-            ("src", "a2rchi_code"),
+            ("src", "archi_code"),
             ("pyproject.toml", "pyproject.toml"),
             ("LICENSE", "LICENSE"),
         ]
