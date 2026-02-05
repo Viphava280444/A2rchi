@@ -18,7 +18,7 @@ from src.cli.utils.helpers import *
 from src.cli.utils.service_builder import ServiceBuilder
 from src.utils.logging import get_logger, setup_cli_logging
 
-# DEFINITIONS 666
+# DEFINITIONS 666 7777
 env = Environment(
     loader=PackageLoader("src.cli"),
     autoescape=select_autoescape(),
