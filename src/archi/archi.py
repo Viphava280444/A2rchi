@@ -3,7 +3,7 @@ from src.utils.config_access import get_full_config
 from src.utils.logging import get_logger
 from src.archi.utils.output_dataclass import PipelineOutput
 from src.archi.utils.vectorstore_connector import VectorstoreConnector
-
+### 666
 logger = get_logger(__name__)
 
 class archi():

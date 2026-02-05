@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python test
 """
 End-to-end test for the Config Management system (Postgres-backed only).
 
