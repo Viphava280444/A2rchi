@@ -402,6 +402,8 @@ class TestOracleQueryTool:
 
         assert "| ID | NAME |" in result
         assert "| 1 | Alice |" in result
+        assert "**Query executed on test_db:**" in result
+        assert "SELECT * FROM MY_SCHEMA.users" in result
 
     def test_dml_rejected(self, manager):
         tool = create_oracle_query_tool(manager)
@@ -441,6 +443,8 @@ class TestOracleQueryTool:
             result = tool.invoke({"db_name": "test_db", "sql": "SELECT * FROM MY_SCHEMA.empty_table"})
 
         assert "0 rows" in result
+        assert "**Query executed on test_db:**" in result
+        assert "SELECT * FROM MY_SCHEMA.empty_table" in result
 
     def test_timeout_error_handled(self, manager):
         with patch.object(manager, "get_connection") as mock_get_conn:
