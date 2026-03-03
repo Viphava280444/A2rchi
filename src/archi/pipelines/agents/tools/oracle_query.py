@@ -131,7 +131,8 @@ def _build_query_tool_description(db_summary: str, skill: Optional[str] = None) 
         "Only SELECT queries are allowed.\n"
         f"Available databases: {db_summary}\n"
         "Input: db_name (string) and sql (string).\n"
-        "Use describe_oracle_schema first to discover tables and columns.\n"
+        "IMPORTANT: ALWAYS call describe_oracle_schema first to discover "
+        "column names and types before writing any SQL query.\n"
         "This is an Oracle database - use Oracle SQL syntax "
         "(FETCH FIRST N ROWS ONLY instead of LIMIT, use DUAL for constants, etc.)."
     )
@@ -470,18 +471,19 @@ _ORACLE_SQL_TIPS = """\
 
 
 def generate_oracle_skill_doc(manager: OracleConnectionManager) -> str:
-    """Generate a skill document describing all configured Oracle databases.
+    """Generate a lightweight skill document listing Oracle databases and tables.
 
-    Introspects live databases to produce a markdown document listing
-    databases, tables/views, and column details. The output is suitable
-    for injection into a tool description via the ``--- Domain Knowledge ---``
-    pattern.
+    Introspects live databases to produce a compact markdown document with
+    database names and table/view listings only (no column details).  The LLM
+    is instructed to call ``describe_oracle_schema`` for column details before
+    writing SQL.  This keeps token usage low while still giving the LLM enough
+    context to pick the right database and table.
 
     Args:
         manager: OracleConnectionManager with configured databases.
 
     Returns:
-        Markdown string with schema documentation.
+        Markdown string with schema overview.
     """
     db_list = manager.list_databases()
     if not db_list:
@@ -505,18 +507,17 @@ def generate_oracle_skill_doc(manager: OracleConnectionManager) -> str:
 
         schema_filter = cfg.allowed_schemas
 
-        # List tables
+        # List tables only — no column introspection
         tables_output = _list_tables(manager, db_name, schema_filter)
         sections.append(tables_output)
         sections.append("")
 
-        # Parse table names from the output and describe columns for each
-        table_names = _extract_table_names(tables_output)
-        for schema_part, table_part in table_names:
-            col_output = _describe_columns(manager, db_name, schema_part, table_part, schema_filter)
-            if "not found" not in col_output.lower():
-                sections.append(col_output)
-                sections.append("")
+    sections.append(
+        "## Important\n\n"
+        "The table list above shows only names. "
+        "ALWAYS call `describe_oracle_schema` with the database name and "
+        "`SCHEMA.TABLE` to discover columns and types BEFORE writing any SQL query.\n"
+    )
 
     sections.append(_ORACLE_SQL_TIPS)
 

@@ -660,14 +660,9 @@ class TestGenerateOracleSkillDoc:
 
     def test_generates_markdown_structure(self, manager, mock_connection):
         conn, cursor = mock_connection
-        # First call: _list_tables returns tables
-        # Second call: _describe_columns for first table
-        cursor.fetchall.side_effect = [
-            [("MY_SCHEMA", "USERS", "TABLE"), ("MY_SCHEMA", "ORDERS", "TABLE")],
-            [("MY_SCHEMA", "USERS", "ID", "NUMBER", 22, "N"),
-             ("MY_SCHEMA", "USERS", "NAME", "VARCHAR2", 100, "Y")],
-            [("MY_SCHEMA", "ORDERS", "ORDER_ID", "NUMBER", 22, "N"),
-             ("MY_SCHEMA", "ORDERS", "STATUS", "VARCHAR2", 50, "Y")],
+        # Only table listing — no column introspection
+        cursor.fetchall.return_value = [
+            ("MY_SCHEMA", "USERS", "TABLE"), ("MY_SCHEMA", "ORDERS", "TABLE"),
         ]
 
         with patch.object(manager, "get_connection") as mock_get_conn:
@@ -678,6 +673,9 @@ class TestGenerateOracleSkillDoc:
         assert "# Oracle Databases" in result
         assert "test_db" in result
         assert "Test database" in result
+        assert "USERS" in result
+        assert "ORDERS" in result
+        assert "describe_oracle_schema" in result
         assert "FETCH FIRST" in result
 
     def test_empty_databases(self):
