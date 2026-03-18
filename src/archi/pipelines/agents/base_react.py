@@ -486,9 +486,38 @@ class BaseReActAgent:
             )
             yield recursion_output
             return
-        
+        except Exception as exc:
+            if not self._is_context_overflow_error(exc):
+                raise
+            logger.warning(
+                "Context overflow during stream for %s: %s",
+                self.__class__.__name__,
+                exc,
+            )
+            if thinking_step_id is not None:
+                duration_ms = int((time.time() - thinking_start_time) * 1000) if thinking_start_time else 0
+                yield self.finalize_output(
+                    answer="",
+                    memory=self.active_memory,
+                    messages=[],
+                    metadata={
+                        "event_type": "thinking_end",
+                        "step_id": thinking_step_id,
+                        "duration_ms": duration_ms,
+                        "thinking_content": accumulated_thinking,
+                    },
+                    final=False,
+                )
+            overflow_output = self._handle_context_overflow(
+                error=exc,
+                agent_inputs=agent_inputs,
+                latest_messages=all_messages or latest_messages,
+            )
+            yield overflow_output
+            return
+
         # Final output
-        logger.debug("Stream finished. accumulated_content='%s', all_messages count=%d", 
+        logger.debug("Stream finished. accumulated_content='%s', all_messages count=%d",
                  accumulated_content[:100] if accumulated_content else "", len(all_messages))
         
         # End thinking phase if still active
@@ -746,9 +775,38 @@ class BaseReActAgent:
             )
             yield recursion_output
             return
-        
+        except Exception as exc:
+            if not self._is_context_overflow_error(exc):
+                raise
+            logger.warning(
+                "Context overflow during async stream for %s: %s",
+                self.__class__.__name__,
+                exc,
+            )
+            if thinking_step_id is not None:
+                duration_ms = int((time.time() - thinking_start_time) * 1000) if thinking_start_time else 0
+                yield self.finalize_output(
+                    answer="",
+                    memory=self.active_memory,
+                    messages=[],
+                    metadata={
+                        "event_type": "thinking_end",
+                        "step_id": thinking_step_id,
+                        "duration_ms": duration_ms,
+                        "thinking_content": accumulated_thinking,
+                    },
+                    final=False,
+                )
+            overflow_output = self._handle_context_overflow(
+                error=exc,
+                agent_inputs=agent_inputs,
+                latest_messages=all_messages or latest_messages,
+            )
+            yield overflow_output
+            return
+
         # Final output
-        logger.debug("Async stream finished. accumulated_content='%s', all_messages count=%d", 
+        logger.debug("Async stream finished. accumulated_content='%s', all_messages count=%d",
                  accumulated_content[:100] if accumulated_content else "", len(all_messages))
         
         # End thinking phase if still active
@@ -1415,6 +1473,84 @@ class BaseReActAgent:
         if last_node:
             metadata["last_node"] = last_node
         return metadata
+
+    @staticmethod
+    def _is_context_overflow_error(exc: Exception) -> bool:
+        """Return True if *exc* is a context-window / token-limit overflow error."""
+        exc_type = type(exc).__name__
+        exc_str = str(exc)
+        return (
+            "ContextOverflow" in exc_type
+            or "context_length_exceeded" in exc_str
+            or "Input tokens exceed" in exc_str
+            or "maximum context length" in exc_str.lower()
+        )
+
+    def _handle_context_overflow(
+        self,
+        *,
+        error: Exception,
+        agent_inputs: Optional[Dict[str, Any]] = None,
+        latest_messages: Optional[Sequence[BaseMessage]] = None,
+    ) -> "PipelineOutput":
+        """Build a graceful response after a context-window overflow.
+
+        Attempts a single retry with the last user message only; falls back to
+        a plain error message if the retry also fails or is not possible.
+        """
+        # Try a lightweight retry with just the last human message
+        if agent_inputs and "messages" in agent_inputs:
+            original_messages: List[BaseMessage] = list(agent_inputs.get("messages") or [])
+            # Keep only the last human message to stay well within context
+            trimmed: List[BaseMessage] = [m for m in original_messages[-1:] if True]
+            if trimmed:
+                try:
+                    trimmed_inputs = {**agent_inputs, "messages": trimmed}
+                    answer_output = self.agent.invoke(
+                        trimmed_inputs, {"recursion_limit": 10}
+                    )
+                    messages_out: List[BaseMessage] = list(
+                        answer_output.get("messages", []) if isinstance(answer_output, dict) else []
+                    )
+                    answer_text = ""
+                    for msg in reversed(messages_out):
+                        msg_type = str(getattr(msg, "type", "")).lower()
+                        if msg_type in {"ai", "assistant"} or "ai" in type(msg).__name__.lower():
+                            answer_text = self._message_content(msg)
+                            if answer_text:
+                                break
+                    if answer_text:
+                        logger.info(
+                            "Context overflow retry succeeded for %s.",
+                            self.__class__.__name__,
+                        )
+                        return self.finalize_output(
+                            answer=answer_text,
+                            memory=self.active_memory,
+                            messages=messages_out,
+                            metadata={"event_type": "final", "context_overflow_retry": True},
+                            final=True,
+                        )
+                except Exception as retry_exc:
+                    logger.warning(
+                        "Context overflow retry also failed for %s: %s",
+                        self.__class__.__name__,
+                        retry_exc,
+                    )
+
+        fallback_msg = AIMessage(
+            content=(
+                "I'm sorry, but the conversation history has grown too large for me to process. "
+                "Please start a new conversation to continue."
+            )
+        )
+        return self.finalize_output(
+            answer=self._message_content(fallback_msg),
+            memory=self.active_memory,
+            messages=list(latest_messages or []) + [fallback_msg],
+            metadata={"event_type": "error", "error_type": "context_overflow"},
+            final=True,
+        )
 
     def _handle_recursion_limit_error(
         self,

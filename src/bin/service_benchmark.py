@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib import error as url_error
@@ -88,7 +88,7 @@ class ResultHandler:
             additional_info = yaml.safe_load(f)
 
         meta_data = {
-            "time": str(datetime.now()),
+            "time": str(datetime.now(timezone.utc)),
             "git_info": additional_info, 
         }
 
@@ -104,7 +104,7 @@ class ResultHandler:
 
         html_content = format_html_output(config_data, config_name, timestamp,questions, total_results)
 
-        filename = f"{benchmark_name}-{datetime.now().strftime('%Y%m%d_%H%M%S')}_report.html"
+        filename = f"{benchmark_name}-{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_report.html"
         file_path = OUTPUT_DIR / filename
 
         logger.info(f"Dumping results to {file_path}")
@@ -118,7 +118,7 @@ class ResultHandler:
 
     @staticmethod 
     def dump(benchmark_name: Path):
-        filename = f"{benchmark_name}-{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        filename = f"{benchmark_name}-{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
         file_path = OUTPUT_DIR / filename
         logger.info(f"Dumping results to {file_path}")
         logger.debug(f"Full results: {ResultHandler.results}")

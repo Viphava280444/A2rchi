@@ -5,7 +5,7 @@ import time
 import uuid
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Dict, Iterator, List, Optional
 from pathlib import Path
@@ -52,16 +52,22 @@ from src.utils.sql import (
     SQL_INSERT_CONVO, SQL_INSERT_FEEDBACK, SQL_INSERT_TIMING, SQL_QUERY_CONVO,
     SQL_CREATE_CONVERSATION, SQL_UPDATE_CONVERSATION_TIMESTAMP,
     SQL_LIST_CONVERSATIONS, SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION,
+    SQL_LIST_CONVERSATIONS_BY_USER, SQL_GET_CONVERSATION_METADATA_BY_USER,
+    SQL_DELETE_CONVERSATION_BY_USER, SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER,
     SQL_INSERT_TOOL_CALLS, SQL_QUERY_CONVO_WITH_FEEDBACK, SQL_DELETE_REACTION_FEEDBACK,
     SQL_GET_REACTION_FEEDBACK,
     SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
 )
 from src.interfaces.chat_app.document_utils import *
+from src.interfaces.chat_app.service_alerts import (
+    register_service_alerts, get_active_banner_alerts, is_alert_manager,
+)
 from src.interfaces.chat_app.utils import collapse_assistant_sequences
 from src.utils.ab_testing import ABPool, ABVariant, ABPoolError, load_ab_pool
 from src.interfaces.chat_app.event_formatter import PipelineEventFormatter
 from src.utils.conversation_service import ConversationService
+from src.utils.user_service import UserService
 
 # RBAC imports for role-based access control
 from src.utils.rbac import (
@@ -674,6 +680,184 @@ class ChatWrapper:
     # A/B Comparison Methods
     # =========================================================================
 
+    def create_ab_comparison(
+        self,
+        conversation_id: int,
+        user_prompt_mid: int,
+        response_a_mid: int,
+        response_b_mid: int,
+        config_a_id: int,
+        config_b_id: int,
+        is_config_a_first: bool,
+    ) -> int:
+        """
+        Create an A/B comparison record linking two responses to the same user prompt.
+        
+        Args:
+            conversation_id: The conversation this comparison belongs to
+            user_prompt_mid: Message ID of the user's question
+            response_a_mid: Message ID of response A
+            response_b_mid: Message ID of response B
+            config_a_id: Config ID used for response A
+            config_b_id: Config ID used for response B
+            is_config_a_first: True if config A was the "first" config before randomization
+            
+        Returns:
+            The comparison_id of the newly created record
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                SQL_INSERT_AB_COMPARISON,
+                (conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
+                 config_a_id, config_b_id, is_config_a_first)
+            )
+            comparison_id = cursor.fetchone()[0]
+            conn.commit()
+            logger.info(f"Created A/B comparison {comparison_id} for conversation {conversation_id}")
+            return comparison_id
+        finally:
+            cursor.close()
+            conn.close()
+
+    def update_ab_preference(self, comparison_id: int, preference: str) -> None:
+        """
+        Record user's preference for an A/B comparison.
+        
+        Args:
+            comparison_id: The comparison to update
+            preference: 'a', 'b', or 'tie'
+        """
+        if preference not in ('a', 'b', 'tie'):
+            raise ValueError(f"Invalid preference: {preference}")
+            
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                SQL_UPDATE_AB_PREFERENCE,
+                (preference, datetime.now(timezone.utc), comparison_id)
+            )
+            conn.commit()
+            logger.info(f"Updated A/B comparison {comparison_id} with preference '{preference}'")
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_ab_comparison(self, comparison_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get an A/B comparison by ID.
+        
+        Returns:
+            Dict with comparison data or None if not found
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_AB_COMPARISON, (comparison_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                'comparison_id': row[0],
+                'conversation_id': row[1],
+                'user_prompt_mid': row[2],
+                'response_a_mid': row[3],
+                'response_b_mid': row[4],
+                'config_a_id': row[5],
+                'config_b_id': row[6],
+                'is_config_a_first': row[7],
+                'preference': row[8],
+                'preference_ts': row[9].isoformat() if row[9] else None,
+                'created_at': row[10].isoformat() if row[10] else None,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_pending_ab_comparison(self, conversation_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Get the most recent incomplete A/B comparison for a conversation.
+        
+        Returns:
+            Dict with comparison data or None if no pending comparison
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_PENDING_AB_COMPARISON, (conversation_id,))
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                'comparison_id': row[0],
+                'conversation_id': row[1],
+                'user_prompt_mid': row[2],
+                'response_a_mid': row[3],
+                'response_b_mid': row[4],
+                'config_a_id': row[5],
+                'config_b_id': row[6],
+                'is_config_a_first': row[7],
+                'preference': row[8],
+                'preference_ts': row[9].isoformat() if row[9] else None,
+                'created_at': row[10].isoformat() if row[10] else None,
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+    def delete_ab_comparison(self, comparison_id: int) -> bool:
+        """
+        Delete an A/B comparison (e.g., on abort/failure).
+        
+        Returns:
+            True if a record was deleted, False otherwise
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_DELETE_AB_COMPARISON, (comparison_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            if deleted:
+                logger.info(f"Deleted A/B comparison {comparison_id}")
+            return deleted
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_ab_comparisons_by_conversation(self, conversation_id: int) -> List[Dict[str, Any]]:
+        """
+        Get all A/B comparisons for a conversation.
+        
+        Returns:
+            List of comparison dicts
+        """
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(SQL_GET_AB_COMPARISONS_BY_CONVERSATION, (conversation_id,))
+            rows = cursor.fetchall()
+            return [
+                {
+                    'comparison_id': row[0],
+                    'conversation_id': row[1],
+                    'user_prompt_mid': row[2],
+                    'response_a_mid': row[3],
+                    'response_b_mid': row[4],
+                    'config_a_id': row[5],
+                    'config_b_id': row[6],
+                    'is_config_a_first': row[7],
+                    'preference': row[8],
+                    'preference_ts': row[9].isoformat() if row[9] else None,
+                    'created_at': row[10].isoformat() if row[10] else None,
+                }
+                for row in rows
+            ]
+        finally:
+            cursor.close()
+            conn.close()
 
     # =========================================================================
     # Agent Trace Methods
@@ -821,7 +1005,7 @@ class ChatWrapper:
             conn.close()
 
 
-    def query_conversation_history(self, conversation_id, client_id):
+    def query_conversation_history(self, conversation_id, client_id, user_id: Optional[str] = None):
         """
         Return the conversation history as an ordered list of tuples. The order
         is determined by ascending message_id. Each tuple contains the sender and
@@ -831,8 +1015,11 @@ class ChatWrapper:
         conn = psycopg2.connect(**self.pg_config)
         cursor = conn.cursor()
 
-        # ensure conversation belongs to client before querying
-        cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+        # ensure conversation belongs to user/client before querying
+        if user_id:
+            cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+        else:
+            cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
         metadata = cursor.fetchone()
         if metadata is None:
             cursor.close()
@@ -850,7 +1037,7 @@ class ChatWrapper:
 
         return history
 
-    def create_conversation(self, first_message: str, client_id: str) -> int:
+    def create_conversation(self, first_message: str, client_id: str, user_id: Optional[str] = None) -> int:
         """
         Gets first message (activates a new conversation), and generates a title w/ first msg.
         (TODO: commercial ones use one-sentence summarizer to make the title)
@@ -860,12 +1047,12 @@ class ChatWrapper:
         """
         service = "Chatbot"
         title = first_message[:20] + ("..." if len(first_message) > 20 else "")
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         
         version = os.getenv("APP_VERSION", "unknown")
 
-        # title, created_at, last_message_at, version
-        insert_tup = (title, now, now, client_id, version)
+        # title, created_at, last_message_at, client_id, version, user_id
+        insert_tup = (title, now, now, client_id, version, user_id)
 
         # create connection to database (use local vars for thread safety)
         conn = psycopg2.connect(**self.pg_config)
@@ -881,19 +1068,22 @@ class ChatWrapper:
         logger.info(f"Created new conversation with ID: {conversation_id}")
         return conversation_id
 
-    def update_conversation_timestamp(self, conversation_id: int, client_id: str):
+    def update_conversation_timestamp(self, conversation_id: int, client_id: str, user_id: Optional[str] = None):
         """
         Update the last_message_at timestamp for a conversation.
         last_message_at is used to reorder conversations in the UI (on vertical sidebar).
         """
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         # create connection to database (use local vars for thread safety)
         conn = psycopg2.connect(**self.pg_config)
         cursor = conn.cursor()
 
         # update timestamp
-        cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP, (now, conversation_id, client_id))
+        if user_id:
+            cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER, (now, conversation_id, user_id, client_id))
+        else:
+            cursor.execute(SQL_UPDATE_CONVERSATION_TIMESTAMP, (now, conversation_id, client_id))
         conn.commit()
 
         # clean up database connection state
@@ -1022,9 +1212,9 @@ class ChatWrapper:
                     try:
                         ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                     except (ValueError, TypeError):
-                        ts = datetime.now()
+                        ts = datetime.now(timezone.utc)
                 else:
-                    ts = datetime.now()
+                    ts = datetime.now(timezone.utc)
 
                 for tc in msg.tool_calls:
                     tool_call_id = tc.get("id", "")
@@ -1041,7 +1231,7 @@ class ChatWrapper:
             tool_result = tc.get("result", "")
             if len(tool_result) > 500:
                 tool_result = tool_result[:500] + "..."
-            ts = tool_call_timestamps.get(tool_call_id, datetime.now())
+            ts = tool_call_timestamps.get(tool_call_id, datetime.now(timezone.utc))
 
             insert_tups.append((
                 conversation_id,
@@ -1065,8 +1255,8 @@ class ChatWrapper:
 
     def _init_timestamps(self) -> Dict[str, datetime]:
         return {
-            "lock_acquisition_ts": datetime.now(),
-            "vectorstore_update_ts": datetime.now(),
+            "lock_acquisition_ts": datetime.now(timezone.utc),
+            "vectorstore_update_ts": datetime.now(timezone.utc),
         }
 
     def _resolve_config_name(self, config_name: Optional[str]) -> str:
@@ -1166,19 +1356,20 @@ class ChatWrapper:
         client_sent_msg_ts: float,
         client_timeout: float,
         timestamps: Dict[str, datetime],
+        user_id: Optional[str] = None,
     ) -> tuple[Optional[ChatRequestContext], Optional[int]]:
         if not client_id:
             raise ValueError("client_id is required to process chat messages")
         sender, content = tuple(message[0])
 
         if conversation_id is None:
-            conversation_id = self.create_conversation(content, client_id)
+            conversation_id = self.create_conversation(content, client_id, user_id)
             history = []
         else:
-            history = self.query_conversation_history(conversation_id, client_id)
-            self.update_conversation_timestamp(conversation_id, client_id)
+            history = self.query_conversation_history(conversation_id, client_id, user_id)
+            self.update_conversation_timestamp(conversation_id, client_id, user_id)
 
-        timestamps["query_convo_history_ts"] = datetime.now()
+        timestamps["query_convo_history_ts"] = datetime.now(timezone.utc)
 
         if is_refresh:
             while history and history[-1][0] == ARCHI_SENDER:
@@ -1640,7 +1831,7 @@ class ChatWrapper:
         else:
             output += self.format_links_markdown(top_sources)
 
-        timestamps["archi_message_ts"] = datetime.now()
+        timestamps["archi_message_ts"] = datetime.now(timezone.utc)
         context_data = self.prepare_context_for_storage(documents, scores)
 
         best_reference = "Link unavailable"
@@ -1658,7 +1849,7 @@ class ChatWrapper:
             context_data,
             context.is_refresh,
         )
-        timestamps["insert_convo_ts"] = datetime.now()
+        timestamps["insert_convo_ts"] = datetime.now(timezone.utc)
         context.history.append((ARCHI_SENDER, result["answer"]))
 
         agent_messages = getattr(result, "messages", []) or []
@@ -1681,7 +1872,7 @@ class ChatWrapper:
 
         return output, message_ids
 
-    def __call__(self, message: List[str], conversation_id: Optional[str], client_id: str, is_refresh: bool, server_received_msg_ts: datetime,  client_sent_msg_ts: float, client_timeout: float, config_name: str):
+    def __call__(self, message: List[str], conversation_id: int|None, client_id: str, is_refresh: bool, server_received_msg_ts: datetime,  client_sent_msg_ts: float, client_timeout: float, config_name: str, user_id: Optional[str] = None):
         """
         Execute the chat functionality.
         """
@@ -1700,6 +1891,7 @@ class ChatWrapper:
                 client_sent_msg_ts,
                 client_timeout,
                 timestamps,
+                user_id=user_id,
             )
             if error_code is not None:
                 return None, None, None, timestamps, error_code
@@ -1708,7 +1900,7 @@ class ChatWrapper:
             self.update_config(config_name=requested_config)
 
             result = self.archi(history=context.history, conversation_id=context.conversation_id)
-            timestamps["chain_finished_ts"] = datetime.now()
+            timestamps["chain_finished_ts"] = datetime.now(timezone.utc)
 
             # keep track of total number of queries and log this amount
             self.number_of_queries += 1
@@ -1735,7 +1927,7 @@ class ChatWrapper:
             if self.conn is not None:
                 self.conn.close()
 
-        timestamps['finish_call_ts'] = datetime.now()
+        timestamps['finish_call_ts'] = datetime.now(timezone.utc)
 
         return output, context.conversation_id if context else None, message_ids, timestamps, None
 
@@ -1756,6 +1948,7 @@ class ChatWrapper:
         provider: str = None,
         model: str = None,
         provider_api_key: str = None,
+        user_id: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         timestamps = self._init_timestamps()
         context = None
@@ -1779,6 +1972,7 @@ class ChatWrapper:
                 client_sent_msg_ts,
                 client_timeout,
                 timestamps,
+                user_id=user_id,
             )
             if error_code is not None:
                 yield self._error_event(error_code)
@@ -1798,6 +1992,7 @@ class ChatWrapper:
                         if hasattr(self.archi.pipeline, 'refresh_agent'):
                             self.archi.pipeline.refresh_agent(force=True)
                         logger.info(f"Overrode pipeline LLM with {provider}/{model}")
+                        self.current_model_used = f"{provider}/{model}"
                 except ValueError as e:
                     logger.warning(f"Failed to create provider LLM {provider}/{model}: {e}")
                     yield {"type": "error", "status": 400, "message": str(e)}
@@ -1889,7 +2084,7 @@ class ChatWrapper:
                             if include_tool_steps:
                                 yield event
 
-            timestamps["chain_finished_ts"] = datetime.now()
+            timestamps["chain_finished_ts"] = datetime.now(timezone.utc)
 
             if last_output is None:
                 if trace_id:
@@ -1915,10 +2110,10 @@ class ChatWrapper:
                 render_markdown=False,  # Client renders with marked.js
             )
 
-            timestamps["finish_call_ts"] = datetime.now()
+            timestamps["finish_call_ts"] = datetime.now(timezone.utc)
             timestamps["server_received_msg_ts"] = server_received_msg_ts
-            timestamps["client_sent_msg_ts"] = datetime.fromtimestamp(client_sent_msg_ts)
-            timestamps["server_response_msg_ts"] = datetime.now()
+            timestamps["client_sent_msg_ts"] = datetime.fromtimestamp(client_sent_msg_ts, tz=timezone.utc)
+            timestamps["server_response_msg_ts"] = datetime.now(timezone.utc)
 
             if message_ids:
                 self.insert_timing(message_ids[-1], timestamps)
@@ -1965,9 +2160,10 @@ class ChatWrapper:
                 "user_message_id": message_ids[0] if message_ids and len(message_ids) > 1 else None,
                 "trace_id": trace_id,
                 "server_response_msg_ts": timestamps["server_response_msg_ts"].timestamp(),
-                "final_response_msg_ts": datetime.now().timestamp(),
+                "final_response_msg_ts": datetime.now(timezone.utc).timestamp(),
                 "usage": usage,
                 "model": model,
+                "model_used": self.current_model_used,
             }
 
         except GeneratorExit:
@@ -2083,6 +2279,17 @@ class FlaskAppWrapper(object):
         # enable CORS:
         CORS(self.app)
 
+        # inject active alerts into every template context
+        @self.app.context_processor
+        def _inject_alerts():
+            if not session.get('logged_in'):
+                return dict(active_banner_alerts=[], is_alert_manager=False)
+            alerts = get_active_banner_alerts()
+            return dict(
+                active_banner_alerts=alerts,
+                is_alert_manager=is_alert_manager(),
+            )
+
         # add endpoints for flask app
         # Public endpoints (no auth required)
         self.add_endpoint('/', 'landing', self.landing)
@@ -2177,6 +2384,16 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/admin/database', 'database_viewer_page', self.require_perm(Permission.Admin.DATABASE)(self.database_viewer_page))
         self.add_endpoint('/api/admin/database/tables', 'list_database_tables', self.require_perm(Permission.Admin.DATABASE)(self.list_database_tables), methods=["GET"])
         self.add_endpoint('/api/admin/database/query', 'run_database_query', self.require_perm(Permission.Admin.DATABASE)(self.run_database_query), methods=["POST"])
+
+        # Service status board endpoints (registered via Blueprint)
+        logger.info("Adding service status board endpoints")
+        register_service_alerts(
+            self.app,
+            pg_config=self.pg_config,
+            auth_enabled=self.auth_enabled,
+            chat_app_config=self.chat_app_config,
+            require_auth=self.require_auth,
+        )
 
         # add unified auth endpoints
         if self.auth_enabled:
@@ -2330,12 +2547,27 @@ class FlaskAppWrapper(object):
             # This handles role validation and default role assignment
             user_roles = get_user_roles(token, user_email)
             
+            # Upsert the SSO user into the users table so that conversation_metadata
+            # can reference user_id via the FK constraint.
+            sso_user_id = user_info.get('sub', '')
+            if sso_user_id:
+                try:
+                    user_service = UserService(pg_config=self.pg_config)
+                    user_service.get_or_create_user(
+                        user_id=sso_user_id,
+                        auth_provider='sso',
+                        display_name=user_info.get('name', user_info.get('preferred_username', '')),
+                        email=user_info.get('email', ''),
+                    )
+                except Exception as ue:
+                    logger.warning(f"Failed to upsert SSO user {sso_user_id} into users table: {ue}")
+
             # Store user information in session (normalized structure)
             self._set_user_session(
                 email=user_info.get('email', ''),
                 name=user_info.get('name', user_info.get('preferred_username', '')),
                 username=user_info.get('preferred_username', user_info.get('email', '')),
-                user_id=user_info.get('sub', ''),
+                user_id=sso_user_id,
                 auth_method='sso',
                 roles=user_roles
             )
@@ -3403,7 +3635,7 @@ class FlaskAppWrapper(object):
         """
         # compute timestamp at which message was received by server
         start_time = time.time()
-        server_received_msg_ts = datetime.now()
+        server_received_msg_ts = datetime.now(timezone.utc)
 
         # get user input and conversation_id from the request
         request_data = self._parse_chat_request()
@@ -3418,9 +3650,11 @@ class FlaskAppWrapper(object):
         if not client_id:
             return jsonify({'error': 'client_id missing'}), 400
 
+        user_id = session.get('user', {}).get('id') or None
+
         # query the chat and return the results.
         logger.debug("Calling the ChatWrapper()")
-        response, conversation_id, message_ids, timestamps, error_code = self.chat(message, conversation_id, client_id, is_refresh, server_received_msg_ts, client_sent_msg_ts, client_timeout,config_name)
+        response, conversation_id, message_ids, timestamps, error_code = self.chat(message, conversation_id, client_id, is_refresh, server_received_msg_ts, client_sent_msg_ts, client_timeout,config_name, user_id=user_id)
 
         # handle errors
         if error_code is not None:
@@ -3428,11 +3662,11 @@ class FlaskAppWrapper(object):
             return jsonify({'error': err['message']}), error_code
 
         # compute timestamp at which message was returned to client
-        timestamps['server_response_msg_ts'] = datetime.now()
+        timestamps['server_response_msg_ts'] = datetime.now(timezone.utc)
 
         # store timing info for this message
         timestamps['server_received_msg_ts'] = server_received_msg_ts
-        timestamps['client_sent_msg_ts'] = datetime.fromtimestamp(client_sent_msg_ts)
+        timestamps['client_sent_msg_ts'] = datetime.fromtimestamp(client_sent_msg_ts, tz=timezone.utc)
         self.chat.insert_timing(message_ids[-1], timestamps)
 
         # otherwise return archi's response to client
@@ -3449,7 +3683,8 @@ class FlaskAppWrapper(object):
             'conversation_id': conversation_id,
             'archi_msg_id': message_ids[-1],
             'server_response_msg_ts': timestamps['server_response_msg_ts'].timestamp(),
-            'final_response_msg_ts': datetime.now().timestamp(),
+            'model_used': self.current_model_used,
+            'final_response_msg_ts': datetime.now(timezone.utc).timestamp(),
         }
 
         end_time = time.time()
@@ -3461,7 +3696,7 @@ class FlaskAppWrapper(object):
         """
         Streams agent updates and the final response as NDJSON.
         """
-        server_received_msg_ts = datetime.now()
+        server_received_msg_ts = datetime.now(timezone.utc)
         request_data = self._parse_chat_request()
 
         message = request_data["message"]
@@ -3479,26 +3714,41 @@ class FlaskAppWrapper(object):
         if not client_id:
             return jsonify({"error": "client_id missing"}), 400
 
+        user_id = session.get('user', {}).get('id') or None
+
         # Get API key from session if available
         session_api_key = None
         if provider and 'provider_api_keys' in session:
             session_api_key = session.get('provider_api_keys', {}).get(provider.lower())
 
-        return self._ndjson_response(self.chat.stream(
-            message,
-            conversation_id,
-            client_id,
-            is_refresh,
-            server_received_msg_ts,
-            client_sent_msg_ts,
-            client_timeout,
-            config_name,
-            include_agent_steps=include_agent_steps,
-            include_tool_steps=include_tool_steps,
-            provider=provider,
-            model=model,
-            provider_api_key=session_api_key,
-        ))
+        def _event_stream() -> Iterator[str]:
+            padding = " " * 2048
+            yield json.dumps({"type": "meta", "event": "stream_started", "padding": padding}) + "\n"
+            for event in self.chat.stream(
+                message,
+                conversation_id,
+                client_id,
+                is_refresh,
+                server_received_msg_ts,
+                client_sent_msg_ts,
+                client_timeout,
+                config_name,
+                include_agent_steps=include_agent_steps,
+                include_tool_steps=include_tool_steps,
+                provider=provider,
+                model=model,
+                provider_api_key=session_api_key,
+                user_id=user_id,
+            ):
+                yield json.dumps(event, default=str) + "\n"
+
+        headers = {
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
+            "Content-Type": "application/x-ndjson",
+        }
+        return Response(stream_with_context(_event_stream()), headers=headers)
 
     def landing(self):
         """Landing page for unauthenticated users"""
@@ -3589,7 +3839,7 @@ class FlaskAppWrapper(object):
             feedback = {
                 "message_id"   : message_id,
                 "feedback"     : "comment",
-                "feedback_ts"  : datetime.now(),
+                "feedback_ts"  : datetime.now(timezone.utc),
                 "feedback_msg" : feedback_msg,
                 "incorrect"    : None,
                 "unhelpful"    : None,
@@ -3612,14 +3862,18 @@ class FlaskAppWrapper(object):
         """
         try:
             client_id = request.args.get('client_id')
-            if not client_id:
+            user_id = session.get('user', {}).get('id') or None
+            if not user_id and not client_id:
                 return jsonify({'error': 'client_id missing'}), 400
             limit = min(int(request.args.get('limit', 50)), 500)
 
             # create connection to database
             conn = psycopg2.connect(**self.pg_config)
             cursor = conn.cursor()
-            cursor.execute(SQL_LIST_CONVERSATIONS, (client_id, limit))
+            if user_id:
+                cursor.execute(SQL_LIST_CONVERSATIONS_BY_USER, (user_id, client_id, limit))
+            else:
+                cursor.execute(SQL_LIST_CONVERSATIONS, (client_id, limit))
             rows = cursor.fetchall()
 
             conversations = []
@@ -3657,10 +3911,11 @@ class FlaskAppWrapper(object):
             data = request.json
             conversation_id = data.get('conversation_id')
             client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not conversation_id:
                 return jsonify({'error': 'conversation_id missing'}), 400
-            if not client_id:
+            if not user_id and not client_id:
                 return jsonify({'error': 'client_id missing'}), 400
 
             # create connection to database
@@ -3668,7 +3923,10 @@ class FlaskAppWrapper(object):
             cursor = conn.cursor()
 
             # get conversation metadata
-            cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+            if user_id:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
             meta_row = cursor.fetchone()
 
             # if no metadata found, return error
@@ -3708,6 +3966,7 @@ class FlaskAppWrapper(object):
                     'message_id': row[2],
                     'feedback': row[3],
                     'comment_count': row[4] if len(row) > 4 else 0,
+                    'model_used': row[5] if len(row) > 5 else None,
                 }
                 
                 # Attach trace data if present
@@ -3773,10 +4032,11 @@ class FlaskAppWrapper(object):
             data = request.json
             conversation_id = data.get('conversation_id')
             client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not conversation_id:
                 return jsonify({'error': 'conversation_id missing when deleting.'}), 400
-            if not client_id:
+            if not user_id and not client_id:
                 return jsonify({'error': 'client_id missing when deleting.'}), 400
 
             # create connection to database
@@ -3784,7 +4044,10 @@ class FlaskAppWrapper(object):
             cursor = conn.cursor()
 
             # Delete conversation metadata (SQL CASCADE will delete all child messages)
-            cursor.execute(SQL_DELETE_CONVERSATION, (conversation_id, client_id))
+            if user_id:
+                cursor.execute(SQL_DELETE_CONVERSATION_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_DELETE_CONVERSATION, (conversation_id, client_id))
             deleted_count = cursor.rowcount
             conn.commit()
 
@@ -4469,14 +4732,25 @@ class FlaskAppWrapper(object):
         try:
             data = request.json or {}
             url = data.get("url", "").strip()
+            depth = data.get("depth", None)
 
             if not url:
                 return jsonify({"error": "missing_url"}), 400
+            if depth is not None:
+                try:
+                    depth = int(depth)
+                except (TypeError, ValueError):
+                    return jsonify({"error": "invalid_depth"}), 400
+                if depth < 0:
+                    return jsonify({"error": "invalid_depth"}), 400
 
             # Proxy to data-manager service
+            dm_payload = {"url": url}
+            if depth is not None:
+                dm_payload["depth"] = str(depth)
             resp = requests.post(
                 f"{self.data_manager_url}/document_index/upload_url",
-                data={"url": url},
+                data=dm_payload,
                 headers=self._dm_headers,
                 timeout=300,
                 allow_redirects=False,
@@ -4500,7 +4774,7 @@ class FlaskAppWrapper(object):
                 return jsonify({
                     "success": True,
                     "url": url,
-                    "resources_scraped": 1
+                    "resources_scraped": dm_data.get("resources_scraped", 1)
                 }), 200
             else:
                 return jsonify({
@@ -5065,24 +5339,40 @@ class FlaskAppWrapper(object):
             sources = []
             seen_projects = set()
 
-            result = self.chat.data_viewer.list_documents(source_type='jira', limit=1000)
+            result = self.chat.data_viewer.list_documents(source_type='ticket', limit=1000)
+
             for doc in result.get('documents', []):
                 # Parse project key from display name or URL
                 display_name = doc.get('display_name', '')
+                url = doc.get('url', '')
                 # Jira documents often have display_name like "PROJECT-123: Title"
                 if display_name:
                     project_key = display_name.split('-')[0] if '-' in display_name else display_name
                     if project_key and project_key not in seen_projects:
                         seen_projects.add(project_key)
+                        logger.debug(f"Adding project key: {project_key}, display_name: {display_name}")
                         sources.append({
-                            'project_key': project_key,
-                            'name': project_key,
+                            'key': project_key,
+                            'name': url.split('-')[0] if '-' in url else url,
                         })
+
+            for project in sources:
+                project_key = project['key']
+                
+                ticket_count = sum(1 for doc in result.get('documents', []) if doc.get('display_name', '').startswith(project_key + '-'))
+                project['ticket_count'] = ticket_count if ticket_count else 0
+                
+                last_sync = max((doc.get('ingested_at')
+                                for doc in result.get('documents', [])
+                                if project_key in doc.get('display_name', '') and doc.get('ingested_at') is not None),
+                                default=None)
+                
+                project['last_sync'] = last_sync if last_sync else None
 
             return jsonify({"sources": sources}), 200
 
         except Exception as e:
-            logger.error(f"Error listing Jira sources: {str(e)}")
+            logger.error(f"Error listing Jira sources: {str(e)}",exc_info=True)
             return jsonify({"error": str(e)}), 500
 
     def _delete_jira_project(self):
@@ -5122,6 +5412,25 @@ class FlaskAppWrapper(object):
         """
         try:
             schedules = self.config_service.get_source_schedules()
+            jobs_by_source = {}
+
+            # Best-effort enrich with scheduler runtime metadata from data-manager.
+            try:
+                dm_response = requests.get(
+                    f"{self.data_manager_url}/api/schedules",
+                    headers=self._dm_headers,
+                    timeout=10,
+                    allow_redirects=False,
+                )
+                if dm_response.ok and not dm_response.is_redirect:
+                    jobs = (dm_response.json() or {}).get("jobs", [])
+                    jobs_by_source = {
+                        (job.get("name") or ""): job
+                        for job in jobs
+                        if isinstance(job, dict)
+                    }
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Could not fetch scheduler runtime status from data-manager: {e}")
             
             # Convert cron expressions to UI-friendly values
             schedule_display = {}
@@ -5133,9 +5442,12 @@ class FlaskAppWrapper(object):
             }
             
             for source, cron in schedules.items():
+                runtime = jobs_by_source.get(source, {})
                 schedule_display[source] = {
                     'cron': cron,
                     'display': cron_to_ui.get(cron, 'custom'),
+                    'next_run': runtime.get('next_run'),
+                    'last_run': runtime.get('last_run'),
                 }
             
             return jsonify({"schedules": schedule_display}), 200

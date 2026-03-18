@@ -10,6 +10,13 @@ global:
   LOGGING:
     input_output_filename: "{{ global.LOGGING.input_output_filename | default('chain_input_output.log', true) }}"
 
+mcp_servers:
+  {%- for server_name, server_config in (mcp_servers | default({}, true)).items() %}
+  {{ server_name }}:
+    transport: {{ server_config.transport | default('streamable_http', true) }}
+    url: {{ server_config.url | default('', true) }}
+  {%- endfor %}
+
 services:
   benchmarking:
     agent_class: {{ services.benchmarking.agent_class | default("", true) }}
@@ -91,9 +98,14 @@ services:
           scope: {{ services.chat_app.auth.sso.client_kwargs.scope | default("openid profile email", true) }}
       basic:
         enabled: {{ services.chat_app.auth.basic.enabled | default(false, true) }}
-      {% if services.chat_app.auth.auth_roles is defined %}
+    {% if services.chat_app.auth.auth_roles is defined %}
       auth_roles: {{ services.chat_app.auth.auth_roles | tojson }}
-      {% endif %}
+    {% endif %}
+    alerts:
+      managers:
+        {%- for manager in services.chat_app.alerts.managers | default([], true) %}
+        - {{ manager }}
+        {%- endfor %}
   {%- if services.ab_testing is defined and services.ab_testing.enabled | default(false) %}
   ab_testing:
     enabled: true
@@ -221,14 +233,12 @@ data_manager:
         visible: {{ data_manager.sources.links.selenium_scraper.selenium_scraper.visible | default(false, true) }}
         use_for_scraping: {{ data_manager.sources.links.selenium_scraper.use_for_scraping | default(false, true) }}
         selenium_class: {{  data_manager.sources.links.selenium_scraper.selenium_class | default('CERNSSOScraper', true)  }}
+        selenium_url: {{  data_manager.sources.links.selenium_scraper.selenium_url | default('null', true)  }}
         selenium_class_map:
           CERNSSOScraper:
             class: {{ data_manager.sources.links.selenium_scraper.selenium_class_map.CERNSSOScraper.class | default('CERNSSOScraper', true) }}
             kwargs:
               headless:  {{ data_manager.sources.links.selenium_scraper.selenium_class_map.CERNSSOScraper.kwargs.headless | default(true, true) }}
-    ticket:
-      enabled: {{ data_manager.sources.ticket.enabled | default(true, true) }}
-      visible: {{ data_manager.sources.ticket.visible | default(true, true) }}
     git:
       enabled: {{ data_manager.sources.git.enabled | default(true, true) }}
       visible: {{ data_manager.sources.git.visible | default(true, true) }}
