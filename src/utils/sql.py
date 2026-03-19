@@ -33,7 +33,7 @@ LIMIT 1;
 """
 
 SQL_QUERY_CONVO = """
-SELECT sender, content
+SELECT sender, content, message_id
 FROM conversations
 WHERE conversation_id = %s
 ORDER BY message_id ASC;
@@ -205,6 +205,16 @@ SELECT comparison_id, conversation_id, user_prompt_mid, response_a_mid, response
        is_config_a_first, preference, preference_ts, created_at
 FROM ab_comparisons
 WHERE comparison_id = %s;
+"""
+
+SQL_GET_AB_COMPARISON_FOR_UPDATE = """
+SELECT comparison_id, conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
+       model_a, pipeline_a, model_b, pipeline_b,
+       variant_a_name, variant_b_name, variant_a_meta, variant_b_meta,
+       is_config_a_first, preference, preference_ts, created_at
+FROM ab_comparisons
+WHERE comparison_id = %s
+FOR UPDATE;
 """
 
 SQL_GET_PENDING_AB_COMPARISON = """

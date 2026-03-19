@@ -30,6 +30,7 @@ const CONFIG = {
     AB_PREFERENCE: '/api/ab/preference',
     AB_PENDING: '/api/ab/pending',
     AB_POOL: '/api/ab/pool',
+    AB_DECISION: '/api/ab/decision',
     AB_POOL_SET: '/api/ab/pool/set',
     AB_POOL_DISABLE: '/api/ab/pool/disable',
     AB_COMPARE: '/api/ab/compare',
@@ -356,15 +357,23 @@ const API = {
     return this.fetchJson(`${CONFIG.ENDPOINTS.AB_POOL}?client_id=${encodeURIComponent(this.clientId)}`);
   },
 
+  async getABDecision(conversationId = null) {
+    const params = new URLSearchParams({ client_id: this.clientId });
+    if (conversationId != null) {
+      params.set('conversation_id', String(conversationId));
+    }
+    return this.fetchJson(`${CONFIG.ENDPOINTS.AB_DECISION}?${params.toString()}`);
+  },
+
   async getABMetrics() {
     return this.fetchJson(`${CONFIG.ENDPOINTS.AB_METRICS}?client_id=${encodeURIComponent(this.clientId)}`);
   },
 
-  async saveABPool(champion, variants) {
+  async saveABPool(payload) {
     return this.fetchJson(CONFIG.ENDPOINTS.AB_POOL_SET, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ champion, variants, client_id: this.clientId }),
+      body: JSON.stringify({ ...payload, client_id: this.clientId }),
     });
   },
 
@@ -380,7 +389,7 @@ const API = {
    * Stream a pool-based A/B comparison. Returns an async iterator of NDJSON events.
    * Each event has an 'arm' field ('a' or 'b') plus 'type', 'content', etc.
    */
-  async *streamABComparison(history, conversationId, configName, signal) {
+  async *streamABComparison(history, conversationId, configName, signal, provider = null, model = null) {
     const body = {
       last_message: history.slice(-1),
       conversation_id: conversationId,
@@ -388,6 +397,8 @@ const API = {
       client_id: this.clientId,
       client_sent_msg_ts: Date.now(),
       client_timeout: CONFIG.STREAMING.TIMEOUT,
+      provider,
+      model,
     };
 
     const response = await fetch(CONFIG.ENDPOINTS.AB_COMPARE, {
@@ -804,16 +815,17 @@ const UI = {
       const target = e.target;
       const row = target.closest('.agent-dropdown-item');
       if (!row) return;
+      e.preventDefault();
+      e.stopPropagation();
       // Handle inline delete confirmation buttons
       if (target.closest('.agent-dropdown-confirm-yes')) {
         const name = row.dataset.agentName;
-        this.closeAgentDropdown();
         this.doDeleteAgent(name);
         return;
       }
       if (target.closest('.agent-dropdown-confirm-no')) {
         // Cancel: re-render list to remove confirmation state
-        Chat.loadAgents();
+        this.renderAgentsList(Chat.state.allAgents || Chat.state.agents || [], Chat.state.activeAgentName);
         return;
       }
       if (target.closest('.agent-dropdown-clone')) {
@@ -859,10 +871,19 @@ const UI = {
       if (!sel || !sel.champion || sel.variants.length < 2) return;
       const saveBtn = document.getElementById('ab-pool-save');
       const msgEl = document.getElementById('ab-pool-message');
+      const sampleRate = Number(document.getElementById('ab-sample-rate')?.value || 1);
+      const disclosureMode = document.getElementById('ab-disclosure-mode')?.value || 'post_vote_reveal';
+      const defaultTraceMode = document.getElementById('ab-trace-mode')?.value || 'minimal';
       saveBtn.disabled = true;
       saveBtn.textContent = 'Saving…';
       try {
-        const result = await API.saveABPool(sel.champion, sel.variants);
+        const result = await API.saveABPool({
+          champion: sel.champion,
+          variants: sel.variants,
+          sample_rate: sampleRate,
+          disclosure_mode: disclosureMode,
+          default_trace_mode: defaultTraceMode,
+        });
         if (result?.success) {
           if (msgEl) { msgEl.textContent = 'Pool saved'; msgEl.className = 'ab-pool-message success'; }
           Chat.state.abPool = result;
@@ -1255,6 +1276,7 @@ const UI = {
     // Clone mode → load source spec, then switch to create for saving
     this.agentSpecMode = mode === 'clone' ? 'create' : mode;
     this.agentSpecName = mode === 'clone' ? null : name;
+    this.agentSpecOriginalName = mode === 'edit' ? name : null;
     // Restore persisted size
     this.restoreAgentSpecSize();
     if (this.elements.agentSpecTitle) {
@@ -1269,6 +1291,12 @@ const UI = {
     // Update reset button label
     if (this.elements.agentSpecReset) {
       this.elements.agentSpecReset.textContent = mode === 'edit' ? 'Revert changes' : 'Reset template';
+    }
+    if (this.elements.agentSpecName) {
+      this.elements.agentSpecName.readOnly = mode === 'edit';
+      this.elements.agentSpecName.title = mode === 'edit'
+        ? 'Agent name is fixed while editing. Clone or create a new agent to use a different name.'
+        : '';
     }
     // Clear validation errors
     this.clearAgentSpecValidation();
@@ -1285,6 +1313,7 @@ const UI = {
     } else if (mode === 'edit' && name) {
       await this.loadAgentToolPalette();
       await this.loadAgentSpecByName(name);
+      this.setAgentSpecStatus('Editing updates this agent in place. Clone or create a new agent to use a different name.', 'info');
     } else {
       await this.loadAgentSpecTemplate();
     }
@@ -1420,9 +1449,9 @@ const UI = {
   resetAgentSpecForm() {
     this.clearAgentSpecValidation();
     this.setAgentSpecStatus('');
-    if (this.agentSpecMode === 'edit' && this.agentSpecName) {
+    if (this.agentSpecMode === 'edit' && this.agentSpecOriginalName) {
       // Revert to saved version
-      this.loadAgentSpecByName(this.agentSpecName);
+      this.loadAgentSpecByName(this.agentSpecOriginalName);
     } else {
       this.loadAgentSpecTemplate();
     }
@@ -1468,6 +1497,11 @@ const UI = {
       hasError = true;
     }
     if (hasError) return;
+    if (this.agentSpecMode === 'edit' && this.agentSpecOriginalName && name !== this.agentSpecOriginalName) {
+      this.elements.agentSpecName?.classList.add('field-error');
+      this.setAgentSpecStatus('Agent name cannot be changed in edit mode. Clone or create a new agent instead.', 'error');
+      return;
+    }
     // Serialise to .md format
     const content = this.serialiseAgentSpec(name, tools, prompt);
     if (this.elements.agentSpecEditor) this.elements.agentSpecEditor.value = content;
@@ -1479,12 +1513,13 @@ const UI = {
       const response = await API.saveAgentSpec({
         content,
         mode: this.agentSpecMode || 'create',
-        existing_name: this.agentSpecName || null,
+        existing_name: this.agentSpecOriginalName || this.agentSpecName || null,
       });
       if (this.agentSpecMode === 'edit') {
-        const savedName = Utils.normalizeAgentName(response?.name || this.agentSpecName || '');
+        const savedName = Utils.normalizeAgentName(response?.name || this.agentSpecOriginalName || this.agentSpecName || '');
         if (savedName) {
           this.agentSpecName = savedName;
+          this.agentSpecOriginalName = savedName;
         }
         if (Utils.normalizeAgentName(Chat.state.activeAgentName) === Utils.normalizeAgentName(savedName)) {
           await Chat.setActiveAgent(savedName);
@@ -1571,8 +1606,21 @@ const UI = {
   },
 
   isABEnabled() {
-    // A/B mode is active when a pool is configured on the server
+    // A/B mode is active when the server reports this user is eligible
     return Chat.state.abPool?.enabled === true;
+  },
+
+  getABDisclosureMode() {
+    return Chat.state.abPool?.disclosure_mode || 'post_vote_reveal';
+  },
+
+  getABTraceMode() {
+    return Chat.state.abPool?.default_trace_mode || 'minimal';
+  },
+
+  shouldUseABForNextTurn() {
+    if (!this.isABEnabled()) return false;
+    return true;
   },
 
   autoResizeInput() {
@@ -2024,8 +2072,10 @@ const UI = {
     // Render pool editor with current agents + pool state
     const agentList = document.getElementById('ab-pool-agent-list');
     const statusBadge = document.getElementById('ab-pool-status');
-    const saveBtn = document.getElementById('ab-pool-save');
     const disableBtn = document.getElementById('ab-pool-disable');
+    const sampleRateInput = document.getElementById('ab-sample-rate');
+    const disclosureModeInput = document.getElementById('ab-disclosure-mode');
+    const traceModeInput = document.getElementById('ab-trace-mode');
     if (!agentList) return;
 
     // Use allAgents so AB-only variants appear in the pool editor
@@ -2043,6 +2093,15 @@ const UI = {
     // Show/hide disable button
     if (disableBtn) {
       disableBtn.style.display = poolEnabled ? '' : 'none';
+    }
+    if (sampleRateInput) {
+      sampleRateInput.value = String(poolInfo?.sample_rate ?? 1);
+    }
+    if (disclosureModeInput) {
+      disclosureModeInput.value = poolInfo?.disclosure_mode || 'post_vote_reveal';
+    }
+    if (traceModeInput) {
+      traceModeInput.value = poolInfo?.default_trace_mode || 'minimal';
     }
 
     // Render agent rows
@@ -2344,21 +2403,39 @@ const UI = {
     }, duration);
   },
 
-  addABComparisonContainer(msgIdA, msgIdB) {
+  getTraceModeForMessage(messageId) {
+    const container = document.querySelector(`.trace-container[data-message-id="${messageId}"]`);
+    return container?.dataset.traceMode || Chat.state.traceVerboseMode || 'normal';
+  },
+
+  getTraceIconSvg() {
+    return `<svg class="trace-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path></svg>`;
+  },
+
+  getTraceLabelText(toolCount = 0) {
+    return toolCount > 0
+      ? `Agent Activity (${toolCount} tool${toolCount === 1 ? '' : 's'})`
+      : 'Agent Activity';
+  },
+
+  addABComparisonContainer(msgIdA, msgIdB, options = {}) {
     // Remove empty state if present
     const empty = this.elements.messagesInner?.querySelector('.messages-empty');
     if (empty) empty.remove();
 
-    const showTrace = Chat.state.traceVerboseMode !== 'minimal';
-    const traceIconSvg = `<svg class="trace-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`;
-    const traceCollapsed = Chat.state.traceVerboseMode === 'normal';
+    const traceMode = options.traceMode || this.getABTraceMode();
+    const showTrace = traceMode !== 'minimal';
+    const traceIconSvg = this.getTraceIconSvg();
+    const traceCollapsed = traceMode === 'normal';
     const traceHtml = (id) => showTrace ? `
-          <div class="trace-container ab-trace-container${traceCollapsed ? ' collapsed' : ''}" data-message-id="${id}">
-            <div class="trace-header" data-trace-toggle="${id}">
+          <div class="trace-container ab-trace-container${traceCollapsed ? ' collapsed' : ''}" data-message-id="${id}" data-trace-mode="${traceMode}">
+            <div class="trace-header">
               ${traceIconSvg}
-              <span class="trace-label">Agent Activity</span>
+              <span class="trace-label">${this.getTraceLabelText()}</span>
               <span class="trace-timer" data-start="${Date.now()}">0.0s</span>
-              <span class="toggle-icon">${traceCollapsed ? '&#9654;' : '&#9660;'}</span>
+              <button class="trace-toggle" data-trace-toggle="${id}" aria-label="Toggle agent activity details" title="Toggle agent activity">
+                <span class="toggle-icon" aria-hidden="true">${traceCollapsed ? '&#9654;' : '&#9660;'}</span>
+              </button>
             </div>
             <div class="trace-content">
               <div class="step-timeline"></div>
@@ -2371,12 +2448,17 @@ const UI = {
           <div class="message-inner">
             <div class="message-header">
               <div class="message-avatar"><img class="assistant-logo" src="/static/images/archi-logo.png" alt="archi logo"></div>
-              <span class="message-sender">archi</span>
-              <span class="message-label ab-arm-label">${label}</span>
-              <span class="ab-arm-variant-name" data-arm-id="${id}"></span>
+              <div class="ab-arm-header-copy">
+                <div class="ab-arm-title-row">
+                  <span class="message-sender">archi</span>
+                  <span class="message-label ab-arm-label">${label}</span>
+                </div>
+                <span class="ab-arm-variant-name" data-arm-id="${id}"></span>
+              </div>
             </div>
             ${traceHtml(id)}
             <div class="message-content"></div>
+            <div class="message-meta" style="display: none;"></div>
             <div class="message-actions">
               <button class="feedback-btn feedback-like" onclick="UI.handleFeedback(this, 'like')" aria-label="Helpful" title="Helpful">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>
@@ -2415,8 +2497,49 @@ const UI = {
 
   updateABVariantLabel(armId, variantName) {
     const labelEl = document.querySelector(`.ab-arm-variant-name[data-arm-id="${armId}"]`);
-    if (labelEl && variantName) {
-      labelEl.textContent = variantName;
+    if (labelEl) {
+      labelEl.textContent = variantName || '';
+    }
+  },
+
+  updateABArmMeta(armId, metaText, visible = true) {
+    const container = document.querySelector(`.ab-arm[data-id="${armId}"], .ab-response[data-id="${armId}"]`);
+    const metaEl = container?.querySelector('.message-meta');
+    if (!metaEl) return;
+    metaEl.textContent = metaText || '';
+    metaEl.style.display = visible && metaText ? '' : 'none';
+  },
+
+  updateABArmPresentation(
+    armId,
+    { variantName = '', modelUsed = '' } = {},
+    { disclosureMode = 'post_vote_reveal', reveal = false } = {},
+  ) {
+    const showVariant = disclosureMode === 'named' || (disclosureMode === 'post_vote_reveal' && reveal);
+    this.updateABVariantLabel(armId, showVariant ? variantName : '');
+    this.updateABArmMeta(armId, modelUsed, showVariant && !!modelUsed);
+  },
+
+  rekeyABArm(oldId, newId) {
+    if (!oldId || !newId || String(oldId) === String(newId)) return;
+
+    const arm = document.querySelector(`.ab-arm[data-id="${oldId}"], .ab-response[data-id="${oldId}"]`);
+    if (arm) {
+      arm.dataset.id = String(newId);
+    }
+
+    const variantLabel = document.querySelector(`.ab-arm-variant-name[data-arm-id="${oldId}"]`);
+    if (variantLabel) {
+      variantLabel.dataset.armId = String(newId);
+    }
+
+    const traceContainer = document.querySelector(`.trace-container[data-message-id="${oldId}"]`);
+    if (traceContainer) {
+      traceContainer.dataset.messageId = String(newId);
+      const toggle = traceContainer.querySelector('[data-trace-toggle]');
+      if (toggle) {
+        toggle.dataset.traceToggle = String(newId);
+      }
     }
   },
 
@@ -2474,11 +2597,32 @@ const UI = {
     document.querySelector('.ab-vote-container')?.remove();
   },
 
-  markABWinner(preference) {
-    const comparison = document.getElementById('ab-comparison-active');
-    if (!comparison) return;
+  markABWinner(preference, comparisonState = null) {
+    const comparisonEl = document.getElementById('ab-comparison-active');
+    if (!comparisonEl) return;
 
-    const arms = comparison.querySelectorAll('.ab-arm');
+    if (comparisonState?.responseAId) {
+      this.rekeyABArm(comparisonState.responseAUiId || comparisonState.responseAId, comparisonState.responseAId);
+      this.updateABArmPresentation(comparisonState.responseAId, {
+        variantName: comparisonState.variantA,
+        modelUsed: comparisonState.responseAModelUsed,
+      }, {
+        disclosureMode: comparisonState.disclosureMode,
+        reveal: true,
+      });
+    }
+    if (comparisonState?.responseBId) {
+      this.rekeyABArm(comparisonState.responseBUiId || comparisonState.responseBId, comparisonState.responseBId);
+      this.updateABArmPresentation(comparisonState.responseBId, {
+        variantName: comparisonState.variantB,
+        modelUsed: comparisonState.responseBModelUsed,
+      }, {
+        disclosureMode: comparisonState.disclosureMode,
+        reveal: true,
+      });
+    }
+
+    const arms = comparisonEl.querySelectorAll('.ab-arm');
     const armA = arms[0];
     const armB = arms[1];
 
@@ -2486,7 +2630,7 @@ const UI = {
       // Tie — dim both equally and add a badge
       armA?.classList.add('ab-arm-tie');
       armB?.classList.add('ab-arm-tie');
-      comparison.removeAttribute('id');
+      comparisonEl.removeAttribute('id');
       return;
     }
 
@@ -2505,7 +2649,7 @@ const UI = {
 
     // Unwrap from the comparison container
     if (winner) {
-      comparison.outerHTML = winner.outerHTML;
+      comparisonEl.outerHTML = winner.outerHTML;
     }
   },
 
@@ -2548,12 +2692,12 @@ const UI = {
     const existingTrace = inner.querySelector('.trace-container');
     if (existingTrace) return;
 
-    const traceIconSvg = `<svg class="trace-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path></svg>`;
+    const traceIconSvg = this.getTraceIconSvg();
     const traceHtml = `
       <div class="trace-container" data-message-id="${messageId}">
         <div class="trace-header">
           ${traceIconSvg}
-          <span class="trace-label">Agent Activity</span>
+          <span class="trace-label">${this.getTraceLabelText()}</span>
           <span class="trace-timer" data-start="${Date.now()}">0.0s</span>
           <button class="trace-toggle" aria-label="Toggle agent activity details" title="Toggle agent activity" onclick="UI.toggleTraceExpanded('${messageId}')">
             <span class="toggle-icon" aria-hidden="true">&#9660;</span>
@@ -2652,7 +2796,7 @@ const UI = {
   },
 
   renderThinkingEnd(messageId, event) {
-    const step = document.querySelector(`.thinking-step[data-step-id="${event.step_id}"]`);
+    const step = document.querySelector(`.trace-container[data-message-id="${messageId}"] .thinking-step[data-step-id="${event.step_id}"]`);
     if (!step) return;
 
     // If no thinking content, remove the step entirely - it's just noise
@@ -2733,7 +2877,7 @@ const UI = {
     this.scrollToBottom();
 
     // Auto-expand if verbose mode
-    if (Chat.state.traceVerboseMode === 'verbose') {
+    if (this.getTraceModeForMessage(messageId) === 'verbose') {
       const step = timeline.querySelector(`[data-step-id="${event.tool_call_id}"]`);
       step?.classList.add('expanded');
       const details = step?.querySelector('.step-details');
@@ -2758,7 +2902,7 @@ const UI = {
   },
 
   renderToolOutput(messageId, event) {
-    const step = document.querySelector(`.tool-step[data-tool-call-id="${event.tool_call_id}"]`);
+    const step = document.querySelector(`.trace-container[data-message-id="${messageId}"] .tool-step[data-tool-call-id="${event.tool_call_id}"]`);
     if (!step) return;
 
     const outputSection = step.querySelector('.tool-output-section');
@@ -2787,7 +2931,7 @@ const UI = {
   },
 
   renderToolEnd(messageId, event) {
-    const step = document.querySelector(`.tool-step[data-tool-call-id="${event.tool_call_id}"]`);
+    const step = document.querySelector(`.trace-container[data-message-id="${messageId}"] .tool-step[data-tool-call-id="${event.tool_call_id}"]`);
     if (!step) return;
 
     step.classList.remove('tool-running');
@@ -2810,8 +2954,9 @@ const UI = {
     }
 
     // Auto-collapse if many tools
-    const toolCount = document.querySelectorAll('.tool-step').length;
-    if (Chat.state.traceVerboseMode === 'normal' && toolCount > CONFIG.TRACE.AUTO_COLLAPSE_TOOL_COUNT) {
+    const timeline = step.closest('.step-timeline');
+    const toolCount = timeline?.querySelectorAll('.tool-step').length || 0;
+    if (this.getTraceModeForMessage(messageId) === 'normal' && toolCount > CONFIG.TRACE.AUTO_COLLAPSE_TOOL_COUNT) {
       step.classList.remove('expanded');
       const details = step.querySelector('.step-details');
       if (details) details.style.display = 'none';
@@ -2867,10 +3012,15 @@ const UI = {
     const container = document.querySelector(`.trace-container[data-message-id="${messageId}"]`);
     if (!container) return;
 
-    const toolCount = trace.toolCalls.size;
+    const toolCalls = trace?.toolCalls;
+    const toolCount = toolCalls instanceof Map
+      ? toolCalls.size
+      : Array.isArray(toolCalls)
+        ? toolCalls.length
+        : 0;
     const label = container.querySelector('.trace-label');
-    if (label && toolCount > 0) {
-      label.textContent = `Agent Activity (${toolCount} tool${toolCount === 1 ? '' : 's'})`;
+    if (label) {
+      label.textContent = this.getTraceLabelText(toolCount);
     }
     
     // Update context meter if usage available
@@ -2879,7 +3029,7 @@ const UI = {
     }
 
     // Auto-collapse in normal mode
-    if (Chat.state.traceVerboseMode === 'normal') {
+    if (this.getTraceModeForMessage(messageId) === 'normal') {
       container.classList.add('collapsed');
       const toggleIcon = container.querySelector('.toggle-icon');
       if (toggleIcon) toggleIcon.innerHTML = '&#9654;';
@@ -2929,12 +3079,10 @@ const UI = {
     const durationMs = trace.total_duration_ms || 0;
     const durationStr = Utils.formatDuration(durationMs);
 
-    const traceIconSvg = `<svg class="trace-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"></path></svg>`;
+    const traceIconSvg = this.getTraceIconSvg();
     
     // Build trace container with collapsed state
-    const labelText = toolCount > 0 
-      ? `Agent Activity (${toolCount} tool${toolCount === 1 ? '' : 's'})` 
-      : 'Agent Activity';
+    const labelText = this.getTraceLabelText(toolCount);
 
     const traceHtml = `
       <div class="trace-container collapsed" data-message-id="${messageId}">
@@ -3382,20 +3530,12 @@ const Chat = {
   async loadABPool() {
     try {
       const data = await API.getABPool();
-      const isAdmin = data?.is_admin === true;
-      // Hide A/B settings section entirely for non-admins
-      UI.setABSectionVisible(isAdmin);
-      if (isAdmin) {
-        if (data?.enabled) {
-          this.state.abPool = data;
-          console.info('A/B pool loaded:', data.champion, '+ challengers:', data.variants);
-        } else {
-          this.state.abPool = null;
-        }
-        // Always render the editor for admins (shows current pool state or empty)
+      const canManage = data?.can_manage === true;
+      UI.setABSectionVisible(canManage);
+
+      this.state.abPool = data?.enabled ? data : null;
+      if (canManage) {
         UI.updateABPoolUI(data?.enabled ? data : { enabled: false });
-      } else {
-        this.state.abPool = null;
       }
     } catch (e) {
       console.warn('Failed to load A/B pool (pool mode disabled):', e);
@@ -3718,6 +3858,8 @@ const Chat = {
 
       // Build history for API
       this.state.history = (data.messages || []).map((msg) => [msg.sender, msg.content]);
+      this.state.activeABComparison = null;
+      this.state.abVotePending = false;
 
       UI.renderMessages(this.state.messages);
       
@@ -3727,6 +3869,13 @@ const Chat = {
           UI.renderHistoricalTrace(msg.id, msg.trace);
         }
       }
+
+      if (data.pending_ab_comparison) {
+        this.restorePendingABComparison(data.pending_ab_comparison);
+      } else {
+        UI.hideABVoteButtons();
+        UI.setInputDisabled(false);
+      }
       
       await this.loadConversations(); // Refresh list to show active state
     } catch (e) {
@@ -3734,10 +3883,77 @@ const Chat = {
       this.state.conversationId = null;
       this.state.messages = [];
       this.state.history = [];
+      this.state.activeABComparison = null;
+      this.state.abVotePending = false;
       Storage.setActiveConversationId(null);
       UI.renderMessages([]);
+      UI.hideABVoteButtons();
+      UI.setInputDisabled(false);
       UI.showToast('Conversation not found. Starting a new chat.');
     }
+  },
+
+  restorePendingABComparison(comparison) {
+    if (!comparison?.response_a || !comparison?.response_b) return;
+
+    const traceMode = comparison.default_trace_mode || 'minimal';
+    const disclosureMode = comparison.disclosure_mode || 'post_vote_reveal';
+    const responseAId = comparison.response_a.message_id;
+    const responseBId = comparison.response_b.message_id;
+
+    UI.addABComparisonContainer(responseAId, responseBId, { traceMode });
+    UI.updateABResponse(responseAId, Markdown.render(comparison.response_a.content || ''), false);
+    UI.updateABResponse(responseBId, Markdown.render(comparison.response_b.content || ''), false);
+    UI.updateABArmPresentation(responseAId, {
+      variantName: comparison.variant_a_name,
+      modelUsed: comparison.response_a.model_used,
+    }, {
+      disclosureMode,
+      reveal: false,
+    });
+    UI.updateABArmPresentation(responseBId, {
+      variantName: comparison.variant_b_name,
+      modelUsed: comparison.response_b.model_used,
+    }, {
+      disclosureMode,
+      reveal: false,
+    });
+
+    if (traceMode !== 'minimal' && comparison.response_a.trace) {
+      document.querySelector(`.ab-arm[data-id="${responseAId}"] .trace-container`)?.remove();
+      UI.stopTraceTimer(responseAId);
+      UI.renderHistoricalTrace(responseAId, comparison.response_a.trace);
+    } else {
+      UI.stopTraceTimer(responseAId);
+      document.querySelector(`.ab-arm[data-id="${responseAId}"] .trace-container`)?.remove();
+    }
+    if (traceMode !== 'minimal' && comparison.response_b.trace) {
+      document.querySelector(`.ab-arm[data-id="${responseBId}"] .trace-container`)?.remove();
+      UI.stopTraceTimer(responseBId);
+      UI.renderHistoricalTrace(responseBId, comparison.response_b.trace);
+    } else {
+      UI.stopTraceTimer(responseBId);
+      document.querySelector(`.ab-arm[data-id="${responseBId}"] .trace-container`)?.remove();
+    }
+
+    this.state.activeABComparison = {
+      comparisonId: comparison.comparison_id,
+      responseAId,
+      responseBId,
+      responseAUiId: responseAId,
+      responseBUiId: responseBId,
+      responseAText: comparison.response_a.content || '',
+      responseBText: comparison.response_b.content || '',
+      responseAModelUsed: comparison.response_a.model_used || '',
+      responseBModelUsed: comparison.response_b.model_used || '',
+      variantA: comparison.variant_a_name || '',
+      variantB: comparison.variant_b_name || '',
+      disclosureMode,
+      traceMode,
+    };
+    this.state.abVotePending = true;
+    UI.showABVoteButtons(comparison.comparison_id);
+    UI.setInputDisabled(true);
   },
 
   async newConversation() {
@@ -3746,9 +3962,13 @@ const Chat = {
       this.state.conversationId = null;
       this.state.messages = [];
       this.state.history = [];
+      this.state.activeABComparison = null;
+      this.state.abVotePending = false;
       Storage.setActiveConversationId(null);
       
       UI.renderMessages([]);
+      UI.hideABVoteButtons();
+      UI.setInputDisabled(false);
       await this.loadConversations();
     } catch (e) {
       console.error('Failed to create conversation:', e);
@@ -3765,8 +3985,12 @@ const Chat = {
         this.state.conversationId = null;
         this.state.messages = [];
         this.state.history = [];
+        this.state.activeABComparison = null;
+        this.state.abVotePending = false;
         Storage.setActiveConversationId(null);
         UI.renderMessages([]);
+        UI.hideABVoteButtons();
+        UI.setInputDisabled(false);
       }
       
       await this.loadConversations();
@@ -3808,7 +4032,15 @@ const Chat = {
 
     // Determine which config to use
     const configA = UI.getSelectedConfig('A');
-    const isAB = UI.isABEnabled();
+    let isAB = false;
+    if (UI.shouldUseABForNextTurn()) {
+      try {
+        const decision = await API.getABDecision(this.state.conversationId);
+        isAB = decision?.use_ab === true;
+      } catch (e) {
+        console.warn('Failed to get server-side A/B decision, falling back to single response mode:', e);
+      }
+    }
 
     if (isAB) {
       await this.sendABMessage(text, configA);
@@ -3852,11 +4084,19 @@ const Chat = {
 
     const msgIdA = `${Date.now()}-ab-a`;
     const msgIdB = `${Date.now()}-ab-b`;
+    const traceMode = UI.getABTraceMode();
+    const disclosureMode = UI.getABDisclosureMode();
+    const { provider, model } = this.getSelectedProviderAndModel();
 
     // Create side-by-side container using normal message styling
-    UI.addABComparisonContainer(msgIdA, msgIdB);
+    UI.addABComparisonContainer(msgIdA, msgIdB, { traceMode });
 
     const armTexts = { a: '', b: '' };
+    const armTraces = {
+      a: { toolCalls: new Map(), events: [] },
+      b: { toolCalls: new Map(), events: [] },
+    };
+    const finalEvents = { a: null, b: null };
     let abMeta = null;
 
     try {
@@ -3867,6 +4107,8 @@ const Chat = {
         this.state.conversationId,
         configA,
         this.state.abortController?.signal,
+        provider,
+        model,
       )) {
         if (event.type === 'meta' && event.event === 'stream_started') {
           continue; // padding event
@@ -3884,9 +4126,14 @@ const Chat = {
         }
 
         if (event.type === 'ab_arms') {
-          // Early metadata: update arm labels with variant names
-          UI.updateABVariantLabel(msgIdA, event.arm_a_name);
-          UI.updateABVariantLabel(msgIdB, event.arm_b_name);
+          UI.updateABArmPresentation(msgIdA, { variantName: event.arm_a_name }, {
+            disclosureMode: event.disclosure_mode || disclosureMode,
+            reveal: false,
+          });
+          UI.updateABArmPresentation(msgIdB, { variantName: event.arm_b_name }, {
+            disclosureMode: event.disclosure_mode || disclosureMode,
+            reveal: false,
+          });
           continue;
         }
 
@@ -3903,12 +4150,27 @@ const Chat = {
         const arm = event.arm; // 'a' or 'b'
         if (!arm) continue;
         const targetId = arm === 'a' ? msgIdA : msgIdB;
+        const traceState = armTraces[arm];
 
         if (event.type === 'text' || event.type === 'chunk') {
           const content = event.content || '';
           if (content) {
             armTexts[arm] = content; // Server sends accumulated text
             UI.updateABResponse(targetId, Markdown.render(armTexts[arm]), true);
+          }
+        } else if (event.type === 'final') {
+          const finalText = event.response || armTexts[arm] || '';
+          armTexts[arm] = finalText;
+          finalEvents[arm] = event;
+          UI.updateABResponse(targetId, Markdown.render(finalText), false);
+          if (abMeta) {
+            UI.updateABArmPresentation(targetId, {
+              variantName: arm === 'a' ? abMeta.arm_a_variant : abMeta.arm_b_variant,
+              modelUsed: event.model_used || '',
+            }, {
+              disclosureMode: abMeta.disclosure_mode || disclosureMode,
+              reveal: false,
+            });
           }
         } else if (event.type === 'step' && event.step_type === 'agent') {
           const content = event.content || '';
@@ -3917,6 +4179,30 @@ const Chat = {
             UI.updateABResponse(targetId, Markdown.render(armTexts[arm]), true);
           }
         } else {
+          if (event.type === 'tool_start') {
+            traceState.toolCalls.set(event.tool_call_id, {
+              name: event.tool_name,
+              args: event.tool_args,
+              status: 'running',
+            });
+            traceState.events.push(event);
+          } else if (event.type === 'tool_output') {
+            const toolData = traceState.toolCalls.get(event.tool_call_id);
+            if (toolData) {
+              toolData.output = event.output;
+              toolData.status = 'success';
+            }
+            traceState.events.push(event);
+          } else if (event.type === 'tool_end') {
+            const toolData = traceState.toolCalls.get(event.tool_call_id);
+            if (toolData) {
+              toolData.status = event.status;
+              toolData.duration = event.duration_ms;
+            }
+            traceState.events.push(event);
+          } else if (event.type === 'thinking_start' || event.type === 'thinking_end') {
+            traceState.events.push(event);
+          }
           this._renderStreamEvent(targetId, event);
         }
       }
@@ -3926,24 +4212,37 @@ const Chat = {
       UI.updateABResponse(msgIdB, Markdown.render(armTexts.b), false);
 
       // Stop trace timers and finalize trace containers
-      UI.stopTraceTimer(msgIdA);
-      UI.stopTraceTimer(msgIdB);
-      UI.finalizeTrace(msgIdA);
-      UI.finalizeTrace(msgIdB);
+      UI.finalizeTrace(msgIdA, armTraces.a, finalEvents.a);
+      UI.finalizeTrace(msgIdB, armTraces.b, finalEvents.b);
 
       // Set up voting if we got a comparison_id
       if (abMeta?.comparison_id) {
+        if (abMeta.arm_a_message_id) {
+          UI.rekeyABArm(msgIdA, abMeta.arm_a_message_id);
+        }
+        if (abMeta.arm_b_message_id) {
+          UI.rekeyABArm(msgIdB, abMeta.arm_b_message_id);
+        }
         this.state.activeABComparison = {
           comparisonId: abMeta.comparison_id,
           responseAId: abMeta.arm_a_message_id,
           responseBId: abMeta.arm_b_message_id,
+          responseAUiId: abMeta.arm_a_message_id || msgIdA,
+          responseBUiId: abMeta.arm_b_message_id || msgIdB,
           responseAText: armTexts.a,
           responseBText: armTexts.b,
+          responseAModelUsed: finalEvents.a?.model_used || abMeta.arm_a_model_used || '',
+          responseBModelUsed: finalEvents.b?.model_used || abMeta.arm_b_model_used || '',
           variantA: abMeta.arm_a_variant,
           variantB: abMeta.arm_b_variant,
+          disclosureMode: abMeta.disclosure_mode || disclosureMode,
+          traceMode,
         };
         this.state.abVotePending = true;
         UI.showABVoteButtons(abMeta.comparison_id);
+      } else {
+        UI.showToast('Comparison completed without a recorded vote state. Input has been re-enabled.');
+        UI.setInputDisabled(false);
       }
 
       // Highlight code
@@ -3973,10 +4272,13 @@ const Chat = {
     if (!this.state.activeABComparison) return;
 
     try {
-      await API.submitABPreference(this.state.activeABComparison.comparisonId, preference);
+      const result = await API.submitABPreference(this.state.activeABComparison.comparisonId, preference);
+      if (result?.updated === false) {
+        console.info('A/B preference already recorded for comparison', this.state.activeABComparison.comparisonId);
+      }
 
       // Update UI to show result
-      UI.markABWinner(preference);
+      UI.markABWinner(preference, this.state.activeABComparison);
       UI.hideABVoteButtons();
 
       // Add the chosen response to history for context
@@ -3996,6 +4298,7 @@ const Chat = {
       this.state.abVotePending = false;
       UI.setInputDisabled(false);
       UI.elements.inputField?.focus();
+      await this.loadConversations();
     } catch (e) {
       console.error('Failed to submit preference:', e);
       UI.showToast('Failed to submit preference. Please try again.');
@@ -4018,7 +4321,7 @@ const Chat = {
     }
 
     // Mark as tie/skipped visually
-    UI.markABWinner('tie');
+    UI.markABWinner('tie', this.state.activeABComparison);
     UI.hideABVoteButtons();
 
     // Clear state
@@ -4034,7 +4337,7 @@ const Chat = {
    * tool/thinking rendering logic is defined in exactly one place.
    */
   _renderStreamEvent(messageId, event) {
-    const showTrace = this.state.traceVerboseMode !== 'minimal';
+    const showTrace = UI.getTraceModeForMessage(messageId) !== 'minimal';
     if (!showTrace) return;
     switch (event.type) {
       case 'tool_start':

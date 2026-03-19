@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import time
 import uuid
@@ -39,7 +40,6 @@ from src.archi.pipelines.agents.agent_spec import (
     slugify_agent_name,
 )
 from src.archi.providers.base import ModelInfo, ProviderConfig, ProviderType
-from src.utils.config_service import ConfigService
 from src.archi.utils.output_dataclass import PipelineOutput
 # from src.data_manager.data_manager import DataManager
 from src.data_manager.data_viewer_service import DataViewerService
@@ -79,7 +79,7 @@ from src.utils.rbac import (
     require_any_permission,
     require_authenticated,
 )
-from src.utils.rbac.permissions import get_permission_context
+from src.utils.rbac.permissions import get_permission_context, is_admin as rbac_is_admin
 from src.utils.rbac.audit import log_authentication_event
 
 
@@ -241,6 +241,7 @@ class ChatWrapper:
             "password": read_secret("PG_PASSWORD"),
             **self.services_config["postgres"],
         }
+        self.config_service = ConfigService(pg_config=self.pg_config)
 
         # initialize data manager (ingestion handled by data-manager service)
         # self.data_manager = DataManager(run_ingestion=False)
@@ -322,6 +323,24 @@ class ChatWrapper:
             self.update_config(config_name=self.default_config_name)
 
         # A/B testing pool (loaded from config; None if not configured)
+        self.refresh_ab_pool()
+
+    def reload_static_state(self) -> None:
+        """
+        Reload static config snapshots used by the chat wrapper.
+
+        This is primarily used after runtime updates to the persisted chat A/B
+        configuration so the active process picks up the latest pool settings.
+        """
+        self.config_service.get_static_config(force_reload=True)
+        self.config = get_full_config()
+        self.global_config = self.config["global"]
+        self.services_config = self.config["services"]
+        self.data_path = self.global_config["DATA_PATH"]
+        self.sources_config = self.config["data_manager"]["sources"]
+        self.refresh_ab_pool()
+
+    def refresh_ab_pool(self) -> None:
         try:
             self.ab_pool = load_ab_pool(self.config)
         except ABPoolError as exc:
@@ -677,189 +696,6 @@ class ChatWrapper:
         return row[0] if row else None
 
     # =========================================================================
-    # A/B Comparison Methods
-    # =========================================================================
-
-    def create_ab_comparison(
-        self,
-        conversation_id: int,
-        user_prompt_mid: int,
-        response_a_mid: int,
-        response_b_mid: int,
-        config_a_id: int,
-        config_b_id: int,
-        is_config_a_first: bool,
-    ) -> int:
-        """
-        Create an A/B comparison record linking two responses to the same user prompt.
-        
-        Args:
-            conversation_id: The conversation this comparison belongs to
-            user_prompt_mid: Message ID of the user's question
-            response_a_mid: Message ID of response A
-            response_b_mid: Message ID of response B
-            config_a_id: Config ID used for response A
-            config_b_id: Config ID used for response B
-            is_config_a_first: True if config A was the "first" config before randomization
-            
-        Returns:
-            The comparison_id of the newly created record
-        """
-        conn = psycopg2.connect(**self.pg_config)
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                SQL_INSERT_AB_COMPARISON,
-                (conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
-                 config_a_id, config_b_id, is_config_a_first)
-            )
-            comparison_id = cursor.fetchone()[0]
-            conn.commit()
-            logger.info(f"Created A/B comparison {comparison_id} for conversation {conversation_id}")
-            return comparison_id
-        finally:
-            cursor.close()
-            conn.close()
-
-    def update_ab_preference(self, comparison_id: int, preference: str) -> None:
-        """
-        Record user's preference for an A/B comparison.
-        
-        Args:
-            comparison_id: The comparison to update
-            preference: 'a', 'b', or 'tie'
-        """
-        if preference not in ('a', 'b', 'tie'):
-            raise ValueError(f"Invalid preference: {preference}")
-            
-        conn = psycopg2.connect(**self.pg_config)
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                SQL_UPDATE_AB_PREFERENCE,
-                (preference, datetime.now(timezone.utc), comparison_id)
-            )
-            conn.commit()
-            logger.info(f"Updated A/B comparison {comparison_id} with preference '{preference}'")
-        finally:
-            cursor.close()
-            conn.close()
-
-    def get_ab_comparison(self, comparison_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Get an A/B comparison by ID.
-        
-        Returns:
-            Dict with comparison data or None if not found
-        """
-        conn = psycopg2.connect(**self.pg_config)
-        cursor = conn.cursor()
-        try:
-            cursor.execute(SQL_GET_AB_COMPARISON, (comparison_id,))
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            return {
-                'comparison_id': row[0],
-                'conversation_id': row[1],
-                'user_prompt_mid': row[2],
-                'response_a_mid': row[3],
-                'response_b_mid': row[4],
-                'config_a_id': row[5],
-                'config_b_id': row[6],
-                'is_config_a_first': row[7],
-                'preference': row[8],
-                'preference_ts': row[9].isoformat() if row[9] else None,
-                'created_at': row[10].isoformat() if row[10] else None,
-            }
-        finally:
-            cursor.close()
-            conn.close()
-
-    def get_pending_ab_comparison(self, conversation_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Get the most recent incomplete A/B comparison for a conversation.
-        
-        Returns:
-            Dict with comparison data or None if no pending comparison
-        """
-        conn = psycopg2.connect(**self.pg_config)
-        cursor = conn.cursor()
-        try:
-            cursor.execute(SQL_GET_PENDING_AB_COMPARISON, (conversation_id,))
-            row = cursor.fetchone()
-            if row is None:
-                return None
-            return {
-                'comparison_id': row[0],
-                'conversation_id': row[1],
-                'user_prompt_mid': row[2],
-                'response_a_mid': row[3],
-                'response_b_mid': row[4],
-                'config_a_id': row[5],
-                'config_b_id': row[6],
-                'is_config_a_first': row[7],
-                'preference': row[8],
-                'preference_ts': row[9].isoformat() if row[9] else None,
-                'created_at': row[10].isoformat() if row[10] else None,
-            }
-        finally:
-            cursor.close()
-            conn.close()
-
-    def delete_ab_comparison(self, comparison_id: int) -> bool:
-        """
-        Delete an A/B comparison (e.g., on abort/failure).
-        
-        Returns:
-            True if a record was deleted, False otherwise
-        """
-        conn = psycopg2.connect(**self.pg_config)
-        cursor = conn.cursor()
-        try:
-            cursor.execute(SQL_DELETE_AB_COMPARISON, (comparison_id,))
-            deleted = cursor.rowcount > 0
-            conn.commit()
-            if deleted:
-                logger.info(f"Deleted A/B comparison {comparison_id}")
-            return deleted
-        finally:
-            cursor.close()
-            conn.close()
-
-    def get_ab_comparisons_by_conversation(self, conversation_id: int) -> List[Dict[str, Any]]:
-        """
-        Get all A/B comparisons for a conversation.
-        
-        Returns:
-            List of comparison dicts
-        """
-        conn = psycopg2.connect(**self.pg_config)
-        cursor = conn.cursor()
-        try:
-            cursor.execute(SQL_GET_AB_COMPARISONS_BY_CONVERSATION, (conversation_id,))
-            rows = cursor.fetchall()
-            return [
-                {
-                    'comparison_id': row[0],
-                    'conversation_id': row[1],
-                    'user_prompt_mid': row[2],
-                    'response_a_mid': row[3],
-                    'response_b_mid': row[4],
-                    'config_a_id': row[5],
-                    'config_b_id': row[6],
-                    'is_config_a_first': row[7],
-                    'preference': row[8],
-                    'preference_ts': row[9].isoformat() if row[9] else None,
-                    'created_at': row[10].isoformat() if row[10] else None,
-                }
-                for row in rows
-            ]
-        finally:
-            cursor.close()
-            conn.close()
-
-    # =========================================================================
     # Agent Trace Methods
     # =========================================================================
 
@@ -1028,8 +864,13 @@ class ChatWrapper:
 
         # query conversation history
         cursor.execute(SQL_QUERY_CONVO, (conversation_id,))
-        history = cursor.fetchall()
-        history = collapse_assistant_sequences(history, sender_name=ARCHI_SENDER)
+        history_rows = cursor.fetchall()
+        comparisons = self.conv_service.get_conversation_ab_comparisons(str(conversation_id))
+        suppressed_ids = self._suppressed_ab_message_ids(comparisons)
+        if suppressed_ids:
+            history_rows = [row for row in history_rows if row[2] not in suppressed_ids]
+        history_rows = collapse_assistant_sequences(history_rows, sender_name=ARCHI_SENDER)
+        history = [(row[0], row[1]) for row in history_rows]
 
         # clean up database connection state
         cursor.close()
@@ -1295,32 +1136,42 @@ class ChatWrapper:
             logger.warning(f"Failed to create provider LLM {provider}/{model}: {e}")
             raise
 
-    def _create_variant_archi(self, variant: "ABVariant") -> "archi":
+    def _create_variant_archi(
+        self,
+        variant: "ABVariant",
+        *,
+        request_provider: Optional[str] = None,
+        request_model: Optional[str] = None,
+        request_provider_api_key: Optional[str] = None,
+    ) -> "archi":
         """
         Build a temporary archi instance configured for a specific A/B variant.
 
-        Falls back to the deployment defaults for any field the variant doesn't override.
+        Uses the deployment defaults for provider/model unless the variant overrides
+        them, but always requires an explicit variant agent spec.
         """
         chat_cfg = self.services_config.get("chat_app", {})
         agents_dir = Path(chat_cfg.get("agents_dir", "/root/archi/agents"))
 
-        # Resolve agent spec
-        variant_agent_spec = self.agent_spec  # default
-        if variant.agent_spec:
-            try:
-                spec_path = agents_dir / variant.agent_spec
-                if not spec_path.exists():
-                    spec_path = Path(variant.agent_spec)
-                variant_agent_spec = load_agent_spec(spec_path)
-            except Exception as exc:
-                logger.warning(
-                    "Variant '%s': failed to load agent spec '%s', using default: %s",
-                    variant.name, variant.agent_spec, exc,
-                )
+        # Resolve variant agent spec from agents_dir; do not silently fall back.
+        spec_name = (variant.agent_spec or "").strip()
+        if not spec_name:
+            raise ABPoolError(f"Variant '{variant.label}' is missing required agent_spec.")
+        if Path(spec_name).name != spec_name:
+            raise ABPoolError(
+                f"Variant '{variant.label}' must use an agent_spec filename under agents_dir, got '{spec_name}'."
+            )
+
+        spec_path = agents_dir / spec_name
+        if not spec_path.exists():
+            raise ABPoolError(
+                f"Variant '{variant.label}' references missing agent spec '{spec_name}' in '{agents_dir}'."
+            )
+        variant_agent_spec = load_agent_spec(spec_path)
 
         agent_class = self._get_agent_class_from_cfg(chat_cfg)
-        default_provider = variant.provider or chat_cfg.get("default_provider")
-        default_model = variant.model or chat_cfg.get("default_model")
+        default_provider = variant.provider or request_provider or chat_cfg.get("default_provider")
+        default_model = variant.model or request_model or chat_cfg.get("default_model")
         prompt_overrides = chat_cfg.get("prompts", {})
 
         variant_archi = archi(
@@ -1330,6 +1181,23 @@ class ChatWrapper:
             default_model=default_model,
             prompt_overrides=prompt_overrides,
         )
+
+        if (
+            request_provider_api_key
+            and default_provider
+            and default_model
+            and default_provider == request_provider
+            and hasattr(variant_archi, 'pipeline')
+        ):
+            override_llm = self._create_provider_llm(
+                default_provider,
+                default_model,
+                request_provider_api_key,
+            )
+            if override_llm and hasattr(variant_archi.pipeline, 'agent_llm'):
+                variant_archi.pipeline.agent_llm = override_llm
+                if hasattr(variant_archi.pipeline, 'refresh_agent'):
+                    variant_archi.pipeline.refresh_agent(force=True)
 
         # Apply retriever overrides if specified
         if variant.num_documents_to_retrieve is not None and hasattr(variant_archi, 'pipeline'):
@@ -1345,6 +1213,35 @@ class ChatWrapper:
                 pipeline.pipeline_config['recursion_limit'] = variant.recursion_limit
 
         return variant_archi
+
+    @staticmethod
+    def _comparison_canonical_message_id(comparison) -> Optional[int]:
+        preference = getattr(comparison, "preference", None)
+        if preference == "b":
+            return getattr(comparison, "response_b_mid", None)
+        if preference in ("a", "tie", "skip"):
+            return getattr(comparison, "response_a_mid", None)
+        return None
+
+    @classmethod
+    def _suppressed_ab_message_ids(cls, comparisons: List[Any]) -> set:
+        suppressed: set = set()
+        for comparison in comparisons or []:
+            preference = getattr(comparison, "preference", None)
+            a_mid = getattr(comparison, "response_a_mid", None)
+            b_mid = getattr(comparison, "response_b_mid", None)
+            if preference is None:
+                if a_mid:
+                    suppressed.add(a_mid)
+                if b_mid:
+                    suppressed.add(b_mid)
+                continue
+
+            canonical_mid = cls._comparison_canonical_message_id(comparison)
+            for mid in (a_mid, b_mid):
+                if mid and mid != canonical_mid:
+                    suppressed.add(mid)
+        return suppressed
 
     def _prepare_chat_context(
         self,
@@ -1480,6 +1377,11 @@ class ChatWrapper:
         client_sent_msg_ts: float,
         client_timeout: float,
         config_name: str,
+        *,
+        user_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+        provider_api_key: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
         Stream a champion/challenger A/B comparison.
@@ -1494,6 +1396,9 @@ class ChatWrapper:
         if not self.ab_pool:
             yield {"type": "error", "message": "A/B pool not configured"}
             return
+
+        requested_config = self._resolve_config_name(config_name)
+        self.update_config(config_name=requested_config)
 
         # Sample matchup
         arm_a_variant, arm_b_variant, is_champion_first = self.ab_pool.sample_matchup()
@@ -1513,6 +1418,7 @@ class ChatWrapper:
             client_sent_msg_ts,
             client_timeout,
             timestamps,
+            user_id=user_id,
         )
         if error_code is not None:
             yield self._error_event(error_code)
@@ -1520,8 +1426,18 @@ class ChatWrapper:
 
         # Build variant archis
         try:
-            archi_a = self._create_variant_archi(arm_a_variant)
-            archi_b = self._create_variant_archi(arm_b_variant)
+            archi_a = self._create_variant_archi(
+                arm_a_variant,
+                request_provider=provider,
+                request_model=model,
+                request_provider_api_key=provider_api_key,
+            )
+            archi_b = self._create_variant_archi(
+                arm_b_variant,
+                request_provider=provider,
+                request_model=model,
+                request_provider_api_key=provider_api_key,
+            )
         except Exception as exc:
             logger.error("Failed to create variant pipelines: %s", exc)
             yield {"type": "error", "message": f"Failed to initialise A/B variants: {exc}"}
@@ -1585,6 +1501,7 @@ class ChatWrapper:
             "type": "ab_arms",
             "arm_a_name": arm_a_variant.name,
             "arm_b_name": arm_b_variant.name,
+            "disclosure_mode": self.ab_pool.disclosure_mode,
         }
 
         # Start both arms in parallel threads
@@ -1689,9 +1606,12 @@ class ChatWrapper:
             "conversation_id": context.conversation_id,
             "arm_a_variant": arm_a_variant.name,
             "arm_b_variant": arm_b_variant.name,
+            "arm_a_model_used": f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
+            "arm_b_model_used": f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
             "is_champion_first": is_champion_first,
             "arm_a_message_id": arm_a_mid,
             "arm_b_message_id": arm_b_mid,
+            "disclosure_mode": self.ab_pool.disclosure_mode,
         }
 
     def _store_assistant_message(self, conversation_id, content, model_used=None, pipeline_used=None):
@@ -2319,6 +2239,7 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/api/ab/preference', 'ab_preference', self.require_auth(self.ab_submit_preference), methods=["POST"])
         self.add_endpoint('/api/ab/pending', 'ab_pending', self.require_auth(self.ab_get_pending), methods=["GET"])
         self.add_endpoint('/api/ab/pool', 'ab_pool', self.require_auth(self.ab_get_pool), methods=["GET"])
+        self.add_endpoint('/api/ab/decision', 'ab_decision', self.require_auth(self.ab_get_decision), methods=["GET"])
         self.add_endpoint('/api/ab/pool/set', 'ab_pool_set', self.require_auth(self.ab_set_pool), methods=["POST"])
         self.add_endpoint('/api/ab/pool/disable', 'ab_pool_disable', self.require_auth(self.ab_disable_pool), methods=["POST"])
         self.add_endpoint('/api/ab/compare', 'ab_compare', self.require_auth(self.ab_compare_stream), methods=["POST"])
@@ -3130,6 +3051,10 @@ class FlaskAppWrapper(object):
                 if not target_path:
                     return jsonify({'error': f"Agent '{existing_name}' not found"}), 404
                 new_spec = load_agent_spec_from_text(content)
+                if new_spec.name != existing_name:
+                    return jsonify({
+                        'error': 'Agent name cannot be changed in edit mode. Create or clone a new agent instead.'
+                    }), 400
                 for path in list_agent_files(agents_dir):
                     if path == target_path:
                         continue
@@ -3140,13 +3065,6 @@ class FlaskAppWrapper(object):
                     if spec.name == new_spec.name:
                         return jsonify({'error': f"Agent name '{new_spec.name}' already exists"}), 409
                 target_path.write_text(content)
-                try:
-                    dynamic = get_dynamic_config()
-                except Exception:
-                    dynamic = None
-                if dynamic and dynamic.active_agent_name == existing_name and new_spec.name != existing_name:
-                    cfg = ConfigService(pg_config=self.pg_config)
-                    cfg.update_dynamic_config(active_agent_name=new_spec.name, updated_by=data.get("client_id") or "system")
                 return jsonify({
                     'success': True,
                     'name': new_spec.name,
@@ -3579,14 +3497,102 @@ class FlaskAppWrapper(object):
         return request.args.get('client_id', '')
 
     def _is_admin_request(self) -> bool:
-        """Return True if the current request's client_id belongs to an admin."""
-        client_id = self._get_request_client_id()
-        if not client_id:
-            return False
+        """Return True when the current request is from an RBAC admin user."""
         try:
-            return self.config_service.is_admin(client_id)
+            return bool(rbac_is_admin())
         except Exception:
             return False
+
+    def _can_manage_ab_testing(self) -> bool:
+        return self._is_admin_request() or has_permission(Permission.Config.MODIFY)
+
+    def _can_view_ab_metrics(self) -> bool:
+        return self._can_manage_ab_testing() or has_permission(Permission.Metrics.VIEW)
+
+    def _current_request_roles(self) -> List[str]:
+        return list(session.get('roles', []) or [])
+
+    def _current_request_permissions(self) -> List[str]:
+        ctx = get_permission_context()
+        permissions: List[str] = []
+        if ctx.get('can_modify_config'):
+            permissions.append(Permission.Config.MODIFY.value)
+        if ctx.get('can_view_metrics'):
+            permissions.append(Permission.Metrics.VIEW.value)
+        if ctx.get('can_chat'):
+            permissions.append(Permission.Chat.QUERY.value)
+        return permissions
+
+    def _can_use_ab_testing(self) -> bool:
+        pool = self.chat.ab_pool
+        if not pool or not pool.enabled:
+            return False
+        return pool.is_targeted_user(
+            roles=self._current_request_roles(),
+            permissions=self._current_request_permissions(),
+        )
+
+    def _refresh_runtime_config(self) -> None:
+        self.config_service.get_static_config(force_reload=True)
+        self.config = get_full_config()
+        self.global_config = self.config["global"]
+        self.services_config = self.config["services"]
+        self.chat_app_config = self.services_config["chat_app"]
+        self.chat.reload_static_state()
+
+    def _serialize_pending_ab_comparison(
+        self,
+        comparison,
+    ) -> Optional[Dict[str, Any]]:
+        if comparison is None:
+            return None
+
+        mids = [comparison.response_a_mid, comparison.response_b_mid]
+        if not all(mids):
+            return None
+
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                SELECT message_id, sender, content, model_used
+                FROM conversations
+                WHERE message_id = ANY(%s)
+                ORDER BY message_id ASC
+                """,
+                (mids,),
+            )
+            messages = {
+                row[0]: {
+                    "message_id": row[0],
+                    "sender": row[1],
+                    "content": row[2],
+                    "model_used": row[3],
+                    "trace": self.chat.get_trace_by_message(row[0]),
+                }
+                for row in cursor.fetchall()
+            }
+        finally:
+            cursor.close()
+            conn.close()
+
+        response_a = messages.get(comparison.response_a_mid)
+        response_b = messages.get(comparison.response_b_mid)
+        if not response_a or not response_b:
+            return None
+
+        return {
+            "comparison_id": comparison.comparison_id,
+            "conversation_id": comparison.conversation_id,
+            "response_a": response_a,
+            "response_b": response_b,
+            "variant_a_name": comparison.variant_a_name,
+            "variant_b_name": comparison.variant_b_name,
+            "preference": comparison.preference,
+            "disclosure_mode": self.chat.ab_pool.disclosure_mode if self.chat.ab_pool else "post_vote_reveal",
+            "default_trace_mode": self.chat.ab_pool.default_trace_mode if self.chat.ab_pool else "minimal",
+        }
 
     def _parse_chat_request(self) -> Dict[str, Any]:
         payload = request.get_json(silent=True) or {}
@@ -3938,6 +3944,10 @@ class FlaskAppWrapper(object):
             # get history of the conversation along with latest feedback state
             cursor.execute(SQL_QUERY_CONVO_WITH_FEEDBACK, (conversation_id, ))
             history_rows = cursor.fetchall()
+            comparisons = self.chat.conv_service.get_conversation_ab_comparisons(str(conversation_id))
+            suppressed_ids = self.chat._suppressed_ab_message_ids(comparisons)
+            if suppressed_ids:
+                history_rows = [row for row in history_rows if row[2] not in suppressed_ids]
             history_rows = collapse_assistant_sequences(history_rows, sender_name=ARCHI_SENDER, sender_index=0)
 
             # Build messages list with trace data for assistant messages
@@ -3987,7 +3997,10 @@ class FlaskAppWrapper(object):
                 'title': meta_row[1] or "New Conversation",
                 'created_at': meta_row[2].isoformat() if meta_row[2] else None,
                 'last_message_at': meta_row[3].isoformat() if meta_row[3] else None,
-                'messages': messages
+                'messages': messages,
+                'pending_ab_comparison': self._serialize_pending_ab_comparison(
+                    next((c for c in reversed(comparisons) if c.preference is None), None)
+                ),
             }
 
             # clean up database connection state
@@ -4088,6 +4101,7 @@ class FlaskAppWrapper(object):
             comparison_id = data.get('comparison_id')
             preference = data.get('preference')
             client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not comparison_id:
                 return jsonify({'error': 'comparison_id is required'}), 400
@@ -4105,29 +4119,18 @@ class FlaskAppWrapper(object):
             comp_conv_id = comparison.conversation_id if comparison else None
             if comp_conv_id:
                 try:
-                    self.chat.query_conversation_history(comp_conv_id, client_id)
+                    self.chat.query_conversation_history(comp_conv_id, client_id, user_id)
                 except ConversationAccessError:
                     return jsonify({'error': 'Not authorized for this comparison'}), 403
 
-            # Update the preference
-            self.chat.conv_service.record_ab_preference(comparison_id, preference)
-
-            # Update variant-level aggregate metrics (pool-based comparisons only)
-            try:
-                if comparison:
-                    va = comparison.variant_a_name
-                    vb = comparison.variant_b_name
-                    if va and vb:
-                        self.chat.conv_service.update_variant_metrics_for_preference(va, vb, preference)
-                        logger.info(f"Updated variant metrics for {va} vs {vb}, preference={preference}")
-            except Exception as metrics_err:
-                # Metrics are best-effort; don't fail the preference submission
-                logger.warning(f"Failed to update variant metrics: {metrics_err}")
+            result = self.chat.conv_service.submit_ab_preference(comparison_id, preference)
 
             return jsonify({
                 'success': True,
                 'comparison_id': comparison_id,
                 'preference': preference,
+                'updated': result.get('updated', False),
+                'canonical_message_id': self.chat._comparison_canonical_message_id(result.get('comparison')),
             }), 200
 
         except ValueError as e:
@@ -4150,18 +4153,22 @@ class FlaskAppWrapper(object):
         try:
             conversation_id = request.args.get('conversation_id', type=int)
             client_id = request.args.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not conversation_id:
                 return jsonify({'error': 'conversation_id is required'}), 400
             if not client_id:
                 return jsonify({'error': 'client_id is required'}), 400
 
-            comparison = self.chat.conv_service.get_pending_ab_comparison(conversation_id)
+            try:
+                self.chat.query_conversation_history(conversation_id, client_id, user_id)
+            except ConversationAccessError:
+                return jsonify({'error': 'Not authorized for this conversation'}), 403
 
-            from dataclasses import asdict
+            comparison = self.chat.conv_service.get_pending_ab_comparison(conversation_id)
             return jsonify({
                 'success': True,
-                'comparison': asdict(comparison) if comparison else None,
+                'comparison': self._serialize_pending_ab_comparison(comparison),
             }), 200
 
         except Exception as e:
@@ -4177,41 +4184,138 @@ class FlaskAppWrapper(object):
             Only admins see the full pool info; non-admins get enabled=false.
         """
         try:
-            is_admin = self._is_admin_request()
             pool = self.chat.ab_pool
-            if pool and is_admin:
-                return jsonify({'success': True, 'is_admin': True, **pool.pool_info()}), 200
-            else:
-                return jsonify({'success': True, 'enabled': False, 'is_admin': is_admin}), 200
+            can_manage = self._can_manage_ab_testing()
+            can_use = self._can_use_ab_testing()
+            if pool and can_manage:
+                return jsonify({
+                    'success': True,
+                    'is_admin': self._is_admin_request(),
+                    'can_manage': True,
+                    **pool.pool_info(),
+                }), 200
+            if pool and can_use:
+                return jsonify({
+                    'success': True,
+                    'is_admin': self._is_admin_request(),
+                    'can_manage': False,
+                    **pool.participant_info(),
+                }), 200
+            return jsonify({
+                'success': True,
+                'enabled': False,
+                'is_admin': self._is_admin_request(),
+                'can_manage': can_manage,
+            }), 200
         except Exception as e:
             logger.error(f"Error getting A/B pool: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def ab_get_decision(self):
+        """
+        Decide on the server whether the next turn should use A/B comparison.
+
+        This keeps sampling authoritative on the backend instead of relying on
+        browser-side Math.random().
+        """
+        try:
+            client_id = request.args.get('client_id', '')
+            conversation_id = request.args.get('conversation_id', type=int)
+            user_id = session.get('user', {}).get('id') or None
+            pool = self.chat.ab_pool
+
+            if not pool or not pool.enabled:
+                return jsonify({'success': True, 'enabled': False, 'use_ab': False, 'reason': 'disabled'}), 200
+            if not self._can_use_ab_testing():
+                return jsonify({'success': True, 'enabled': True, 'use_ab': False, 'reason': 'not_targeted'}), 200
+
+            if conversation_id:
+                try:
+                    self.chat.query_conversation_history(conversation_id, client_id, user_id)
+                except ConversationAccessError:
+                    return jsonify({'error': 'Not authorized for this conversation'}), 403
+
+                pending = self.chat.conv_service.get_pending_ab_comparison(conversation_id)
+                if pending:
+                    return jsonify({
+                        'success': True,
+                        'enabled': True,
+                        'use_ab': False,
+                        'reason': 'pending_vote',
+                        'comparison_id': getattr(pending, 'comparison_id', None),
+                    }), 200
+
+            sample_rate = float(pool.sample_rate)
+            if sample_rate <= 0:
+                use_ab = False
+                roll = None
+            elif sample_rate >= 1:
+                use_ab = True
+                roll = None
+            else:
+                roll = random.random()
+                use_ab = roll < sample_rate
+
+            logger.info(
+                "A/B decision: use_ab=%s sample_rate=%.3f roll=%s conversation_id=%s client_id=%s",
+                use_ab,
+                sample_rate,
+                "forced" if roll is None else f"{roll:.5f}",
+                conversation_id,
+                client_id,
+            )
+
+            return jsonify({
+                'success': True,
+                'enabled': True,
+                'use_ab': use_ab,
+                'reason': 'sampled' if use_ab else 'not_sampled',
+                'sample_rate': sample_rate,
+                'disclosure_mode': pool.disclosure_mode,
+                'default_trace_mode': pool.default_trace_mode,
+                'max_pending_per_conversation': pool.max_pending_per_conversation,
+            }), 200
+        except Exception as e:
+            logger.error(f"Error deciding A/B sampling: {str(e)}")
             return jsonify({'error': str(e)}), 500
 
     def ab_set_pool(self):
         """
         Set the A/B testing pool from the UI.
-        Admin only.  Accepts JSON: { champion: "agent-name", variants: ["name1", "name2", ...] }
-        The champion must be in the variants list.  At least 2 variants required.
+        Admin only. Accepts JSON with champion label plus at least two variants.
         """
-        if not self._is_admin_request():
+        if not self._can_manage_ab_testing():
             return jsonify({'error': 'Admin access required'}), 403
         try:
             data = request.get_json(force=True)
             champion_name = (data.get('champion') or '').strip()
-            variant_names = data.get('variants') or []
+            variant_items = data.get('variants') or []
+            sample_rate = float(data.get('sample_rate', 1.0))
+            disclosure_mode = (data.get('disclosure_mode') or 'post_vote_reveal').strip() or 'post_vote_reveal'
+            default_trace_mode = (data.get('default_trace_mode') or 'minimal').strip() or 'minimal'
             if not champion_name:
                 return jsonify({'error': 'champion is required'}), 400
-            if not isinstance(variant_names, list) or len(variant_names) < 2:
-                return jsonify({'error': 'At least 2 variant names required'}), 400
-            # Validate all variant names are non-empty strings
-            for vn in variant_names:
-                if not isinstance(vn, str) or not vn.strip():
-                    return jsonify({'error': 'All variant names must be non-empty strings'}), 400
+            if not isinstance(variant_items, list) or len(variant_items) < 2:
+                return jsonify({'error': 'At least 2 variants are required'}), 400
+            parsed_labels = []
+            for item in variant_items:
+                if isinstance(item, str):
+                    label = item.strip()
+                elif isinstance(item, dict):
+                    label = str(item.get('label') or item.get('name') or '').strip()
+                else:
+                    label = ''
+                if not label:
+                    return jsonify({'error': 'All variants must include a non-empty label'}), 400
+                parsed_labels.append(label)
 
-            if champion_name not in variant_names:
+            if len(set(parsed_labels)) != len(parsed_labels):
+                return jsonify({'error': 'Variant labels must be unique'}), 400
+
+            if champion_name not in parsed_labels:
                 return jsonify({'error': 'Champion must be one of the variants'}), 400
 
-            # Resolve each variant name to its agent spec file
+            # Resolve available agent names to markdown files for UI-driven selection.
             agents_dir = self._get_agents_dir()
             agent_files = list_agent_files(agents_dir)
             spec_map = {}
@@ -4222,30 +4326,77 @@ class FlaskAppWrapper(object):
                 except Exception:
                     pass
 
-            missing = [n for n in variant_names if n not in spec_map]
-            if missing:
-                return jsonify({'error': f'Agent(s) not found: {", ".join(missing)}'}), 400
-
-            # Build ABVariant list
-            # Note: pool changes are ephemeral (in-memory only) and will revert
-            # to config.yaml on server restart.
             _chat_cfg = self.chat.services_config.get("chat_app", {})
             default_provider = _chat_cfg.get("default_provider", "")
             default_model = _chat_cfg.get("default_model", "")
+            existing_variants = {
+                variant.label: variant for variant in (self.chat.ab_pool.variants if self.chat.ab_pool else [])
+            }
             variants = []
-            for name in variant_names:
-                path = spec_map[name]
+            for item, label in zip(variant_items, parsed_labels):
+                item_cfg = item if isinstance(item, dict) else {}
+                explicit_agent_spec = str(item_cfg.get('agent_spec') or '').strip()
+                if explicit_agent_spec:
+                    if Path(explicit_agent_spec).name != explicit_agent_spec:
+                        return jsonify({'error': f"Variant '{label}' must use an agent_spec filename under agents_dir"}), 400
+                    path = agents_dir / explicit_agent_spec
+                    if not path.exists():
+                        return jsonify({'error': f"Variant '{label}' references missing agent_spec '{explicit_agent_spec}'"}), 400
+                    try:
+                        load_agent_spec(path)
+                    except Exception as exc:
+                        return jsonify({'error': f"Variant '{label}' has invalid agent_spec '{explicit_agent_spec}': {exc}"}), 400
+                else:
+                    path = spec_map.get(label)
+                    if not path:
+                        return jsonify({'error': f"Agent '{label}' not found in agents_dir; provide agent_spec explicitly"}), 400
+                existing = existing_variants.get(label)
+                provider_override = item_cfg.get('provider')
+                if provider_override is None and existing and existing.provider and existing.provider != default_provider:
+                    provider_override = existing.provider
+                model_override = item_cfg.get('model')
+                if model_override is None and existing and existing.model and existing.model != default_model:
+                    model_override = existing.model
                 variants.append(ABVariant(
-                    name=name,
-                    agent_spec=path.name,  # relative filename inside agents_dir
-                    provider=default_provider or None,
-                    model=default_model or None,
+                    label=label,
+                    agent_spec=path.name,
+                    provider=provider_override or None,
+                    model=model_override or None,
+                    num_documents_to_retrieve=item_cfg.get('num_documents_to_retrieve') or (
+                        existing.num_documents_to_retrieve if existing else None
+                    ),
+                    recursion_limit=item_cfg.get('recursion_limit') or (
+                        existing.recursion_limit if existing else None
+                    ),
                 ))
 
-            pool = ABPool(variants=variants, champion_name=champion_name)
-            self.chat.ab_pool = pool
-            logger.info("A/B pool updated via UI: champion='%s', variants=%s", champion_name, variant_names)
-            return jsonify({'success': True, **pool.pool_info()}), 200
+            pool = ABPool(
+                variants=variants,
+                champion_name=champion_name,
+                enabled=True,
+                sample_rate=sample_rate,
+                disclosure_mode=disclosure_mode,
+                default_trace_mode=default_trace_mode,
+                max_pending_per_conversation=int(data.get('max_pending_per_conversation', 1)),
+            )
+            self.config_service.update_services_config({
+                "chat_app": {
+                    "ab_testing": {
+                        "enabled": True,
+                        "sample_rate": pool.sample_rate,
+                        "disclosure_mode": pool.disclosure_mode,
+                        "default_trace_mode": pool.default_trace_mode,
+                        "max_pending_per_conversation": pool.max_pending_per_conversation,
+                        "pool": {
+                            "champion": champion_name,
+                            "variants": [variant.to_meta() for variant in variants],
+                        },
+                    }
+                }
+            })
+            self._refresh_runtime_config()
+            logger.info("Persisted A/B pool update: champion='%s', variants=%s", champion_name, parsed_labels)
+            return jsonify({'success': True, **self.chat.ab_pool.pool_info()}), 200
         except ABPoolError as exc:
             return jsonify({'error': str(exc)}), 400
         except Exception as exc:
@@ -4260,11 +4411,18 @@ class FlaskAppWrapper(object):
         UI will be lost on server restart. The pool reverts to whatever is
         configured in config.yaml.
         """
-        if not self._is_admin_request():
+        if not self._can_manage_ab_testing():
             return jsonify({'error': 'Admin access required'}), 403
         try:
-            self.chat.ab_pool = None
-            logger.info("A/B pool disabled via UI")
+            self.config_service.update_services_config({
+                "chat_app": {
+                    "ab_testing": {
+                        "enabled": False,
+                    }
+                }
+            })
+            self._refresh_runtime_config()
+            logger.info("Persisted A/B pool disable")
             return jsonify({'success': True, 'enabled': False}), 200
         except Exception as exc:
             logger.error("Error disabling A/B pool: %s", exc)
@@ -4273,7 +4431,6 @@ class FlaskAppWrapper(object):
     def ab_compare_stream(self):
         """
         Stream a pool-based A/B comparison (champion vs challenger).
-        Admin only — non-admins receive 403.
 
         POST body:
         - message: [sender, content] pair
@@ -4284,8 +4441,8 @@ class FlaskAppWrapper(object):
         Returns:
             NDJSON stream with arm-tagged events.
         """
-        if not self._is_admin_request():
-            return jsonify({'error': 'Admin access required for A/B testing'}), 403
+        if not self._can_use_ab_testing():
+            return jsonify({'error': 'A/B testing is not enabled for this user'}), 403
 
         server_received_msg_ts = datetime.now()
         request_data = self._parse_chat_request()
@@ -4297,9 +4454,21 @@ class FlaskAppWrapper(object):
         client_sent_msg_ts = request_data["client_sent_msg_ts"]
         client_timeout = request_data["client_timeout"]
         client_id = request_data["client_id"]
+        provider = request_data["provider"]
+        model = request_data["model"]
+        user_id = session.get('user', {}).get('id') or None
+        session_api_key = None
 
         if not client_id:
             return jsonify({"error": "client_id missing"}), 400
+
+        if provider and 'provider_api_keys' in session:
+            session_api_key = session.get('provider_api_keys', {}).get(provider.lower())
+
+        if conversation_id:
+            pending = self.chat.conv_service.get_pending_ab_comparison(conversation_id)
+            if pending is not None:
+                return jsonify({'error': 'Resolve the current comparison before sending another message'}), 409
 
         return self._ndjson_response(self.chat.stream_ab_comparison(
             message,
@@ -4310,6 +4479,10 @@ class FlaskAppWrapper(object):
             client_sent_msg_ts,
             client_timeout,
             config_name,
+            user_id=user_id,
+            provider=provider,
+            model=model,
+            provider_api_key=session_api_key,
         ))
 
     def ab_get_metrics(self):
@@ -4319,7 +4492,7 @@ class FlaskAppWrapper(object):
         Returns:
             JSON with variant metrics (wins, losses, ties, total).
         """
-        if not self._is_admin_request():
+        if not self._can_view_ab_metrics():
             return jsonify({'error': 'Admin access required'}), 403
         try:
             metrics = self.chat.conv_service.get_all_variant_metrics()

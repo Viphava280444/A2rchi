@@ -106,31 +106,39 @@ services:
         {%- for manager in services.chat_app.alerts.managers | default([], true) %}
         - {{ manager }}
         {%- endfor %}
-  {%- if services.ab_testing is defined and services.ab_testing.enabled | default(false) %}
-  ab_testing:
-    enabled: true
-    pool:
-      champion: {{ services.ab_testing.pool.champion }}
-      variants:
-        {%- for v in services.ab_testing.pool.variants %}
-        - name: {{ v.name }}
-          {%- if v.agent_spec is defined %}
-          agent_spec: "{{ v.agent_spec }}"
-          {%- endif %}
-          {%- if v.provider is defined %}
-          provider: {{ v.provider }}
-          {%- endif %}
-          {%- if v.model is defined %}
-          model: "{{ v.model }}"
-          {%- endif %}
-          {%- if v.num_documents_to_retrieve is defined %}
-          num_documents_to_retrieve: {{ v.num_documents_to_retrieve }}
-          {%- endif %}
-          {%- if v.recursion_limit is defined %}
-          recursion_limit: {{ v.recursion_limit }}
-          {%- endif %}
-        {%- endfor %}
-  {%- endif %}
+    {%- if services.chat_app.ab_testing is defined and services.chat_app.ab_testing.enabled | default(false) %}
+    ab_testing:
+      enabled: {{ services.chat_app.ab_testing.enabled | default(false, true) }}
+      sample_rate: {{ services.chat_app.ab_testing.sample_rate | default(0.2, true) }}
+      disclosure_mode: {{ services.chat_app.ab_testing.disclosure_mode | default("post_vote_reveal", true) }}
+      default_trace_mode: {{ services.chat_app.ab_testing.default_trace_mode | default("minimal", true) }}
+      max_pending_per_conversation: {{ services.chat_app.ab_testing.max_pending_per_conversation | default(1, true) }}
+      {%- if services.chat_app.ab_testing.target_roles is defined %}
+      target_roles: {{ services.chat_app.ab_testing.target_roles | tojson }}
+      {%- endif %}
+      {%- if services.chat_app.ab_testing.target_permissions is defined %}
+      target_permissions: {{ services.chat_app.ab_testing.target_permissions | tojson }}
+      {%- endif %}
+      pool:
+        champion: {{ services.chat_app.ab_testing.pool.champion }}
+        variants:
+          {%- for v in services.chat_app.ab_testing.pool.variants %}
+          - label: {{ v.label }}
+            agent_spec: "{{ v.agent_spec }}"
+            {%- if v.provider is defined %}
+            provider: {{ v.provider }}
+            {%- endif %}
+            {%- if v.model is defined %}
+            model: "{{ v.model }}"
+            {%- endif %}
+            {%- if v.num_documents_to_retrieve is defined %}
+            num_documents_to_retrieve: {{ v.num_documents_to_retrieve }}
+            {%- endif %}
+            {%- if v.recursion_limit is defined %}
+            recursion_limit: {{ v.recursion_limit }}
+            {%- endif %}
+          {%- endfor %}
+    {%- endif %}
   data_manager:
     auth:
       enabled: {{ services.data_manager.auth.enabled | default(false) }}
@@ -229,7 +237,7 @@ data_manager:
         verify_urls: {{ data_manager.sources.links.html_scraper.verify_urls | default(false, true) }}
         enable_warnings: {{ data_manager.sources.links.html_scraper.enable_warnings | default(false, true) }}
       selenium_scraper:
-        enabled: {{ data_manager.sources.links.selenium_scraper.selenium_scraper.enabled | default(false, True) }}
+        enabled: {{ data_manager.sources.links.selenium_scraper.selenium_scraper.enabled | default(false, true) }}
         visible: {{ data_manager.sources.links.selenium_scraper.selenium_scraper.visible | default(false, true) }}
         use_for_scraping: {{ data_manager.sources.links.selenium_scraper.use_for_scraping | default(false, true) }}
         selenium_class: {{  data_manager.sources.links.selenium_scraper.selenium_class | default('CERNSSOScraper', true)  }}

@@ -17,6 +17,7 @@ from src.utils.sql import (
     SQL_INSERT_AB_COMPARISON,
     SQL_UPDATE_AB_PREFERENCE,
     SQL_GET_AB_COMPARISON,
+    SQL_GET_AB_COMPARISON_FOR_UPDATE,
     SQL_GET_PENDING_AB_COMPARISON,
     SQL_DELETE_AB_COMPARISON,
     SQL_GET_AB_COMPARISONS_BY_CONVERSATION,
@@ -353,6 +354,80 @@ class ConversationService:
                 )
                 conn.commit()
         except Exception as e:
+            conn.rollback()
+            raise
+        finally:
+            self._release_connection(conn)
+
+    def submit_ab_preference(
+        self,
+        comparison_id: int,
+        preference: str,
+    ) -> Dict[str, Any]:
+        """
+        Record a comparison preference exactly once and update metrics in the same transaction.
+
+        Returns:
+            Dict with keys:
+            - updated: whether this call changed the stored preference
+            - comparison: ABComparison after processing
+        """
+        if preference not in ('a', 'b', 'tie'):
+            raise ValueError(f"Invalid preference: {preference}")
+
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(SQL_GET_AB_COMPARISON_FOR_UPDATE, (comparison_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise ValueError(f"A/B comparison {comparison_id} not found")
+
+                comparison = ABComparison(
+                    comparison_id=row[0],
+                    conversation_id=row[1],
+                    user_prompt_mid=row[2],
+                    response_a_mid=row[3],
+                    response_b_mid=row[4],
+                    model_a=row[5],
+                    pipeline_a=row[6],
+                    model_b=row[7],
+                    pipeline_b=row[8],
+                    variant_a_name=row[9],
+                    variant_b_name=row[10],
+                    variant_a_meta=row[11],
+                    variant_b_meta=row[12],
+                    is_config_a_first=row[13],
+                    preference=row[14],
+                    preference_ts=row[15],
+                    created_at=row[16],
+                )
+
+                if comparison.preference is not None:
+                    return {"updated": False, "comparison": comparison}
+
+                cur.execute(
+                    SQL_UPDATE_AB_PREFERENCE,
+                    (preference, datetime.now(timezone.utc), comparison_id)
+                )
+
+                if comparison.variant_a_name and comparison.variant_b_name:
+                    if preference == "a":
+                        cur.execute(SQL_UPSERT_VARIANT_METRIC, (comparison.variant_a_name, 1, 0, 0, 1))
+                        cur.execute(SQL_UPSERT_VARIANT_METRIC, (comparison.variant_b_name, 0, 1, 0, 1))
+                    elif preference == "b":
+                        cur.execute(SQL_UPSERT_VARIANT_METRIC, (comparison.variant_a_name, 0, 1, 0, 1))
+                        cur.execute(SQL_UPSERT_VARIANT_METRIC, (comparison.variant_b_name, 1, 0, 0, 1))
+                    else:
+                        cur.execute(SQL_UPSERT_VARIANT_METRIC, (comparison.variant_a_name, 0, 0, 1, 1))
+                        cur.execute(SQL_UPSERT_VARIANT_METRIC, (comparison.variant_b_name, 0, 0, 1, 1))
+
+                conn.commit()
+
+                comparison.preference = preference
+                comparison.preference_ts = datetime.now(timezone.utc)
+                return {"updated": True, "comparison": comparison}
+        except Exception:
             conn.rollback()
             raise
         finally:

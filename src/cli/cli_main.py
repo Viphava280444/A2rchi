@@ -9,7 +9,7 @@ from jinja2 import (ChainableUndefined, Environment, PackageLoader,
                     select_autoescape)
 
 from src.cli.managers.config_manager import ConfigurationManager
-from src.cli.managers.deployment_manager import DeploymentManager
+from src.cli.managers.deployment_manager import DeploymentError, DeploymentManager
 from src.cli.managers.secrets_manager import SecretsManager
 from src.cli.managers.templates_manager import TemplateManager
 from src.cli.managers.volume_manager import VolumeManager
@@ -266,7 +266,7 @@ def delete(name: str, rmi: bool, rmv: bool, keep_files: bool, list_deployments: 
 @click.option('--service', '-s', type=str, default="chatbot", help="Service to restart (default: chatbot)")
 @click.option('--config', '-c', 'config_files', type=str, multiple=True, help="Path to .yaml archi configuration")
 @click.option('--config-dir', '-cd', 'config_dir', type=str, help="Path to configs directory")
-@click.option('--env-file', '-e', type=str, required=False, help="Path to .env file with secrets")
+@click.option('--env-file', '-e', type=str, required=True, help="Path to .env file with secrets")
 @click.option('--no-build', is_flag=True, help="Restart without rebuilding the image")
 @click.option('--with-deps', is_flag=True, help="Also restart dependent services")
 @click.option('--podman', '-p', is_flag=True, default=False, help="specify if podman is being used")
@@ -276,7 +276,7 @@ def restart(
     service: str,
     config_files: tuple,
     config_dir: Optional[str],
-    env_file: Optional[str],
+    env_file: str,
     no_build: bool,
     with_deps: bool,
     podman: bool,
@@ -390,6 +390,20 @@ def restart(
             allow_port_reuse=True,
         )
 
+    deployment_manager = DeploymentManager(use_podman=podman)
+
+    if config_files or config_dir:
+        try:
+            if deployment_manager.has_service(deployment_dir, "config-seed"):
+                deployment_manager.run_service_once(
+                    deployment_dir=deployment_dir,
+                    service_name="config-seed",
+                    build=not no_build,
+                    no_deps=True,
+                )
+        except DeploymentError as e:
+            raise click.ClickException(str(e))
+
     if not no_build and not (config_files or config_dir):
         template_manager = TemplateManager(env, verbosity)
         try:
@@ -397,7 +411,9 @@ def restart(
         except Exception as e:
             logger.warning(f"Warning: could not update source code before rebuild: {e}", err=True)
 
-    deployment_manager = DeploymentManager(use_podman=podman)
+    if service == "config-seed":
+        return
+
     deployment_manager.restart_service(
         deployment_dir=deployment_dir,
         service_name=service,

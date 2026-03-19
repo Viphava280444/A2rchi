@@ -261,38 +261,62 @@ data_manager:
 
 Archi supports champion/challenger A/B testing via a server-side variant pool. When configured, the system automatically pairs the champion agent against a random challenger for each comparison. Users vote on which response is better, and aggregate metrics are tracked per variant.
 
-Add an `ab_testing` block under your `archi:` or top-level config:
+Configure A/B testing under `services.chat_app.ab_testing`:
 
 ```yaml
-ab_testing:
-  champion: default            # The variant that always appears in every matchup
-  variants:
-    - name: default
-      agent_spec: default      # Name of the agent spec (from agents_dir)
-    - name: creative
-      agent_spec: default
-      provider: openai
-      model: gpt-4o
-      recursion_limit: 30
-    - name: concise
-      agent_spec: concise      # A different agent spec with a shorter prompt
-      provider: anthropic
-      model: claude-sonnet-4-20250514
-      num_documents_to_retrieve: 3
+services:
+  chat_app:
+    ab_testing:
+      enabled: true
+      sample_rate: 0.25
+      disclosure_mode: post_vote_reveal
+      default_trace_mode: minimal
+      max_pending_per_conversation: 1
+      target_roles: []
+      target_permissions: []
+      pool:
+        champion: default
+        variants:
+          - label: default
+            agent_spec: default.md
+          - label: creative
+            agent_spec: default.md
+            provider: openai
+            model: gpt-4o
+            recursion_limit: 30
+          - label: concise
+            agent_spec: concise.md
+            provider: anthropic
+            model: claude-sonnet-4-20250514
+            num_documents_to_retrieve: 3
 ```
+
+`services.ab_testing` is deprecated and no longer loaded. Use `services.chat_app.ab_testing` only.
 
 ### Variant Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `name` | string | *required* | Unique variant identifier |
-| `agent_spec` | string | `null` | Agent spec name to use (must exist in `agents_dir`) |
+| `label` | string | *required* | Unique human-facing variant label used in the UI and metrics |
+| `agent_spec` | string | *required* | Agent markdown filename to load from `agents_dir` |
 | `provider` | string | `null` | Override LLM provider |
 | `model` | string | `null` | Override LLM model |
 | `num_documents_to_retrieve` | int | `null` | Override retriever document count |
 | `recursion_limit` | int | `null` | Override agent recursion limit |
 
-The `champion` field must reference an existing variant name. At least two variants are required. When a user enables A/B mode in the chat UI, the pool takes over — the champion always appears in one arm, and a random challenger is placed in the other. Arm positions (A vs B) are randomized per comparison.
+### Pool Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable the experiment pool |
+| `sample_rate` | float | `1.0` | Fraction of eligible turns that should run A/B |
+| `disclosure_mode` | string | `post_vote_reveal` | One of `blind`, `post_vote_reveal`, `named` |
+| `default_trace_mode` | string | `minimal` | One of `minimal`, `normal`, `verbose` |
+| `max_pending_per_conversation` | int | `1` | Maximum unresolved comparisons per conversation |
+| `target_roles` | list[string] | `[]` | Restrict participation to matching RBAC roles |
+| `target_permissions` | list[string] | `[]` | Restrict participation to matching permissions |
+
+The `champion` field must reference an existing variant `label`. At least two variants are required. `name`-only variant config is not supported. When a user enables A/B mode in the chat UI, the pool takes over — the champion always appears in one arm, and a random challenger is placed in the other. Arm positions (A vs B) are randomized per comparison.
 
 Variant metrics (wins, losses, ties) are tracked in the `ab_variant_metrics` database table and available via `GET /api/ab/metrics`.
 

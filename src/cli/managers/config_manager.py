@@ -7,6 +7,7 @@ import yaml
 
 from src.cli.managers.templates_manager import BASE_CONFIG_TEMPLATE
 from src.cli.source_registry import source_registry
+from src.utils.ab_testing import ABPool, ABPoolError
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -195,6 +196,20 @@ class ConfigurationManager:
             raise ValueError(f"Invalid field: '{timeout_path}' must be > 0")
         if timeout_value > 86400:
             raise ValueError(f"Invalid field: '{timeout_path}' must be <= 86400 seconds")
+
+        self._validate_ab_testing_config(chat_cfg)
+
+    def _validate_ab_testing_config(self, chat_cfg: Dict[str, Any]) -> None:
+        ab_cfg = chat_cfg.get("ab_testing")
+        if not isinstance(ab_cfg, dict) or not ab_cfg.get("enabled", False):
+            return
+        try:
+            ABPool.from_config(ab_cfg)
+        except ABPoolError as exc:
+            raise ValueError(
+                "Invalid field: 'services.chat_app.ab_testing' is misconfigured. "
+                f"{exc}"
+            )
 
     def _validate_benchmarking_config(self, config: Dict[str, Any], services: List[str]) -> None:
         if not services or "benchmarking" not in services:

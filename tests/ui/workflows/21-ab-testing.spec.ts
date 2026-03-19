@@ -346,6 +346,105 @@ test.describe('A/B Comparison Streaming', () => {
     await expect(armB).toContainText('Beta answer');
   });
 
+  test('A/B headers render cleanly with named disclosure and minimal trace mode', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          enabled: true,
+          is_admin: false,
+          sample_rate: 1,
+          disclosure_mode: 'named',
+          default_trace_mode: 'minimal',
+          max_pending_per_conversation: 1,
+        },
+      });
+    });
+
+    const abStream = [
+      JSON.stringify({ type: 'meta', event: 'stream_started' }),
+      JSON.stringify({
+        type: 'ab_arms',
+        arm_a_name: 'CMS CompOps Agent',
+        arm_b_name: 'Challenger GPT-4o',
+        disclosure_mode: 'named',
+      }),
+      JSON.stringify({ arm: 'a', type: 'chunk', content: 'Champion says hello' }),
+      JSON.stringify({ arm: 'b', type: 'chunk', content: 'Challenger says hi' }),
+      JSON.stringify({
+        type: 'ab_meta',
+        comparison_id: 42,
+        conversation_id: 1,
+        arm_a_message_id: 101,
+        arm_b_message_id: 102,
+        arm_a_variant: 'CMS CompOps Agent',
+        arm_b_variant: 'Challenger GPT-4o',
+        disclosure_mode: 'named',
+      }),
+    ].join('\n') + '\n';
+
+    await page.route('**/api/ab/compare', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
+    });
+
+    await page.goto('/chat');
+    await page.getByLabel('Message input').fill('Hello');
+    await page.getByRole('button', { name: 'Send message' }).click();
+
+    await expect(page.locator('.ab-arm-title-row')).toHaveCount(2);
+    await expect(page.locator('.ab-arm-variant-name').first()).toHaveText('CMS CompOps Agent');
+    await expect(page.locator('.ab-arm-variant-name').nth(1)).toHaveText('Challenger GPT-4o');
+    await expect(page.locator('.ab-comparison .trace-container')).toHaveCount(0);
+  });
+
+  test('A/B trace headers match the standard agent activity presentation', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          enabled: true,
+          is_admin: false,
+          sample_rate: 1,
+          disclosure_mode: 'blind',
+          default_trace_mode: 'normal',
+          max_pending_per_conversation: 1,
+        },
+      });
+    });
+
+    const abStream = [
+      JSON.stringify({ type: 'meta', event: 'stream_started' }),
+      JSON.stringify({ arm: 'a', type: 'chunk', content: 'Champion says hello' }),
+      JSON.stringify({ arm: 'b', type: 'chunk', content: 'Challenger says hi' }),
+      JSON.stringify({
+        type: 'ab_meta',
+        comparison_id: 42,
+        conversation_id: 1,
+        arm_a_message_id: 101,
+        arm_b_message_id: 102,
+        arm_a_variant: 'normal',
+        arm_b_variant: 'mad',
+        disclosure_mode: 'blind',
+      }),
+    ].join('\n') + '\n';
+
+    await page.route('**/api/ab/compare', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
+    });
+
+    await page.goto('/chat');
+    await page.getByLabel('Message input').fill('Hello');
+    await page.getByRole('button', { name: 'Send message' }).click();
+
+    await expect(page.locator('.ab-comparison .trace-container')).toHaveCount(2);
+    await expect(page.locator('.ab-comparison .trace-label').first()).toHaveText('Agent Activity');
+    await expect(page.locator('.ab-comparison .trace-toggle')).toHaveCount(2);
+  });
+
   test('vote buttons appear after A/B stream completes', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);

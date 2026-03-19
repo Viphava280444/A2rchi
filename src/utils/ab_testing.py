@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,12 +23,17 @@ logger = get_logger(__name__)
 class ABVariant:
     """A single agent variant in the A/B testing pool."""
 
-    name: str
-    agent_spec: Optional[str] = None          # path to agent spec .md file
+    label: str
+    agent_spec: str                           # filename under agents_dir
     provider: Optional[str] = None            # e.g. "anthropic", "openai"
     model: Optional[str] = None               # e.g. "claude-sonnet-4-20250514"
     num_documents_to_retrieve: Optional[int] = None
     recursion_limit: Optional[int] = None
+
+    @property
+    def name(self) -> str:
+        """Backward-compatible alias for existing call-sites and stored metrics."""
+        return self.label
 
     def to_meta(self) -> Dict[str, Any]:
         """Serialise variant config for JSONB storage in comparison records."""
@@ -47,31 +52,71 @@ class ABPool:
     """
     Manages the set of agent variants and champion designation.
 
-    Loaded from the ``ab_testing`` section of config.yaml:
+    Loaded from ``services.chat_app.ab_testing`` in config.yaml:
 
     .. code-block:: yaml
 
-        ab_testing:
-          enabled: true
-          champion: "production-v2"
-          pool:
-            - name: "production-v2"
-              agent_spec: "agents/cms-comp-ops.md"
-              provider: "anthropic"
-              model: "claude-sonnet-4-20250514"
-            - name: "gpt4o-candidate"
-              provider: "openai"
-              model: "gpt-4o"
+        services:
+          chat_app:
+            ab_testing:
+              enabled: true
+              pool:
+                champion: "production-v2"
+                variants:
+                  - label: "production-v2"
+                    agent_spec: "cms-comp-ops.md"
+                    provider: "anthropic"
+                    model: "claude-sonnet-4-20250514"
+                  - label: "gpt4o-candidate"
+                    agent_spec: "cms-comp-ops.md"
+                    provider: "openai"
+                    model: "gpt-4o"
     """
 
-    def __init__(self, variants: List[ABVariant], champion_name: str) -> None:
+    VALID_DISCLOSURE_MODES = {"blind", "named", "post_vote_reveal"}
+    VALID_TRACE_MODES = {"minimal", "normal", "verbose"}
+
+    def __init__(
+        self,
+        variants: List[ABVariant],
+        champion_name: str,
+        *,
+        enabled: bool = True,
+        sample_rate: float = 1.0,
+        target_roles: Optional[List[str]] = None,
+        target_permissions: Optional[List[str]] = None,
+        max_pending_per_conversation: int = 1,
+        disclosure_mode: str = "post_vote_reveal",
+        default_trace_mode: str = "minimal",
+    ) -> None:
         if len(variants) < 2:
             raise ABPoolError("ABPool requires at least 2 variants for A/B comparison.")
-        if champion_name not in {v.name for v in variants}:
+        if champion_name not in {v.label for v in variants}:
             raise ABPoolError(f"Champion '{champion_name}' not found in variant list.")
+        if not 0 <= float(sample_rate) <= 1:
+            raise ABPoolError("ab_testing.sample_rate must be between 0 and 1.")
+        if max_pending_per_conversation < 1:
+            raise ABPoolError("ab_testing.max_pending_per_conversation must be at least 1.")
+        if disclosure_mode not in self.VALID_DISCLOSURE_MODES:
+            raise ABPoolError(
+                f"ab_testing.disclosure_mode must be one of {sorted(self.VALID_DISCLOSURE_MODES)}."
+            )
+        if default_trace_mode not in self.VALID_TRACE_MODES:
+            raise ABPoolError(
+                f"ab_testing.default_trace_mode must be one of {sorted(self.VALID_TRACE_MODES)}."
+            )
         self.variants = variants
         self.champion_name = champion_name
-        self._variant_map: Dict[str, ABVariant] = {v.name: v for v in variants}
+        self._variant_map: Dict[str, ABVariant] = {v.label: v for v in variants}
+        self.enabled = bool(enabled)
+        self.sample_rate = float(sample_rate)
+        self.target_roles = [r for r in (target_roles or []) if isinstance(r, str) and r.strip()]
+        self.target_permissions = [
+            p for p in (target_permissions or []) if isinstance(p, str) and p.strip()
+        ]
+        self.max_pending_per_conversation = int(max_pending_per_conversation)
+        self.disclosure_mode = disclosure_mode
+        self.default_trace_mode = default_trace_mode
 
     # ------------------------------------------------------------------
     # Factory
@@ -80,20 +125,24 @@ class ABPool:
     @classmethod
     def from_config(cls, ab_config: Dict[str, Any]) -> "ABPool":
         """
-        Build an ABPool from the ``ab_testing`` config dict.
+        Build an ABPool from the ``services.chat_app.ab_testing`` config dict.
 
         Expected structure::
 
-            ab_testing:
-              enabled: true
-              pool:
-                champion: "variant-name"
-                variants:
-                  - name: variant-name
-                    provider: local
-                    model: "qwen3:32b"
-                  - name: other-variant
-                    model: "gpt-oss:120b"
+            services:
+              chat_app:
+                ab_testing:
+                  enabled: true
+                  pool:
+                    champion: "variant-name"
+                    variants:
+                      - label: variant-name
+                        agent_spec: variant-name.md
+                        provider: local
+                        model: "qwen3:32b"
+                      - label: other-variant
+                        agent_spec: other-variant.md
+                        model: "gpt-oss:120b"
 
         Raises ABPoolError on validation failures.
         """
@@ -105,6 +154,8 @@ class ABPool:
             raise ABPoolError("ab_testing.pool must be a mapping with 'champion' and 'variants'.")
 
         champion_name = pool_config.get("champion")
+        if isinstance(champion_name, str):
+            champion_name = champion_name.strip()
         if not champion_name or not isinstance(champion_name, str):
             raise ABPoolError("ab_testing.pool.champion must be a non-empty string.")
 
@@ -113,30 +164,50 @@ class ABPool:
             raise ABPoolError("ab_testing.pool.variants must be a non-empty list of variants.")
 
         variants: List[ABVariant] = []
-        seen_names: set = set()
+        seen_labels: set = set()
         for idx, entry in enumerate(variant_list):
             if not isinstance(entry, dict):
                 raise ABPoolError(f"ab_testing.pool.variants[{idx}] must be a mapping.")
-            name = entry.get("name")
-            if not name or not isinstance(name, str):
-                raise ABPoolError(f"ab_testing.pool.variants[{idx}] must include a string 'name'.")
-            if name in seen_names:
-                raise ABPoolError(f"Duplicate variant name '{name}' in ab_testing.pool.variants.")
-            seen_names.add(name)
+            if "name" in entry and "label" not in entry:
+                raise ABPoolError(
+                    f"ab_testing.pool.variants[{idx}] uses deprecated 'name'. "
+                    "Use required fields 'label' and 'agent_spec'."
+                )
+
+            label = entry.get("label")
+            if isinstance(label, str):
+                label = label.strip()
+            if not label or not isinstance(label, str):
+                raise ABPoolError(f"ab_testing.pool.variants[{idx}] must include a string 'label'.")
+            if label in seen_labels:
+                raise ABPoolError(f"Duplicate variant label '{label}' in ab_testing.pool.variants.")
+            seen_labels.add(label)
+
+            agent_spec = entry.get("agent_spec")
+            if isinstance(agent_spec, str):
+                agent_spec = agent_spec.strip()
+            if not agent_spec or not isinstance(agent_spec, str):
+                raise ABPoolError(
+                    f"ab_testing.pool.variants[{idx}] must include a string 'agent_spec'."
+                )
+            if Path(agent_spec).name != agent_spec:
+                raise ABPoolError(
+                    f"ab_testing.pool.variants[{idx}].agent_spec must be a filename under agents_dir."
+                )
 
             variants.append(ABVariant(
-                name=name,
-                agent_spec=entry.get("agent_spec"),
+                label=label,
+                agent_spec=agent_spec,
                 provider=entry.get("provider"),
                 model=entry.get("model"),
                 num_documents_to_retrieve=entry.get("num_documents_to_retrieve"),
                 recursion_limit=entry.get("recursion_limit"),
             ))
 
-        if champion_name not in seen_names:
+        if champion_name not in seen_labels:
             raise ABPoolError(
                 f"Champion '{champion_name}' not found in pool. "
-                f"Available: {sorted(seen_names)}"
+                f"Available: {sorted(seen_labels)}"
             )
 
         if len(variants) < 2:
@@ -146,7 +217,17 @@ class ABPool:
             "Loaded A/B pool: %d variants, champion='%s'",
             len(variants), champion_name,
         )
-        return cls(variants=variants, champion_name=champion_name)
+        return cls(
+            variants=variants,
+            champion_name=champion_name,
+            enabled=ab_config.get("enabled", True),
+            sample_rate=ab_config.get("sample_rate", 1.0),
+            target_roles=ab_config.get("target_roles") or [],
+            target_permissions=ab_config.get("target_permissions") or [],
+            max_pending_per_conversation=ab_config.get("max_pending_per_conversation", 1),
+            disclosure_mode=ab_config.get("disclosure_mode", "post_vote_reveal"),
+            default_trace_mode=ab_config.get("default_trace_mode", "minimal"),
+        )
 
     # ------------------------------------------------------------------
     # Queries
@@ -158,10 +239,10 @@ class ABPool:
 
     @property
     def challengers(self) -> List[ABVariant]:
-        return [v for v in self.variants if v.name != self.champion_name]
+        return [v for v in self.variants if v.label != self.champion_name]
 
-    def get_variant(self, name: str) -> Optional[ABVariant]:
-        return self._variant_map.get(name)
+    def get_variant(self, label: str) -> Optional[ABVariant]:
+        return self._variant_map.get(label)
 
     def sample_challenger(self) -> ABVariant:
         """Return a random challenger (any variant that is not the champion)."""
@@ -183,13 +264,44 @@ class ABPool:
         else:
             return challenger, self.champion, False
 
+    def is_targeted_user(self, roles: Optional[List[str]] = None, permissions: Optional[List[str]] = None) -> bool:
+        roles_set = set(roles or [])
+        permissions_set = set(permissions or [])
+        if self.target_roles and not roles_set.intersection(self.target_roles):
+            return False
+        if self.target_permissions and not permissions_set.intersection(self.target_permissions):
+            return False
+        return True
+
+    def should_sample(self) -> bool:
+        if self.sample_rate <= 0:
+            return False
+        if self.sample_rate >= 1:
+            return True
+        return random.random() < self.sample_rate
+
     def pool_info(self) -> Dict[str, Any]:
         """Return serialisable pool metadata for the /api/ab/pool endpoint."""
         return {
-            "enabled": True,
+            "enabled": self.enabled,
             "champion": self.champion_name,
-            "variants": [v.name for v in self.variants],
+            "variants": [v.label for v in self.variants],
             "variant_count": len(self.variants),
+            "sample_rate": self.sample_rate,
+            "target_roles": list(self.target_roles),
+            "target_permissions": list(self.target_permissions),
+            "max_pending_per_conversation": self.max_pending_per_conversation,
+            "disclosure_mode": self.disclosure_mode,
+            "default_trace_mode": self.default_trace_mode,
+        }
+
+    def participant_info(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "sample_rate": self.sample_rate,
+            "disclosure_mode": self.disclosure_mode,
+            "default_trace_mode": self.default_trace_mode,
+            "max_pending_per_conversation": self.max_pending_per_conversation,
         }
 
 
@@ -197,23 +309,21 @@ def load_ab_pool(config: Dict[str, Any]) -> Optional[ABPool]:
     """
     Load the A/B pool from the full config dict.
 
-    Looks for ab_testing config at (in priority order):
-      - config["ab_testing"]  (top-level)
-      - config["services"]["chat_app"]["ab_testing"]  (preferred)
-      - config["services"]["ab_testing"]  (legacy)
+    The only supported location is ``config["services"]["chat_app"]["ab_testing"]``.
+    Legacy top-level ``ab_testing`` and ``services.ab_testing`` blocks are
+    ignored.
 
-    Returns None if ab_testing is not configured or disabled.
+    Returns None if the chat_app A/B config is not configured or disabled.
     """
-    ab_config = config.get("ab_testing")
-    if not ab_config or not isinstance(ab_config, dict):
-        # Try under services.chat_app.ab_testing (preferred location)
-        services = config.get("services") or {}
-        chat_app = services.get("chat_app") or {}
-        ab_config = chat_app.get("ab_testing")
-    if not ab_config or not isinstance(ab_config, dict):
-        # Legacy: try services.ab_testing
-        services = config.get("services") or {}
-        ab_config = services.get("ab_testing")
+    if isinstance(config.get("ab_testing"), dict):
+        logger.warning("Ignoring deprecated top-level ab_testing config; use services.chat_app.ab_testing.")
+
+    services = config.get("services") or {}
+    if isinstance(services.get("ab_testing"), dict):
+        logger.warning("Ignoring deprecated services.ab_testing config; use services.chat_app.ab_testing.")
+
+    chat_app = services.get("chat_app") or {}
+    ab_config = chat_app.get("ab_testing")
     if not ab_config or not isinstance(ab_config, dict):
         return None
     if not ab_config.get("enabled", False):
