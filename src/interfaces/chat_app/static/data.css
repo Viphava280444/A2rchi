@@ -1077,6 +1077,18 @@
   animation: spin 1s linear infinite;
 }
 
+.ab-admin-nav-btn {
+  width: auto;
+  padding: 0 12px;
+  gap: 8px;
+  text-decoration: none;
+}
+
+.ab-admin-nav-btn span {
+  font-size: 13px;
+  font-weight: 500;
+}
+
 /* =====================================================
    FILTER ROW STYLES
    ===================================================== */
@@ -1094,6 +1106,170 @@
 /* =====================================================
    TOAST ENHANCEMENTS
    ===================================================== */
+
+.ab-admin-layout {
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  overflow: auto;
+}
+
+.ab-admin-panel {
+  background: var(--bg-secondary, #161b22);
+  border: 1px solid var(--border-color, #30363d);
+  border-radius: 14px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.ab-admin-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.ab-admin-panel-header h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+
+.ab-admin-panel-header p {
+  margin: 0;
+  color: var(--text-secondary, #8b949e);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ab-admin-settings-grid,
+.ab-variant-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.ab-admin-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ab-admin-field span {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary, #8b949e);
+}
+
+.ab-admin-field input,
+.ab-admin-field select {
+  width: 100%;
+  min-height: 40px;
+  background: var(--bg-primary, #0d1117);
+  border: 1px solid var(--border-color, #30363d);
+  border-radius: 8px;
+  color: var(--text-primary, #e6edf3);
+  padding: 10px 12px;
+  font-size: 14px;
+}
+
+.ab-admin-field input:focus,
+.ab-admin-field select:focus {
+  outline: none;
+  border-color: var(--accent-color, #58a6ff);
+  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.14);
+}
+
+.ab-admin-field-wide {
+  grid-column: 1 / -1;
+}
+
+.ab-admin-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ab-admin-add-btn,
+.ab-variant-remove {
+  border: 1px solid var(--border-color, #30363d);
+  background: var(--bg-primary, #0d1117);
+  color: var(--text-primary, #e6edf3);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ab-admin-add-btn:hover,
+.ab-variant-remove:hover {
+  background: var(--bg-tertiary, #21262d);
+}
+
+.ab-admin-variant-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ab-variant-card {
+  border: 1px solid var(--border-color, #30363d);
+  border-radius: 12px;
+  background: var(--bg-primary, #0d1117);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ab-variant-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ab-variant-card-header h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.ab-variant-card-header p {
+  margin: 0;
+  color: var(--text-secondary, #8b949e);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.ab-admin-empty-state {
+  border: 1px dashed var(--border-color, #30363d);
+  border-radius: 12px;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-secondary, #8b949e);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+@media (max-width: 800px) {
+  .ab-admin-layout {
+    padding: 16px;
+  }
+
+  .ab-admin-panel {
+    padding: 16px;
+  }
+
+  .ab-admin-panel-header,
+  .ab-variant-card-header {
+    flex-direction: column;
+  }
+}
 
 .toast {
   display: flex;

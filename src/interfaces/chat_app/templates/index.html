@@ -251,56 +251,15 @@
             <!-- <section class="settings-section" id="settings-advanced" aria-labelledby="advanced-heading" hidden>
               <h4 class="settings-section-title" id="advanced-heading">Advanced Settings</h4> -->
               
-              <!-- A/B Testing Pool Editor (admin only — hidden until loadABPool confirms admin) -->
+              <!-- A/B Testing admin link (admin only — hidden until loadABPool confirms admin) -->
               <div id="ab-settings-section" style="display: none;">
-              <div class="settings-group settings-group-bordered">
-                <div class="settings-group-header">
-                  <span class="settings-label" id="ab-testing-label">A/B Testing Pool</span>
-                  <span class="ab-pool-status" id="ab-pool-status">Inactive</span>
+                <div class="settings-group settings-group-bordered">
+                  <div class="settings-group-header">
+                    <span class="settings-label" id="ab-testing-label">A/B Testing</span>
+                  </div>
+                  <p class="settings-description">Experiment management now lives on a dedicated admin page so pool settings and variant parameters stay in one place.</p>
+                  <a href="/admin/ab-testing" class="settings-link-btn">Open A/B Testing Admin</a>
                 </div>
-                <p class="settings-description">Pick a champion and at least one challenger to run side-by-side comparisons.</p>
-                
-                <div class="ab-pool-editor" id="ab-pool-editor">
-                  <div class="settings-group">
-                    <label class="settings-label" for="ab-sample-rate">Sampling Rate</label>
-                    <p class="settings-description">Fraction of eligible user messages to route through the A/B experiment.</p>
-                    <input
-                      type="number"
-                      id="ab-sample-rate"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value="1"
-                    >
-                  </div>
-                  <div class="settings-group">
-                    <label class="settings-label" for="ab-disclosure-mode">Response Disclosure</label>
-                    <p class="settings-description">Control when variant names are shown to participants.</p>
-                    <select id="ab-disclosure-mode">
-                      <option value="post_vote_reveal" selected>Reveal after vote</option>
-                      <option value="blind">Keep variants hidden</option>
-                      <option value="named">Show variants while streaming</option>
-                    </select>
-                  </div>
-                  <div class="settings-group">
-                    <label class="settings-label" for="ab-trace-mode">Agent Activity Default</label>
-                    <p class="settings-description">Choose how much agent activity is shown during A/B comparisons.</p>
-                    <select id="ab-trace-mode">
-                      <option value="minimal" selected>Hidden</option>
-                      <option value="normal">Collapsed</option>
-                      <option value="verbose">Expanded</option>
-                    </select>
-                  </div>
-                  <div class="ab-pool-agent-list" id="ab-pool-agent-list">
-                    <!-- Agent rows rendered by JS -->
-                  </div>
-                  <div class="ab-pool-actions" id="ab-pool-actions">
-                    <button class="ab-pool-btn ab-pool-btn-save" id="ab-pool-save" disabled>Save Pool</button>
-                    <button class="ab-pool-btn ab-pool-btn-disable" id="ab-pool-disable" style="display:none;">Disable</button>
-                  </div>
-                  <div class="ab-pool-message" id="ab-pool-message"></div>
-                </div>
-              </div>
               </div>
               
               <!-- Agent Transparency -->

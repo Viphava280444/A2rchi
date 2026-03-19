@@ -1,13 +1,8 @@
 /**
  * Workflow 21: A/B Testing (Pool-based)
  *
- * Tests for the A/B testing pool editor, streaming comparison, vote buttons,
- * preference submission, admin gating, and metrics.
- *
- * NOTE: In the deployed build, #ab-settings-section lives inside
- * SECTION#settings-advanced which is hidden by default.  Tests that need to
- * *see* or *click* pool-editor elements call showPoolEditor() which force-
- * reveals every hidden ancestor so Playwright can interact with them.
+ * Tests for the dedicated A/B admin page, pool management, streaming
+ * comparison, vote buttons, preference submission, and metrics.
  */
 import {
   test,
@@ -23,44 +18,20 @@ import {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Open the settings modal. */
-async function openSettings(page: import('@playwright/test').Page) {
-  await page.getByRole('button', { name: /settings/i }).click();
-  await expect(page.locator('.settings-modal')).toBeVisible();
-}
-
-/**
- * Open settings AND force every hidden ancestor of #ab-settings-section
- * visible so Playwright can interact with pool-editor elements.
- */
-async function showPoolEditor(page: import('@playwright/test').Page) {
-  await openSettings(page);
-  // Wait until the pool response has been processed (badge text is set by loadABPool)
-  await page.locator('#ab-pool-status').waitFor({ state: 'attached' });
-  await page.evaluate(() => {
-    const section = document.getElementById('ab-settings-section');
-    if (!section) return;
-    let el: HTMLElement | null = section;
-    while (el) {
-      if (el.hidden) el.hidden = false;
-      if (getComputedStyle(el).display === 'none') {
-        el.style.setProperty('display', 'block', 'important');
-      }
-      el = el.parentElement;
-    }
-  });
+async function openABAdminPage(page: import('@playwright/test').Page) {
+  await page.goto('/admin/ab-testing');
+  await expect(page.locator('#ab-admin-status')).toBeVisible();
 }
 
 // =============================================================================
-// Admin gating -- pool editor visibility
+// Admin gating -- chat settings link visibility
 // =============================================================================
 
-test.describe('A/B Pool Editor -- Admin Gating', () => {
+test.describe('A/B Management Entry Point -- Admin Gating', () => {
 
-  test('pool section display is none for non-admin users', async ({ page }) => {
+  test('chat settings section stays hidden for non-admin users', async ({ page }) => {
     await setupBasicMocks(page);
     await page.goto('/chat');
-    // Wait for pool data to settle (non-admin keeps display:none)
     await page.waitForTimeout(500);
     const display = await page.locator('#ab-settings-section').evaluate(
       (el: HTMLElement) => el.style.display,
@@ -68,110 +39,97 @@ test.describe('A/B Pool Editor -- Admin Gating', () => {
     expect(display).toBe('none');
   });
 
-  test('pool section display is cleared for admin users', async ({ page }) => {
+  test('chat settings shows admin link for admin users', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
     await page.goto('/chat');
-    await expect(page.locator('#ab-pool-status')).toHaveText('Active');
     const display = await page.locator('#ab-settings-section').evaluate(
       (el: HTMLElement) => el.style.display,
     );
     expect(display).toBe('');
+    await expect(page.locator('#ab-settings-section .settings-link-btn')).toHaveAttribute('href', '/admin/ab-testing');
   });
 
-  test('pool status badge shows Active when pool is enabled', async ({ page }) => {
+  test('dedicated admin page loads for admin users', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
-    await expect(page.locator('#ab-pool-status')).toHaveText('Active');
+    await openABAdminPage(page);
+    await expect(page.locator('#ab-admin-status')).toHaveText('Active');
   });
 
-  test('pool status badge shows Inactive when pool is disabled', async ({ page }) => {
+  test('dedicated admin page shows Inactive when pool is disabled', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminInactiveMocks(page);
-    await page.goto('/chat');
-    await expect(page.locator('#ab-pool-status')).toHaveText('Inactive');
+    await openABAdminPage(page);
+    await expect(page.locator('#ab-admin-status')).toHaveText('Inactive');
   });
 });
 
 // =============================================================================
-// Pool editor -- agent list rendering
+// Dedicated page -- variant rendering
 // =============================================================================
 
-test.describe('A/B Pool Editor -- Agent List', () => {
+test.describe('A/B Admin Page -- Variant List', () => {
 
-  test('renders all agents including ab_only variants', async ({ page }) => {
+  test('renders existing variants and their parameters', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
+    await openABAdminPage(page);
 
-    const agentRows = page.locator('#ab-pool-agent-list .ab-pool-agent-row');
-    await expect(agentRows).toHaveCount(mockData.agentsList.agents.length);
+    const cards = page.locator('.ab-variant-card');
+    await expect(cards).toHaveCount(mockData.abPoolAdmin.variant_details!.length);
+    await expect(cards.first().locator('[data-field="label"]')).toHaveValue('CMS CompOps Agent');
+    await expect(cards.first().locator('[data-field="agent_spec"]')).toHaveValue('cms-comp-ops.md');
   });
 
-  test('ab_only agents have an AB badge', async ({ page }) => {
+  test('champion select is pre-populated', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
-
-    const abBadges = page.locator('.ab-pool-ab-badge');
-    await expect(abBadges).toHaveCount(2);
+    await openABAdminPage(page);
+    await expect(page.locator('#ab-admin-champion')).toHaveValue(mockData.abPoolAdmin.champion!);
   });
 
-  test('champion is pre-selected and marked', async ({ page }) => {
+  test('agent markdown selector exposes available files', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
-
-    const championRow = page.locator('.ab-pool-agent-row.champion');
-    await expect(championRow).toHaveCount(1);
-    await expect(championRow).toHaveAttribute('data-agent', mockData.abPoolAdmin.champion!);
-  });
-
-  test('pool variants have checkboxes checked', async ({ page }) => {
-    await setupBasicMocks(page);
-    await setupABAdminMocks(page);
-    await page.goto('/chat');
-
-    const checkedBoxes = page.locator('.ab-pool-agent-row.selected input[type="checkbox"]:checked');
-    await expect(checkedBoxes).toHaveCount(mockData.abPoolAdmin.variants!.length);
+    await openABAdminPage(page);
+    const options = page.locator('.ab-variant-card').first().locator('[data-field="agent_spec"] option');
+    await expect(options).toHaveCount(mockData.agentsList.agents.length + 1);
   });
 });
 
 // =============================================================================
-// Pool editor -- save / disable interactions
+// Dedicated page -- save / disable interactions
 // =============================================================================
 
-test.describe('A/B Pool Editor -- Save and Disable', () => {
+test.describe('A/B Admin Page -- Save and Disable', () => {
 
-  test('save button is enabled when champion + 2+ variants selected', async ({ page }) => {
+  test('save button is enabled when champion + 2+ variants are configured', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
-    await expect(page.locator('#ab-pool-save')).toBeEnabled();
+    await openABAdminPage(page);
+    await expect(page.locator('#ab-admin-save')).toBeEnabled();
   });
 
-  test('save button is disabled when fewer than 2 agents selected', async ({ page }) => {
+  test('save button is disabled when fewer than 2 variants exist', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminInactiveMocks(page);
-    await page.goto('/chat');
-    await expect(page.locator('#ab-pool-save')).toBeDisabled();
+    await openABAdminPage(page);
+    await expect(page.locator('#ab-admin-save')).toBeDisabled();
   });
 
   test('disable button visible when pool is active', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
-    await showPoolEditor(page);
-    await expect(page.locator('#ab-pool-disable')).toBeVisible();
+    await openABAdminPage(page);
+    await expect(page.locator('#ab-admin-disable')).toBeVisible();
   });
 
   test('disable button hidden when pool is inactive', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminInactiveMocks(page);
-    await page.goto('/chat');
-    await showPoolEditor(page);
-    await expect(page.locator('#ab-pool-disable')).toBeHidden();
+    await openABAdminPage(page);
+    await expect(page.locator('#ab-admin-disable')).toBeHidden();
   });
 
   test('clicking save sends correct payload', async ({ page }) => {
@@ -185,16 +143,13 @@ test.describe('A/B Pool Editor -- Save and Disable', () => {
       await route.fulfill({ status: 200, json: { success: true, ...mockData.abPoolAdmin } });
     });
 
-    await page.goto('/chat');
-    await showPoolEditor(page);
-    await page.locator('#ab-pool-save').click();
+    await openABAdminPage(page);
+    await page.locator('#ab-admin-save').click();
 
-    // The "Pool saved" message flashes then gets cleared by _updateABPoolSaveState
-    // so we verify the payload was sent correctly instead.
     await page.waitForTimeout(300);
     expect(savedPayload).toBeTruthy();
     expect(savedPayload.champion).toBe(mockData.abPoolAdmin.champion);
-    expect(savedPayload.variants).toEqual(expect.arrayContaining(mockData.abPoolAdmin.variants!));
+    expect(savedPayload.variants).toEqual(expect.arrayContaining(mockData.abPoolAdmin.variant_details!));
   });
 
   test('clicking disable calls endpoint and updates UI', async ({ page }) => {
@@ -207,84 +162,69 @@ test.describe('A/B Pool Editor -- Save and Disable', () => {
       await route.fulfill({ status: 200, json: { success: true } });
     });
 
-    await page.goto('/chat');
-    await showPoolEditor(page);
-    await page.locator('#ab-pool-disable').click();
+    await openABAdminPage(page);
+    await page.locator('#ab-admin-disable').click();
 
-    await expect(page.locator('#ab-pool-status')).toHaveText('Inactive');
+    await expect(page.locator('#ab-admin-status')).toHaveText('Inactive');
     expect(disableCalled).toBe(true);
   });
 
-  test('validation message when less than 2 agents selected', async ({ page }) => {
+  test('validation message when fewer than 2 variants remain', async ({ page }) => {
     await setupBasicMocks(page);
-    await setupABAdminInactiveMocks(page);
-    await page.goto('/chat');
-    await showPoolEditor(page);
+    await setupABAdminMocks(page);
+    await openABAdminPage(page);
 
-    const firstRow = page.locator('.ab-pool-agent-row').first();
-    await firstRow.locator('input[type="checkbox"]').check({ force: true });
+    await page.locator('.ab-variant-remove').nth(1).click();
 
-    await expect(page.locator('#ab-pool-message')).toContainText('Select at least 2 agents');
+    await expect(page.locator('#ab-admin-message')).toContainText('Add at least 2 variants');
   });
 
-  test('validation message when no champion designated', async ({ page }) => {
+  test('validation message when champion does not match current labels', async ({ page }) => {
     await setupBasicMocks(page);
-    await setupABAdminInactiveMocks(page);
-    await page.goto('/chat');
-    await showPoolEditor(page);
+    await setupABAdminMocks(page);
+    await openABAdminPage(page);
 
-    const rows = page.locator('.ab-pool-agent-row');
-    await rows.nth(0).locator('input[type="checkbox"]').check({ force: true });
-    await rows.nth(1).locator('input[type="checkbox"]').check({ force: true });
+    await page.locator('.ab-variant-card').first().locator('[data-field="label"]').fill('Renamed baseline');
 
-    await expect(page.locator('#ab-pool-message')).toContainText('Champion');
+    await expect(page.locator('#ab-admin-message')).toContainText('Champion');
   });
 });
 
 // =============================================================================
-// Pool editor -- champion toggle
+// Dedicated page -- champion selection
 // =============================================================================
 
-test.describe('A/B Pool Editor -- Champion Selection', () => {
+test.describe('A/B Admin Page -- Champion Selection', () => {
 
-  test('clicking champion button marks agent as champion', async ({ page }) => {
-    await setupBasicMocks(page);
-    await setupABAdminInactiveMocks(page);
-    await page.goto('/chat');
-    await showPoolEditor(page);
-
-    const rows = page.locator('.ab-pool-agent-row');
-    await rows.nth(0).locator('input[type="checkbox"]').check({ force: true });
-    await rows.nth(1).locator('input[type="checkbox"]').check({ force: true });
-    await rows.nth(0).locator('.ab-pool-champion-btn').click();
-
-    await expect(rows.nth(0)).toHaveClass(/champion/);
-  });
-
-  test('switching champion removes previous champion', async ({ page }) => {
+  test('changing champion select updates champion', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
-    await showPoolEditor(page);
+    await openABAdminPage(page);
 
-    const rows = page.locator('.ab-pool-agent-row');
-    await rows.nth(2).locator('input[type="checkbox"]').check({ force: true });
-    await rows.nth(2).locator('.ab-pool-champion-btn').click();
-
-    await expect(page.locator('.ab-pool-agent-row.champion')).toHaveCount(1);
-    await expect(rows.nth(2)).toHaveClass(/champion/);
+    await page.locator('#ab-admin-champion').selectOption('Challenger GPT-4o');
+    await expect(page.locator('#ab-admin-champion')).toHaveValue('Challenger GPT-4o');
   });
 
-  test('unchecking champion removes champion status', async ({ page }) => {
+  test('adding a variant updates champion choices', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
-    await showPoolEditor(page);
+    await openABAdminPage(page);
 
-    const championRow = page.locator('.ab-pool-agent-row.champion');
-    await championRow.locator('input[type="checkbox"]').uncheck({ force: true });
+    await page.locator('#ab-admin-add-variant').click();
+    await page.locator('.ab-variant-card').last().locator('[data-field="label"]').fill('Challenger Claude');
 
-    await expect(page.locator('.ab-pool-agent-row.champion')).toHaveCount(0);
+    const championOptions = page.locator('#ab-admin-champion option');
+    await expect(championOptions).toHaveCount(3);
+  });
+
+  test('removing the champion variant picks a remaining label', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+    await openABAdminPage(page);
+
+    await page.locator('.ab-variant-remove').first().click();
+
+    await expect(page.locator('#ab-admin-champion')).toHaveValue('Challenger GPT-4o');
   });
 });
 

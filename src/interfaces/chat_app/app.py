@@ -2186,6 +2186,9 @@ class FlaskAppWrapper(object):
         self.auth_enabled = auth_config.get('enabled', False)
         self.sso_enabled = auth_config.get('sso', {}).get('enabled', False)
         self.basic_auth_enabled = auth_config.get('basic', {}).get('enabled', False)
+        self.basic_temp_role_grants = self._load_basic_temporary_role_grants(
+            auth_config.get('basic', {}) or {}
+        )
         
         logger.info(f"Auth enabled: {self.auth_enabled}, SSO: {self.sso_enabled}, Basic: {self.basic_auth_enabled}")
         
@@ -2273,6 +2276,7 @@ class FlaskAppWrapper(object):
         # Enable/disable documents - requires documents:select permission
         logger.info("Adding data viewer API endpoints")
         self.add_endpoint('/data', 'data_viewer', self.require_perm(Permission.Documents.VIEW)(self.data_viewer_page))
+        self.add_endpoint('/admin/ab-testing', 'ab_testing_admin_page', self.require_auth(self.ab_testing_admin_page))
         self.add_endpoint('/api/data/documents', 'list_data_documents', self.require_perm(Permission.Documents.VIEW)(self.list_data_documents), methods=["GET"])
         self.add_endpoint('/api/data/documents/<document_hash>/content', 'get_data_document_content', self.require_perm(Permission.Documents.VIEW)(self.get_data_document_content), methods=["GET"])
         self.add_endpoint('/api/data/documents/<document_hash>/chunks', 'get_data_document_chunks', self.require_perm(Permission.Documents.VIEW)(self.get_data_document_chunks), methods=["GET"])
@@ -2351,6 +2355,59 @@ class FlaskAppWrapper(object):
         """Get user roles from session. Returns empty list if not logged in."""
         return session.get('roles', [])
 
+    def _load_basic_temporary_role_grants(self, basic_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        grants_cfg = basic_cfg.get('temporary_role_grants')
+        if not isinstance(grants_cfg, dict) or not grants_cfg.get('enabled', False):
+            return None
+
+        tracking_id = str(grants_cfg.get('tracking_id') or '').strip()
+        remove_after = str(grants_cfg.get('remove_after') or '').strip()
+        users_cfg = grants_cfg.get('users') or {}
+
+        registry = get_registry()
+        normalized_users: Dict[str, List[str]] = {}
+        for username, user_cfg in users_cfg.items():
+            if not isinstance(username, str) or not username.strip() or not isinstance(user_cfg, dict):
+                continue
+            roles = [
+                role.strip()
+                for role in (user_cfg.get('roles') or [])
+                if isinstance(role, str) and role.strip()
+            ]
+            valid_roles = registry.filter_valid_roles(roles)
+            if valid_roles:
+                normalized_users[username.strip()] = valid_roles
+
+        grant_info = {
+            'enabled': True,
+            'tracking_id': tracking_id,
+            'remove_after': remove_after,
+            'users': normalized_users,
+        }
+
+        logger.warning(
+            "Temporary basic-auth RBAC grants enabled: tracking_id=%s remove_after=%s users=%s",
+            tracking_id,
+            remove_after,
+            sorted(normalized_users.keys()),
+        )
+        return grant_info
+
+    def _get_basic_auth_roles_for_username(self, username: str) -> List[str]:
+        if not self.basic_temp_role_grants or not username:
+            return []
+
+        roles = list(self.basic_temp_role_grants.get('users', {}).get(username, []) or [])
+        if roles:
+            logger.warning(
+                "Applying temporary basic-auth RBAC grant for user '%s': roles=%s tracking_id=%s remove_after=%s",
+                username,
+                roles,
+                self.basic_temp_role_grants.get('tracking_id', ''),
+                self.basic_temp_role_grants.get('remove_after', ''),
+            )
+        return roles
+
     def _setup_sso(self):
         """Initialize OAuth client for SSO using OpenID Connect"""
         auth_config = self.chat_app_config.get('auth', {})
@@ -2405,20 +2462,21 @@ class FlaskAppWrapper(object):
             password = request.form.get('password')
             
             if check_credentials(username, password, self.salt, self.app.config['ACCOUNTS_FOLDER']):
+                basic_roles = self._get_basic_auth_roles_for_username(username or '')
                 self._set_user_session(
                     email=username,
                     name=username,
                     username=username,
                     auth_method='basic',
-                    roles=[]
+                    roles=basic_roles
                 )
-                logger.info(f"Basic auth login successful for user: {username}")
+                logger.info(f"Basic auth login successful for user: {username} with roles: {basic_roles}")
                 return redirect(url_for('index'))
             else:
                 flash('Invalid credentials')
         
         # Render login page with available auth methods
-        return render_template('landing.html', 
+        return render_template('login.html', 
                              sso_enabled=self.sso_enabled, 
                              basic_auth_enabled=self.basic_auth_enabled)
 
@@ -2572,12 +2630,9 @@ class FlaskAppWrapper(object):
                         # Redirect to login page which will trigger SSO
                         return redirect(url_for('login'))
                 
-                # Return 401 Unauthorized response for API requests
-                return jsonify({'error': 'Unauthorized', 'message': 'Authentication required'}), 401
                 if request.path.startswith('/api/'):
                     return jsonify({'error': 'Unauthorized', 'message': 'Authentication required'}), 401
-                else:   
-                    return redirect(url_for('login'))
+                return redirect(url_for('login'))
             
             return f(*args, **kwargs)
         return decorated_function
@@ -4187,12 +4242,21 @@ class FlaskAppWrapper(object):
             pool = self.chat.ab_pool
             can_manage = self._can_manage_ab_testing()
             can_use = self._can_use_ab_testing()
-            if pool and can_manage:
+            raw_ab_cfg = ((self.chat.services_config or {}).get("chat_app") or {}).get("ab_testing") or {}
+
+            admin_pool = pool
+            if not admin_pool and can_manage and isinstance(raw_ab_cfg, dict) and raw_ab_cfg.get("pool"):
+                try:
+                    admin_pool = ABPool.from_config(raw_ab_cfg)
+                except Exception as exc:
+                    logger.warning("Failed to parse persisted A/B pool config for admin view: %s", exc)
+
+            if admin_pool and can_manage:
                 return jsonify({
                     'success': True,
                     'is_admin': self._is_admin_request(),
                     'can_manage': True,
-                    **pool.pool_info(),
+                    **admin_pool.pool_info(),
                 }), 200
             if pool and can_use:
                 return jsonify({
@@ -4596,7 +4660,16 @@ class FlaskAppWrapper(object):
 
     def data_viewer_page(self):
         """Render the data viewer page."""
-        return render_template('data.html')
+        return render_template(
+            'data.html',
+            can_manage_ab_testing=self._can_manage_ab_testing(),
+        )
+
+    def ab_testing_admin_page(self):
+        """Render the dedicated admin A/B testing management page."""
+        if not self._can_manage_ab_testing():
+            return "Forbidden", 403
+        return render_template('ab_testing.html')
 
     def list_data_documents(self):
         """

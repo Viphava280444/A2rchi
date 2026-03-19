@@ -75,9 +75,9 @@ export const mockData = {
 
   agentsList: {
     agents: [
-      { name: 'CMS CompOps Agent', ab_only: false },
-      { name: 'Challenger GPT-4o', ab_only: true },
-      { name: 'Challenger Claude', ab_only: true },
+      { name: 'CMS CompOps Agent', filename: 'cms-comp-ops.md', ab_only: false },
+      { name: 'Challenger GPT-4o', filename: 'challenger-gpt4o.md', ab_only: true },
+      { name: 'Challenger Claude', filename: 'challenger-claude.md', ab_only: true },
     ],
     active_name: 'CMS CompOps Agent',
   },
@@ -85,18 +85,36 @@ export const mockData = {
   abPoolAdmin: {
     enabled: true,
     is_admin: true,
+    can_manage: true,
     champion: 'CMS CompOps Agent',
     variants: ['CMS CompOps Agent', 'Challenger GPT-4o'],
+    variant_details: [
+      { label: 'CMS CompOps Agent', agent_spec: 'cms-comp-ops.md' },
+      { label: 'Challenger GPT-4o', agent_spec: 'challenger-gpt4o.md', provider: 'openai', model: 'gpt-4o' },
+    ],
+    sample_rate: 1,
+    disclosure_mode: 'post_vote_reveal',
+    default_trace_mode: 'minimal',
+    max_pending_per_conversation: 1,
   },
 
   abPoolAdminInactive: {
     enabled: false,
     is_admin: true,
+    can_manage: true,
+    champion: '',
+    variants: [],
+    variant_details: [],
+    sample_rate: 1,
+    disclosure_mode: 'post_vote_reveal',
+    default_trace_mode: 'minimal',
+    max_pending_per_conversation: 1,
   },
 
   abPoolNonAdmin: {
     enabled: true,
     is_admin: false,
+    can_manage: false,
   },
 
   abMetrics: {
@@ -213,7 +231,7 @@ export async function setupBasicMocks(page: Page) {
   // Default A/B pool: non-admin, disabled.
   // Tests that need admin behavior should call setupABAdminMocks AFTER this.
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
-    await route.fulfill({ status: 200, json: { enabled: false, is_admin: false } });
+    await route.fulfill({ status: 200, json: { enabled: false, is_admin: false, can_manage: false } });
   });
 }
 

@@ -286,6 +286,7 @@ class ABPool:
             "enabled": self.enabled,
             "champion": self.champion_name,
             "variants": [v.label for v in self.variants],
+            "variant_details": [v.to_meta() for v in self.variants],
             "variant_count": len(self.variants),
             "sample_rate": self.sample_rate,
             "target_roles": list(self.target_roles),

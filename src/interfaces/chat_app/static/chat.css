@@ -1526,6 +1526,27 @@ body {
   line-height: 1.5;
 }
 
+.settings-link-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  text-decoration: none;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.settings-link-btn:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--accent-soft);
+}
+
 /* Compact Toggle (for inline use) */
 .settings-toggle-compact {
   position: relative;
