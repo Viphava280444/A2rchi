@@ -14,6 +14,7 @@ def test_basic_auth_login_sets_identity_without_rbac_roles():
     wrapper.salt = "salt"
     wrapper.sso_enabled = False
     wrapper.basic_auth_enabled = True
+    wrapper.app.config["ACCOUNTS_FOLDER"] = "/tmp/test-accounts"
 
     with app.test_request_context("/login", method="POST", data={"username": "alice", "password": "secret"}):
         with patch("src.interfaces.chat_app.app.check_credentials", return_value=True):

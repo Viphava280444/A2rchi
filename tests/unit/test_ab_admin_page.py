@@ -146,6 +146,15 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
             },
         },
     }
+    wrapper.config = {
+        "data_manager": {
+            "retrievers": {
+                "hybrid_retriever": {
+                    "num_documents_to_retrieve": 5,
+                }
+            }
+        }
+    }
     wrapper.global_config = {"DATA_PATH": "/root/data"}
     wrapper._get_ab_agents_dir = Mock(return_value=Path("/root/archi/ab_agents"))
     wrapper._is_admin_request = Mock(return_value=True)

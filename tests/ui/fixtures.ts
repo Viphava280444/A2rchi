@@ -169,6 +169,122 @@ export const mockData = {
   },
 };
 
+function abAdminPageHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>archi - A/B Testing</title>
+  <link rel="stylesheet" href="/static/chat.css">
+  <link rel="stylesheet" href="/static/data.css">
+</head>
+<body>
+  <div class="data-app">
+    <header class="data-header">
+      <div class="header-left"><a href="/data" class="back-link"><span>Data</span></a></div>
+      <div class="header-center"><h1>A/B Testing</h1></div>
+      <div class="header-right"><a href="/chat" class="icon-btn ab-admin-nav-btn"><span>Chat</span></a></div>
+    </header>
+    <main class="ab-admin-layout">
+      <section class="ab-admin-panel">
+        <div class="ab-admin-panel-header">
+          <div>
+            <h2>Experiment Settings</h2>
+            <p>Manage participant sampling, disclosure behavior, and the active champion/challenger pool.</p>
+          </div>
+          <span class="ab-pool-status" id="ab-admin-status">Inactive</span>
+        </div>
+        <div class="ab-admin-settings-grid">
+          <label class="ab-admin-field"><span>Sampling Rate</span><input type="number" id="ab-admin-sample-rate" min="0" max="1" step="0.05" value="1"></label>
+          <label class="ab-admin-field"><span>Disclosure Mode</span><select id="ab-admin-disclosure-mode"><option value="post_vote_reveal">Reveal after vote</option><option value="blind">Keep variants hidden</option><option value="named">Show variants while streaming</option></select></label>
+          <label class="ab-admin-field"><span>Agent Activity Default</span><select id="ab-admin-trace-mode"><option value="minimal">Hidden</option><option value="normal">Collapsed</option><option value="verbose">Expanded</option></select></label>
+          <label class="ab-admin-field"><span>Max Pending Per Conversation</span><input type="number" id="ab-admin-max-pending" min="1" step="1" value="1"></label>
+          <label class="ab-admin-field ab-admin-field-wide"><span>Champion</span><select id="ab-admin-champion"></select></label>
+        </div>
+        <div class="ab-admin-actions">
+          <button class="ab-pool-btn ab-pool-btn-save" id="ab-admin-save">Save Configuration</button>
+          <button class="ab-pool-btn ab-pool-btn-disable" id="ab-admin-disable">Disable</button>
+        </div>
+        <div class="ab-pool-message" id="ab-admin-message"></div>
+        <div class="ab-admin-warning-list" id="ab-admin-warnings" style="display: none;"></div>
+      </section>
+      <section class="ab-admin-panel">
+        <div class="ab-admin-panel-header">
+          <div>
+            <h2>Variants</h2>
+            <p>Each variant must have a unique label and a concrete agent markdown file in the isolated A/B agent pool.</p>
+          </div>
+          <div class="ab-admin-panel-actions">
+            <button class="ab-pool-btn ab-pool-btn-save" id="ab-admin-variant-save" type="button">Save Variants</button>
+            <button class="ab-pool-btn" id="ab-admin-add-variant" type="button">Add Variant</button>
+          </div>
+        </div>
+        <div class="ab-pool-message" id="ab-admin-variant-message"></div>
+        <div class="ab-admin-variant-list" id="ab-admin-variant-list"></div>
+      </section>
+    </main>
+  </div>
+  <div class="ab-agent-modal" id="ab-agent-modal" style="display: none;">
+    <div class="ab-agent-modal-backdrop" data-close-modal="true"></div>
+    <div class="ab-agent-modal-panel" role="dialog" aria-modal="true" aria-labelledby="ab-agent-modal-title">
+      <div class="ab-agent-modal-header">
+        <div><h2 id="ab-agent-modal-title">New A/B Agent</h2><p>Create an agent spec that is only available to A/B experiments.</p></div>
+        <button class="ab-agent-modal-close" id="ab-agent-modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <label class="ab-admin-field"><span>Agent Name</span><input type="text" id="ab-agent-name" placeholder="A/B Candidate"></label>
+      <div class="ab-agent-tools-section">
+        <div class="ab-agent-tools-header"><span>Tools</span><span class="ab-agent-tools-note">Choose the tools available to this experiment-only agent.</span></div>
+        <div class="ab-agent-tools-list" id="ab-agent-tools-list"></div>
+      </div>
+      <label class="ab-admin-field"><span>System Prompt</span><textarea id="ab-agent-prompt" class="ab-agent-prompt" rows="12" placeholder="Write the system prompt here."></textarea></label>
+      <div class="ab-agent-modal-footer">
+        <div class="ab-pool-message" id="ab-agent-message"></div>
+        <div class="ab-agent-modal-actions">
+          <button class="ab-pool-btn ab-pool-btn-disable" id="ab-agent-cancel" type="button">Cancel</button>
+          <button class="ab-pool-btn ab-pool-btn-save" id="ab-agent-save" type="button">Create Agent</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="/static/modules/theme-init.js"></script>
+  <script src="/static/modules/ab-admin.js"></script>
+</body>
+</html>`;
+}
+
+function adminDataPageHtml() {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>archi - Data Viewer</title>
+  <link rel="stylesheet" href="/static/chat.css">
+  <link rel="stylesheet" href="/static/data.css">
+</head>
+<body>
+  <div class="data-app">
+    <header class="data-header">
+      <div class="header-left"><a href="/chat" class="back-link"><span>Chat</span></a></div>
+      <div class="header-center"><h1>Data Viewer</h1></div>
+      <div class="header-right">
+        <a href="/admin/ab-testing" class="icon-btn header-action-btn ab-admin-nav-btn" title="A/B Testing"><span>A/B Testing</span></a>
+        <a href="/upload" class="icon-btn header-action-btn" title="Uploader"><span>Uploader</span></a>
+        <a href="/admin/database" class="icon-btn header-action-btn" title="Postgres"><span>Postgres</span></a>
+        <button class="icon-btn header-action-btn" id="refresh-btn" title="Refresh" type="button"><span>Refresh</span></button>
+      </div>
+    </header>
+    <main class="data-content">
+      <section class="documents-panel">
+        <div class="empty-state"><h3>Mock Data View</h3><p>Playwright admin bootstrap shell.</p></div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>`;
+}
+
 // =============================================================================
 // Stream Response Helpers
 // =============================================================================
@@ -293,6 +409,18 @@ export async function setupBasicMocks(page: Page) {
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
     await route.fulfill({ status: 200, json: { enabled: false, is_admin: false, can_manage: false } });
   });
+
+  await page.route('**/api/ab/decision*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        use_ab: false,
+        reason: 'pool_disabled',
+        pending_count: 0,
+        max_pending_per_conversation: 1,
+      },
+    });
+  });
 }
 
 export async function setupStreamMock(page: Page, response: string, delay = 0) {
@@ -309,6 +437,14 @@ export async function setupStreamMock(page: Page, response: string, delay = 0) {
  * Must be called BEFORE page.goto('/chat') so the init API calls get intercepted.
  */
 export async function setupABAdminMocks(page: Page) {
+  await page.route('**/data', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'text/html', body: adminDataPageHtml() });
+  });
+
+  await page.route('**/admin/ab-testing', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'text/html', body: abAdminPageHtml() });
+  });
+
   // Register AFTER setupBasicMocks — Playwright processes routes LIFO,
   // so this handler runs first and the default non-admin one never fires.
   await page.route('**/api/agents/list*', async (route) => {
@@ -320,12 +456,32 @@ export async function setupABAdminMocks(page: Page) {
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
     await route.fulfill({ status: 200, json: mockData.abPoolAdmin });
   });
+
+  await page.route('**/api/ab/decision*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        use_ab: true,
+        reason: 'sampled',
+        pending_count: 0,
+        max_pending_per_conversation: mockData.abPoolAdmin.max_pending_per_conversation,
+      },
+    });
+  });
 }
 
 /**
  * Set up route mocks for an admin who has NOT yet enabled a pool.
  */
 export async function setupABAdminInactiveMocks(page: Page) {
+  await page.route('**/data', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'text/html', body: adminDataPageHtml() });
+  });
+
+  await page.route('**/admin/ab-testing', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'text/html', body: abAdminPageHtml() });
+  });
+
   await page.route('**/api/agents/list*', async (route) => {
     const url = route.request().url();
     const isABScope = url.includes('scope=ab');
@@ -334,6 +490,18 @@ export async function setupABAdminInactiveMocks(page: Page) {
 
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
     await route.fulfill({ status: 200, json: mockData.abPoolAdminInactive });
+  });
+
+  await page.route('**/api/ab/decision*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        use_ab: false,
+        reason: 'pool_disabled',
+        pending_count: 0,
+        max_pending_per_conversation: mockData.abPoolAdminInactive.max_pending_per_conversation,
+      },
+    });
   });
 }
 

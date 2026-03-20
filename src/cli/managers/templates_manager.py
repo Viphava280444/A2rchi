@@ -376,7 +376,7 @@ class TemplateManager:
     # config rendering
     def _render_config_files(self, context: TemplateContext) -> None:
         configs_path = context.base_dir / "configs"
-        configs_path.mkdir(exist_ok=True)
+        configs_path.mkdir(parents=True, exist_ok=True)
 
         archi_configs = context.config_manager.get_configs()
         single_mode = len(archi_configs) == 1
