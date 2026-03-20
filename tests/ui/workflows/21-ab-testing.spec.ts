@@ -26,9 +26,19 @@ async function openABAdminPage(page: import('@playwright/test').Page) {
 }
 
 async function openChatPage(page: import('@playwright/test').Page) {
+  const abPoolLoaded = page.waitForResponse((response) =>
+    response.url().includes('/api/ab/pool') && response.request().method() === 'GET',
+  );
   await page.goto('/chat');
   await expect(page.getByLabel('Message input')).toBeVisible();
-  await page.waitForFunction(() => Boolean((window as any).Chat?.state));
+  await abPoolLoaded;
+  await expect(page.locator('.conversation-item[data-id]').first()).toBeVisible();
+}
+
+async function loadConversationFromSidebar(page: import('@playwright/test').Page, conversationId: number) {
+  const conversation = page.locator(`.conversation-item[data-id="${conversationId}"]`);
+  await expect(conversation).toBeVisible();
+  await conversation.click();
 }
 
 // =============================================================================
@@ -493,7 +503,6 @@ test.describe('A/B Comparison Streaming', () => {
     });
 
     await openChatPage(page);
-    await page.waitForFunction(() => (window as any).Chat?.state?.abPool?.enabled === true);
     await page.getByLabel('Message input').fill('Hello');
     await page.getByRole('button', { name: 'Send message' }).click();
 
@@ -547,7 +556,6 @@ test.describe('A/B Comparison Streaming', () => {
     });
 
     await openChatPage(page);
-    await page.waitForFunction(() => (window as any).Chat?.state?.abPool?.enabled === true);
     await page.getByLabel('Message input').fill('Hello');
     await page.getByRole('button', { name: 'Send message' }).click();
 
@@ -667,8 +675,7 @@ test.describe('A/B Comparison Streaming', () => {
     });
 
     await openChatPage(page);
-    await page.waitForFunction(() => (window as any).Chat?.state?.abPool?.max_pending_per_conversation === 2);
-    await page.evaluate(() => (window as any).Chat.loadConversation(1));
+    await loadConversationFromSidebar(page, 1);
 
     await expect(page.locator('.ab-comparison')).toHaveCount(1);
     await expect(page.locator('.ab-vote-container')).toBeVisible();
@@ -743,8 +750,7 @@ test.describe('A/B Comparison Streaming', () => {
     });
 
     await openChatPage(page);
-    await page.waitForFunction(() => (window as any).Chat?.state?.abPool?.max_pending_per_conversation === 2);
-    await page.evaluate(() => (window as any).Chat.loadConversation(1));
+    await loadConversationFromSidebar(page, 1);
 
     await expect(page.locator('.ab-comparison')).toHaveCount(2);
     await expect(page.locator('.ab-vote-container')).toBeVisible();
