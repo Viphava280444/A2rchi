@@ -169,6 +169,10 @@ export const mockData = {
   },
 };
 
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value));
+}
+
 function abAdminPageHtml() {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -423,6 +427,72 @@ export async function setupBasicMocks(page: Page) {
   });
 }
 
+export async function setupABDecisionMock(page: Page, overrides: Record<string, any> = {}) {
+  await page.route('**/api/ab/decision*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        use_ab: false,
+        reason: 'pool_disabled',
+        pending_count: 0,
+        max_pending_per_conversation: 1,
+        ...overrides,
+      },
+    });
+  });
+}
+
+export async function setupABAdminPageBootstrap(page: Page, options: {
+  abAgentsList?: typeof mockData.abAgentsList;
+} = {}) {
+  const seededABAgents = cloneJson(options.abAgentsList?.agents || mockData.abAgentsList.agents);
+  let abAgents = seededABAgents;
+
+  await page.route('**/data', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'text/html', body: adminDataPageHtml() });
+  });
+
+  await page.route('**/admin/ab-testing', async (route) => {
+    await route.fulfill({ status: 200, contentType: 'text/html', body: abAdminPageHtml() });
+  });
+
+  await page.route('**/api/agents/list*', async (route) => {
+    const url = route.request().url();
+    const isABScope = url.includes('scope=ab');
+    await route.fulfill({
+      status: 200,
+      json: isABScope
+        ? { agents: abAgents, active_name: null }
+        : mockData.agentsList,
+    });
+  });
+
+  await page.route('**/api/agents', async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.fallback();
+      return;
+    }
+    const body = route.request().postDataJSON();
+    if (body.scope !== 'ab') {
+      await route.fallback();
+      return;
+    }
+
+    const content = String(body.content || '');
+    const match = content.match(/^name:\s*(.+)$/m);
+    const name = match ? match[1].trim() : 'New A/B Agent';
+    const filename = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'new-ab-agent'}.md`;
+
+    abAgents = abAgents.filter((agent) => agent.filename !== filename);
+    abAgents.push({ name, filename, ab_only: true });
+
+    await route.fulfill({
+      status: 200,
+      json: { success: true, name, filename, scope: 'ab' },
+    });
+  });
+}
+
 export async function setupStreamMock(page: Page, response: string, delay = 0) {
   await page.route('**/api/get_chat_response_stream', async (route) => {
     if (delay > 0) {
@@ -437,36 +507,17 @@ export async function setupStreamMock(page: Page, response: string, delay = 0) {
  * Must be called BEFORE page.goto('/chat') so the init API calls get intercepted.
  */
 export async function setupABAdminMocks(page: Page) {
-  await page.route('**/data', async (route) => {
-    await route.fulfill({ status: 200, contentType: 'text/html', body: adminDataPageHtml() });
-  });
-
-  await page.route('**/admin/ab-testing', async (route) => {
-    await route.fulfill({ status: 200, contentType: 'text/html', body: abAdminPageHtml() });
-  });
-
-  // Register AFTER setupBasicMocks — Playwright processes routes LIFO,
-  // so this handler runs first and the default non-admin one never fires.
-  await page.route('**/api/agents/list*', async (route) => {
-    const url = route.request().url();
-    const isABScope = url.includes('scope=ab');
-    await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
-  });
+  await setupABAdminPageBootstrap(page);
 
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
     await route.fulfill({ status: 200, json: mockData.abPoolAdmin });
   });
 
-  await page.route('**/api/ab/decision*', async (route) => {
-    await route.fulfill({
-      status: 200,
-      json: {
-        use_ab: true,
-        reason: 'sampled',
-        pending_count: 0,
-        max_pending_per_conversation: mockData.abPoolAdmin.max_pending_per_conversation,
-      },
-    });
+  await setupABDecisionMock(page, {
+    use_ab: true,
+    reason: 'sampled',
+    pending_count: 0,
+    max_pending_per_conversation: mockData.abPoolAdmin.max_pending_per_conversation,
   });
 }
 
@@ -474,34 +525,17 @@ export async function setupABAdminMocks(page: Page) {
  * Set up route mocks for an admin who has NOT yet enabled a pool.
  */
 export async function setupABAdminInactiveMocks(page: Page) {
-  await page.route('**/data', async (route) => {
-    await route.fulfill({ status: 200, contentType: 'text/html', body: adminDataPageHtml() });
-  });
-
-  await page.route('**/admin/ab-testing', async (route) => {
-    await route.fulfill({ status: 200, contentType: 'text/html', body: abAdminPageHtml() });
-  });
-
-  await page.route('**/api/agents/list*', async (route) => {
-    const url = route.request().url();
-    const isABScope = url.includes('scope=ab');
-    await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
-  });
+  await setupABAdminPageBootstrap(page);
 
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
     await route.fulfill({ status: 200, json: mockData.abPoolAdminInactive });
   });
 
-  await page.route('**/api/ab/decision*', async (route) => {
-    await route.fulfill({
-      status: 200,
-      json: {
-        use_ab: false,
-        reason: 'pool_disabled',
-        pending_count: 0,
-        max_pending_per_conversation: mockData.abPoolAdminInactive.max_pending_per_conversation,
-      },
-    });
+  await setupABDecisionMock(page, {
+    use_ab: false,
+    reason: 'pool_disabled',
+    pending_count: 0,
+    max_pending_per_conversation: mockData.abPoolAdminInactive.max_pending_per_conversation,
   });
 }
 

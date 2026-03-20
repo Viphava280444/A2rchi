@@ -8,8 +8,10 @@ import {
   test,
   expect,
   setupBasicMocks,
+  setupABAdminPageBootstrap,
   setupABAdminMocks,
   setupABAdminInactiveMocks,
+  setupABDecisionMock,
   mockData,
   createABStreamResponse,
 } from '../fixtures';
@@ -21,6 +23,12 @@ import {
 async function openABAdminPage(page: import('@playwright/test').Page) {
   await page.goto('/admin/ab-testing');
   await expect(page.locator('#ab-admin-status')).toBeVisible();
+}
+
+async function openChatPage(page: import('@playwright/test').Page) {
+  await page.goto('/chat');
+  await expect(page.getByLabel('Message input')).toBeVisible();
+  await page.waitForFunction(() => Boolean((window as any).Chat?.state));
 }
 
 // =============================================================================
@@ -181,12 +189,8 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
 
   test('settings save keeps backend-confirmed values visible without relying on a follow-up GET', async ({ page }) => {
     await setupBasicMocks(page);
+    await setupABAdminPageBootstrap(page);
 
-    await page.route('**/api/agents/list*', async (route) => {
-      const url = route.request().url();
-      const isABScope = url.includes('scope=ab');
-      await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
-    });
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
       await route.fulfill({ status: 200, json: mockData.abPoolAdmin });
     });
@@ -230,17 +234,30 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     expect(savedPayload).toBeTruthy();
     expect(savedPayload).toHaveProperty('variants');
     expect(savedPayload).not.toHaveProperty('sample_rate');
-    expect(savedPayload.variants).toEqual(expect.arrayContaining(mockData.abPoolAdmin.variant_details!));
+    expect(savedPayload.variants).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        label: 'Baseline',
+        agent_spec: 'baseline-ab.md',
+        provider: null,
+        model: null,
+        recursion_limit: null,
+        num_documents_to_retrieve: null,
+      }),
+      expect.objectContaining({
+        label: 'Poet',
+        agent_spec: 'poet-ab.md',
+        provider: 'openrouter',
+        model: 'anthropic/claude-3.5-sonnet',
+        recursion_limit: null,
+        num_documents_to_retrieve: null,
+      }),
+    ]));
   });
 
   test('variant save keeps backend-confirmed selections visible without relying on a follow-up GET', async ({ page }) => {
     await setupBasicMocks(page);
+    await setupABAdminPageBootstrap(page);
 
-    await page.route('**/api/agents/list*', async (route) => {
-      const url = route.request().url();
-      const isABScope = url.includes('scope=ab');
-      await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
-    });
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
       await route.fulfill({ status: 200, json: mockData.abPoolAdmin });
     });
@@ -274,12 +291,8 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
 
   test('clicking disable calls endpoint and updates UI', async ({ page }) => {
     await setupBasicMocks(page);
+    await setupABAdminPageBootstrap(page);
     let poolState = { ...mockData.abPoolAdmin };
-    await page.route('**/api/agents/list*', async (route) => {
-      const url = route.request().url();
-      const isABScope = url.includes('scope=ab');
-      await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
-    });
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
       await route.fulfill({ status: 200, json: poolState });
     });
@@ -432,6 +445,12 @@ test.describe('A/B Comparison Streaming', () => {
 
   test('A/B headers render cleanly with named disclosure and minimal trace mode', async ({ page }) => {
     await setupBasicMocks(page);
+    await setupABDecisionMock(page, {
+      use_ab: true,
+      reason: 'sampled',
+      pending_count: 0,
+      max_pending_per_conversation: 1,
+    });
 
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
       await route.fulfill({
@@ -473,7 +492,8 @@ test.describe('A/B Comparison Streaming', () => {
       await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
     });
 
-    await page.goto('/chat');
+    await openChatPage(page);
+    await page.waitForFunction(() => (window as any).Chat?.state?.abPool?.enabled === true);
     await page.getByLabel('Message input').fill('Hello');
     await page.getByRole('button', { name: 'Send message' }).click();
 
@@ -485,6 +505,12 @@ test.describe('A/B Comparison Streaming', () => {
 
   test('A/B trace headers match the standard agent activity presentation', async ({ page }) => {
     await setupBasicMocks(page);
+    await setupABDecisionMock(page, {
+      use_ab: true,
+      reason: 'sampled',
+      pending_count: 0,
+      max_pending_per_conversation: 1,
+    });
 
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
       await route.fulfill({
@@ -520,7 +546,8 @@ test.describe('A/B Comparison Streaming', () => {
       await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
     });
 
-    await page.goto('/chat');
+    await openChatPage(page);
+    await page.waitForFunction(() => (window as any).Chat?.state?.abPool?.enabled === true);
     await page.getByLabel('Message input').fill('Hello');
     await page.getByRole('button', { name: 'Send message' }).click();
 
@@ -632,7 +659,15 @@ test.describe('A/B Comparison Streaming', () => {
       });
     });
 
-    await page.goto('/chat');
+    await setupABDecisionMock(page, {
+      use_ab: true,
+      reason: 'sampled',
+      pending_count: 0,
+      max_pending_per_conversation: 2,
+    });
+
+    await openChatPage(page);
+    await page.waitForFunction(() => (window as any).Chat?.state?.abPool?.max_pending_per_conversation === 2);
     await page.evaluate(() => (window as any).Chat.loadConversation(1));
 
     await expect(page.locator('.ab-comparison')).toHaveCount(1);
@@ -700,7 +735,15 @@ test.describe('A/B Comparison Streaming', () => {
       });
     });
 
-    await page.goto('/chat');
+    await setupABDecisionMock(page, {
+      use_ab: true,
+      reason: 'sampled',
+      pending_count: 0,
+      max_pending_per_conversation: 2,
+    });
+
+    await openChatPage(page);
+    await page.waitForFunction(() => (window as any).Chat?.state?.abPool?.max_pending_per_conversation === 2);
     await page.evaluate(() => (window as any).Chat.loadConversation(1));
 
     await expect(page.locator('.ab-comparison')).toHaveCount(2);

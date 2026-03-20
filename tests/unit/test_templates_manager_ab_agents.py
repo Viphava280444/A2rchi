@@ -80,3 +80,33 @@ def test_render_config_files_rewrites_ab_agents_dir_to_runtime_path(tmp_path):
     rendered = (context.base_dir / "configs" / "config.yaml").read_text()
     assert 'agents_dir: "/root/archi/agents"' in rendered
     assert 'ab_agents_dir: "/root/archi/ab_agents"' in rendered
+
+
+def test_render_config_files_preserves_benchmarking_rewrite_with_explicit_flag(tmp_path):
+    benchmark_agent = tmp_path / "bench-agent.md"
+    benchmark_agent.write_text("---\nname: Bench\n---\nPrompt\n")
+
+    config = {
+        "name": "bench-demo",
+        "global": {"LOGGING": {}},
+        "utils": {},
+        "services": {
+            "benchmarking": {
+                "agent_md_file": str(benchmark_agent),
+            },
+            "chat_app": {
+                "agents_dir": str(tmp_path / "agents-src"),
+            },
+        },
+    }
+    context = SimpleNamespace(
+        base_dir=tmp_path / "deployment",
+        config_manager=_FakeConfigManager(config),
+        plan=SimpleNamespace(host_mode=False, verbosity=0),
+        benchmarking=True,
+    )
+
+    _template_manager()._render_config_files(context)
+
+    rendered = (context.base_dir / "configs" / "config.yaml").read_text()
+    assert 'agent_md_file: "/root/archi/agents/bench-agent.md"' in rendered

@@ -377,6 +377,7 @@ class TemplateManager:
     def _render_config_files(self, context: TemplateContext) -> None:
         configs_path = context.base_dir / "configs"
         configs_path.mkdir(parents=True, exist_ok=True)
+        benchmarking_enabled = bool(getattr(context, "benchmarking", False))
 
         archi_configs = context.config_manager.get_configs()
         single_mode = len(archi_configs) == 1
@@ -399,7 +400,7 @@ class TemplateManager:
                         ab_cfg = service_cfg.get("ab_testing")
                         if isinstance(ab_cfg, dict) and ab_cfg.get("ab_agents_dir"):
                             ab_cfg["ab_agents_dir"] = DEFAULT_AB_AGENTS_DIR
-            if context.benchmarking:
+            if benchmarking_enabled:
                 benchmark_cfg = services_cfg.get("benchmarking")
                 if isinstance(benchmark_cfg, dict):
                     agent_md_file = benchmark_cfg.get("agent_md_file")
