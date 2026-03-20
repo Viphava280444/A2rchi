@@ -96,6 +96,15 @@ test.describe('A/B Admin Page -- Variant List', () => {
     const options = page.locator('.ab-variant-card').first().locator('[data-field="agent_spec"] option');
     await expect(options).toHaveCount(mockData.agentsList.agents.length + 1);
   });
+
+  test('provider selector uses provider dropdown options', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+    await openABAdminPage(page);
+
+    const providerOptions = page.locator('.ab-variant-card').nth(1).locator('[data-field="provider"] option');
+    await expect(providerOptions).toHaveCount(mockData.providers.providers.length + 1);
+  });
 });
 
 // =============================================================================
@@ -137,7 +146,7 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     await setupABAdminMocks(page);
 
     let savedPayload: any = null;
-    await page.route('**/api/ab/pool/set', async (route) => {
+    await page.route('**/api/ab/pool/settings/set', async (route) => {
       const body = route.request().postDataJSON();
       savedPayload = body;
       await route.fulfill({ status: 200, json: { success: true, ...mockData.abPoolAdmin } });
@@ -149,17 +158,114 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     await page.waitForTimeout(300);
     expect(savedPayload).toBeTruthy();
     expect(savedPayload.champion).toBe(mockData.abPoolAdmin.champion);
+    expect(savedPayload).not.toHaveProperty('variants');
+    expect(savedPayload.sample_rate).toBe(mockData.abPoolAdmin.sample_rate);
+  });
+
+  test('settings save keeps backend-confirmed values visible without relying on a follow-up GET', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route('**/api/agents/list*', async (route) => {
+      await route.fulfill({ status: 200, json: mockData.agentsList });
+    });
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({ status: 200, json: mockData.abPoolAdmin });
+    });
+    await page.route('**/api/ab/pool/settings/set', async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          ...mockData.abPoolAdmin,
+          sample_rate: 0.4,
+          disclosure_mode: 'blind',
+          default_trace_mode: 'verbose',
+        },
+      });
+    });
+
+    await openABAdminPage(page);
+    await page.locator('#ab-admin-sample-rate').fill('0.4');
+    await page.locator('#ab-admin-disclosure-mode').selectOption('blind');
+    await page.locator('#ab-admin-trace-mode').selectOption('verbose');
+    await page.locator('#ab-admin-save').click();
+
+    await expect(page.locator('#ab-admin-sample-rate')).toHaveValue('0.4');
+    await expect(page.locator('#ab-admin-disclosure-mode')).toHaveValue('blind');
+    await expect(page.locator('#ab-admin-trace-mode')).toHaveValue('verbose');
+  });
+
+  test('clicking save variants sends only variant details', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+
+    let savedPayload: any = null;
+    await page.route('**/api/ab/pool/variants/set', async (route) => {
+      savedPayload = route.request().postDataJSON();
+      await route.fulfill({ status: 200, json: { success: true, ...mockData.abPoolAdmin } });
+    });
+
+    await openABAdminPage(page);
+    await page.locator('#ab-admin-variant-save').click();
+
+    await page.waitForTimeout(300);
+    expect(savedPayload).toBeTruthy();
+    expect(savedPayload).toHaveProperty('variants');
+    expect(savedPayload).not.toHaveProperty('sample_rate');
     expect(savedPayload.variants).toEqual(expect.arrayContaining(mockData.abPoolAdmin.variant_details!));
+  });
+
+  test('variant save keeps backend-confirmed selections visible without relying on a follow-up GET', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route('**/api/agents/list*', async (route) => {
+      await route.fulfill({ status: 200, json: mockData.agentsList });
+    });
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({ status: 200, json: mockData.abPoolAdmin });
+    });
+    await page.route('**/api/ab/pool/variants/set', async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          ...mockData.abPoolAdmin,
+          variant_details: [
+            { label: 'CMS CompOps Agent', agent_spec: 'cms-comp-ops.md' },
+            { label: 'Poet', agent_spec: 'challenger-claude.md', provider: 'openrouter', model: 'anthropic/claude-3.5-sonnet' },
+          ],
+          variants: ['CMS CompOps Agent', 'Poet'],
+        },
+      });
+    });
+
+    await openABAdminPage(page);
+    const secondCard = page.locator('.ab-variant-card').nth(1);
+    await secondCard.locator('[data-field="label"]').fill('Poet');
+    await secondCard.locator('[data-field="agent_spec"]').selectOption('challenger-claude.md');
+    await secondCard.locator('[data-field="provider"]').selectOption('openrouter');
+    await secondCard.locator('[data-field="model_select"]').selectOption('anthropic/claude-3.5-sonnet');
+    await page.locator('#ab-admin-variant-save').click();
+
+    await expect(secondCard.locator('[data-field="label"]')).toHaveValue('Poet');
+    await expect(secondCard.locator('[data-field="agent_spec"]')).toHaveValue('challenger-claude.md');
+    await expect(secondCard.locator('[data-field="provider"]')).toHaveValue('openrouter');
+    await expect(secondCard.locator('[data-field="model_select"]')).toHaveValue('anthropic/claude-3.5-sonnet');
   });
 
   test('clicking disable calls endpoint and updates UI', async ({ page }) => {
     await setupBasicMocks(page);
-    await setupABAdminMocks(page);
+    let poolState = { ...mockData.abPoolAdmin };
+    await page.route('**/api/agents/list*', async (route) => {
+      await route.fulfill({ status: 200, json: mockData.agentsList });
+    });
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({ status: 200, json: poolState });
+    });
 
     let disableCalled = false;
     await page.route('**/api/ab/pool/disable', async (route) => {
       disableCalled = true;
-      await route.fulfill({ status: 200, json: { success: true } });
+      poolState = { ...mockData.abPoolAdmin, enabled: false, enabled_requested: false };
+      await route.fulfill({ status: 200, json: { success: true, ...poolState } });
     });
 
     await openABAdminPage(page);
@@ -176,17 +282,32 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
 
     await page.locator('.ab-variant-remove').nth(1).click();
 
-    await expect(page.locator('#ab-admin-message')).toContainText('Add at least 2 variants');
+    await expect(page.locator('#ab-admin-variant-message')).toContainText('Add at least 2 variants');
   });
 
-  test('validation message when champion does not match current labels', async ({ page }) => {
+  test('settings save ignores unsaved variant label edits', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
     await openABAdminPage(page);
 
     await page.locator('.ab-variant-card').first().locator('[data-field="label"]').fill('Renamed baseline');
 
-    await expect(page.locator('#ab-admin-message')).toContainText('Champion');
+    await expect(page.locator('#ab-admin-save')).toBeEnabled();
+    await expect(page.locator('#ab-admin-champion')).toHaveValue('CMS CompOps Agent');
+  });
+
+  test('unsaved draft is restored after navigation', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminInactiveMocks(page);
+    await openABAdminPage(page);
+
+    await page.locator('#ab-admin-add-variant').click();
+    await page.locator('.ab-variant-card').first().locator('[data-field="label"]').fill('Draft Variant');
+
+    await page.goto('/chat');
+    await openABAdminPage(page);
+
+    await expect(page.locator('.ab-variant-card').first().locator('[data-field="label"]')).toHaveValue('Draft Variant');
   });
 });
 
@@ -205,7 +326,7 @@ test.describe('A/B Admin Page -- Champion Selection', () => {
     await expect(page.locator('#ab-admin-champion')).toHaveValue('Challenger GPT-4o');
   });
 
-  test('adding a variant updates champion choices', async ({ page }) => {
+  test('adding an unsaved variant does not change champion choices yet', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
     await openABAdminPage(page);
@@ -214,17 +335,17 @@ test.describe('A/B Admin Page -- Champion Selection', () => {
     await page.locator('.ab-variant-card').last().locator('[data-field="label"]').fill('Challenger Claude');
 
     const championOptions = page.locator('#ab-admin-champion option');
-    await expect(championOptions).toHaveCount(3);
+    await expect(championOptions).toHaveCount(2);
   });
 
-  test('removing the champion variant picks a remaining label', async ({ page }) => {
+  test('removing an unsaved champion variant does not change saved champion selection', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
     await openABAdminPage(page);
 
     await page.locator('.ab-variant-remove').first().click();
 
-    await expect(page.locator('#ab-admin-champion')).toHaveValue('Challenger GPT-4o');
+    await expect(page.locator('#ab-admin-champion')).toHaveValue('CMS CompOps Agent');
   });
 });
 

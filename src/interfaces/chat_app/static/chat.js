@@ -2350,7 +2350,7 @@ const UI = {
             <p>This will compare two AI responses for each message.</p>
             <ul>
               <li><strong>2× API usage</strong> - Each message generates two responses</li>
-              <li><strong>Voting required</strong> - You must choose the better response before continuing</li>
+              <li><strong>Voting required</strong> - Once the pending comparison limit is reached, you must resolve one before continuing</li>
               <li>You can disable A/B mode at any time to skip voting</li>
             </ul>
           </div>
@@ -2473,8 +2473,9 @@ const UI = {
           </div>
         </div>`;
 
+    const comparisonKey = Utils.escapeAttr(options.comparisonKey || `${msgIdA}-${msgIdB}`);
     const html = `
-      <div class="ab-comparison" id="ab-comparison-active">
+      <div class="ab-comparison" data-comparison-key="${comparisonKey}">
         ${armHtml(msgIdA, 'Response A')}
         ${armHtml(msgIdB, 'Response B')}
       </div>`;
@@ -2493,6 +2494,38 @@ const UI = {
       this.startTraceTimer(msgIdB);
     }
     this.scrollToBottom();
+  },
+
+  findABComparisonElement(comparisonState = null) {
+    if (!comparisonState) return null;
+
+    const comparisonId = comparisonState.comparisonId;
+    if (comparisonId != null) {
+      const byId = document.querySelector(`.ab-comparison[data-comparison-id="${comparisonId}"]`);
+      if (byId) return byId;
+    }
+
+    const armIds = [
+      comparisonState.responseAUiId,
+      comparisonState.responseBUiId,
+      comparisonState.responseAId,
+      comparisonState.responseBId,
+    ].filter(Boolean);
+
+    for (const armId of armIds) {
+      const arm = document.querySelector(`.ab-arm[data-id="${armId}"], .ab-response[data-id="${armId}"]`);
+      if (arm) {
+        const container = arm.closest('.ab-comparison');
+        if (container) return container;
+      }
+    }
+    return null;
+  },
+
+  setABComparisonId(comparisonState = null) {
+    const comparison = this.findABComparisonElement(comparisonState);
+    if (!comparison || !comparisonState?.comparisonId) return;
+    comparison.dataset.comparisonId = String(comparisonState.comparisonId);
   },
 
   updateABVariantLabel(armId, variantName) {
@@ -2557,12 +2590,14 @@ const UI = {
     this.scrollToBottom();
   },
 
-  showABVoteButtons(comparisonId) {
-    const comparison = document.getElementById('ab-comparison-active');
+  showABVoteButtons(comparisonState) {
+    const comparison = this.findABComparisonElement(comparisonState);
     if (!comparison) return;
 
+    this.hideABVoteButtons();
+
     const voteHtml = `
-      <div class="ab-vote-container" data-comparison-id="${comparisonId}">
+      <div class="ab-vote-container" data-comparison-id="${comparisonState.comparisonId}">
         <div class="ab-vote-prompt">Which response do you prefer?</div>
         <div class="ab-vote-buttons">
           <button class="ab-vote-btn ab-vote-btn-a" data-vote="a">
@@ -2583,7 +2618,7 @@ const UI = {
     comparison.insertAdjacentHTML('afterend', voteHtml);
 
     // Bind vote button events
-    document.querySelectorAll('.ab-vote-btn').forEach((btn) => {
+    comparison.nextElementSibling?.querySelectorAll('.ab-vote-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         const vote = btn.dataset.vote;
         Chat.submitABPreference(vote);
@@ -2598,7 +2633,7 @@ const UI = {
   },
 
   markABWinner(preference, comparisonState = null) {
-    const comparisonEl = document.getElementById('ab-comparison-active');
+    const comparisonEl = this.findABComparisonElement(comparisonState);
     if (!comparisonEl) return;
 
     if (comparisonState?.responseAId) {
@@ -2630,7 +2665,7 @@ const UI = {
       // Tie — dim both equally and add a badge
       armA?.classList.add('ab-arm-tie');
       armB?.classList.add('ab-arm-tie');
-      comparisonEl.removeAttribute('id');
+      delete comparisonEl.dataset.comparisonId;
       return;
     }
 
@@ -2653,8 +2688,12 @@ const UI = {
     }
   },
 
-  removeABComparisonContainer() {
-    document.getElementById('ab-comparison-active')?.remove();
+  removeABComparisonContainer(comparisonState = null) {
+    if (comparisonState) {
+      this.findABComparisonElement(comparisonState)?.remove();
+    } else {
+      document.querySelector('.ab-comparison:last-of-type')?.remove();
+    }
     this.hideABVoteButtons();
   },
 
@@ -3453,6 +3492,7 @@ const Chat = {
     configs: [],
     // A/B Testing state
     activeABComparison: null,  // { comparisonId, responseAId, responseBId, variantA, variantB }
+    pendingABComparisons: [],  // unresolved comparisons in creation order
     abVotePending: false,      // true when waiting for user vote
     abPool: null,              // null or { enabled, champion, variants: [...] } from /api/ab/pool
     // Trace state
@@ -3469,6 +3509,51 @@ const Chat = {
     agents: [],
     allAgents: [],  // full list including ab_only variants, for pool editor
     activeAgentName: null,
+  },
+
+  getABPendingLimit() {
+    const configured = Number(this.state.abPool?.max_pending_per_conversation ?? 1);
+    return Number.isFinite(configured) && configured >= 1 ? configured : 1;
+  },
+
+  hasReachedABPendingLimit() {
+    return this.state.pendingABComparisons.length >= this.getABPendingLimit();
+  },
+
+  syncABPendingState() {
+    const pending = Array.isArray(this.state.pendingABComparisons)
+      ? this.state.pendingABComparisons.filter(Boolean)
+      : [];
+    this.state.pendingABComparisons = pending;
+    this.state.activeABComparison = pending.length ? pending[pending.length - 1] : null;
+    this.state.abVotePending = pending.length > 0;
+
+    UI.hideABVoteButtons();
+    if (this.state.activeABComparison) {
+      UI.setABComparisonId(this.state.activeABComparison);
+      UI.showABVoteButtons(this.state.activeABComparison);
+    }
+
+    if (!this.state.isStreaming) {
+      UI.setInputDisabled(this.hasReachedABPendingLimit());
+    }
+  },
+
+  addPendingABComparison(comparisonState) {
+    if (!comparisonState?.comparisonId) return;
+    const remaining = this.state.pendingABComparisons.filter(
+      (item) => item?.comparisonId !== comparisonState.comparisonId,
+    );
+    remaining.push(comparisonState);
+    this.state.pendingABComparisons = remaining;
+    this.syncABPendingState();
+  },
+
+  removePendingABComparison(comparisonId) {
+    this.state.pendingABComparisons = this.state.pendingABComparisons.filter(
+      (item) => item?.comparisonId !== comparisonId,
+    );
+    this.syncABPendingState();
   },
 
   async init() {
@@ -3859,6 +3944,7 @@ const Chat = {
       // Build history for API
       this.state.history = (data.messages || []).map((msg) => [msg.sender, msg.content]);
       this.state.activeABComparison = null;
+      this.state.pendingABComparisons = [];
       this.state.abVotePending = false;
 
       UI.renderMessages(this.state.messages);
@@ -3870,8 +3956,10 @@ const Chat = {
         }
       }
 
-      if (data.pending_ab_comparison) {
-        this.restorePendingABComparison(data.pending_ab_comparison);
+      if (Array.isArray(data.pending_ab_comparisons) && data.pending_ab_comparisons.length) {
+        this.restorePendingABComparisons(data.pending_ab_comparisons);
+      } else if (data.pending_ab_comparison) {
+        this.restorePendingABComparisons([data.pending_ab_comparison]);
       } else {
         UI.hideABVoteButtons();
         UI.setInputDisabled(false);
@@ -3884,6 +3972,7 @@ const Chat = {
       this.state.messages = [];
       this.state.history = [];
       this.state.activeABComparison = null;
+      this.state.pendingABComparisons = [];
       this.state.abVotePending = false;
       Storage.setActiveConversationId(null);
       UI.renderMessages([]);
@@ -3901,7 +3990,10 @@ const Chat = {
     const responseAId = comparison.response_a.message_id;
     const responseBId = comparison.response_b.message_id;
 
-    UI.addABComparisonContainer(responseAId, responseBId, { traceMode });
+    UI.addABComparisonContainer(responseAId, responseBId, {
+      traceMode,
+      comparisonKey: comparison.comparison_id || `${responseAId}-${responseBId}`,
+    });
     UI.updateABResponse(responseAId, Markdown.render(comparison.response_a.content || ''), false);
     UI.updateABResponse(responseBId, Markdown.render(comparison.response_b.content || ''), false);
     UI.updateABArmPresentation(responseAId, {
@@ -3936,7 +4028,7 @@ const Chat = {
       document.querySelector(`.ab-arm[data-id="${responseBId}"] .trace-container`)?.remove();
     }
 
-    this.state.activeABComparison = {
+    const state = {
       comparisonId: comparison.comparison_id,
       responseAId,
       responseBId,
@@ -3951,9 +4043,18 @@ const Chat = {
       disclosureMode,
       traceMode,
     };
-    this.state.abVotePending = true;
-    UI.showABVoteButtons(comparison.comparison_id);
-    UI.setInputDisabled(true);
+    UI.setABComparisonId(state);
+    return state;
+  },
+
+  restorePendingABComparisons(comparisons) {
+    const restored = [];
+    (comparisons || []).forEach((comparison) => {
+      const state = this.restorePendingABComparison(comparison);
+      if (state) restored.push(state);
+    });
+    this.state.pendingABComparisons = restored;
+    this.syncABPendingState();
   },
 
   async newConversation() {
@@ -3963,6 +4064,7 @@ const Chat = {
       this.state.messages = [];
       this.state.history = [];
       this.state.activeABComparison = null;
+      this.state.pendingABComparisons = [];
       this.state.abVotePending = false;
       Storage.setActiveConversationId(null);
       
@@ -3986,6 +4088,7 @@ const Chat = {
         this.state.messages = [];
         this.state.history = [];
         this.state.activeABComparison = null;
+        this.state.pendingABComparisons = [];
         this.state.abVotePending = false;
         Storage.setActiveConversationId(null);
         UI.renderMessages([]);
@@ -4009,9 +4112,10 @@ const Chat = {
       return;
     }
 
-    // Block if A/B vote is pending
-    if (this.state.abVotePending) {
-      UI.showToast('Please vote on the current comparison first, or disable A/B mode');
+    // Block only when the unresolved-comparison limit has been reached
+    if (this.hasReachedABPendingLimit()) {
+      const limit = this.getABPendingLimit();
+      UI.showToast(`Please resolve one of the pending comparisons before continuing (limit: ${limit}).`);
       return;
     }
 
@@ -4077,7 +4181,7 @@ const Chat = {
     if (!this.state.abPool) {
       UI.showToast('A/B pool is not configured on the server. Cannot run comparison.');
       this.state.isStreaming = false;
-      UI.setInputDisabled(false);
+      this.syncABPendingState();
       UI.setStreamingState(false);
       return;
     }
@@ -4089,7 +4193,10 @@ const Chat = {
     const { provider, model } = this.getSelectedProviderAndModel();
 
     // Create side-by-side container using normal message styling
-    UI.addABComparisonContainer(msgIdA, msgIdB, { traceMode });
+    UI.addABComparisonContainer(msgIdA, msgIdB, {
+      traceMode,
+      comparisonKey: `${msgIdA}-${msgIdB}`,
+    });
 
     const armTexts = { a: '', b: '' };
     const armTraces = {
@@ -4118,7 +4225,7 @@ const Chat = {
           const errMsg = event.message || 'A/B stream error';
           UI.showABError(errMsg);
           this.state.isStreaming = false;
-          UI.setInputDisabled(false);
+          this.syncABPendingState();
           UI.setStreamingState(false);
           this.state.abortController = null;
           await this.loadConversations();
@@ -4223,7 +4330,7 @@ const Chat = {
         if (abMeta.arm_b_message_id) {
           UI.rekeyABArm(msgIdB, abMeta.arm_b_message_id);
         }
-        this.state.activeABComparison = {
+        const comparisonState = {
           comparisonId: abMeta.comparison_id,
           responseAId: abMeta.arm_a_message_id,
           responseBId: abMeta.arm_b_message_id,
@@ -4238,8 +4345,8 @@ const Chat = {
           disclosureMode: abMeta.disclosure_mode || disclosureMode,
           traceMode,
         };
-        this.state.abVotePending = true;
-        UI.showABVoteButtons(abMeta.comparison_id);
+        UI.setABComparisonId(comparisonState);
+        this.addPendingABComparison(comparisonState);
       } else {
         UI.showToast('Comparison completed without a recorded vote state. Input has been re-enabled.');
         UI.setInputDisabled(false);
@@ -4254,7 +4361,7 @@ const Chat = {
       console.error('A/B comparison error:', e);
       UI.showABError(e.message || 'Failed to create comparison');
       this.state.isStreaming = false;
-      UI.setInputDisabled(false);
+      this.syncABPendingState();
       UI.setStreamingState(false);
       this.state.abortController = null;
       await this.loadConversations();
@@ -4264,7 +4371,7 @@ const Chat = {
     this.state.isStreaming = false;
     UI.setStreamingState(false);
     this.state.abortController = null;
-    // Keep input disabled until vote
+    this.syncABPendingState();
     await this.loadConversations();
   },
 
@@ -4272,31 +4379,30 @@ const Chat = {
     if (!this.state.activeABComparison) return;
 
     try {
-      const result = await API.submitABPreference(this.state.activeABComparison.comparisonId, preference);
+      const activeComparison = this.state.activeABComparison;
+      const result = await API.submitABPreference(activeComparison.comparisonId, preference);
       if (result?.updated === false) {
-        console.info('A/B preference already recorded for comparison', this.state.activeABComparison.comparisonId);
+        console.info('A/B preference already recorded for comparison', activeComparison.comparisonId);
       }
 
       // Update UI to show result
-      UI.markABWinner(preference, this.state.activeABComparison);
+      UI.markABWinner(preference, activeComparison);
       UI.hideABVoteButtons();
 
       // Add the chosen response to history for context
       let winningText;
       if (preference === 'tie') {
         // For ties, use response A (arbitrary)
-        winningText = this.state.activeABComparison.responseAText;
+        winningText = activeComparison.responseAText;
       } else if (preference === 'b') {
-        winningText = this.state.activeABComparison.responseBText;
+        winningText = activeComparison.responseBText;
       } else {
-        winningText = this.state.activeABComparison.responseAText;
+        winningText = activeComparison.responseAText;
       }
       this.state.history.push(['archi', winningText]);
 
       // Clear A/B state
-      this.state.activeABComparison = null;
-      this.state.abVotePending = false;
-      UI.setInputDisabled(false);
+      this.removePendingABComparison(activeComparison.comparisonId);
       UI.elements.inputField?.focus();
       await this.loadConversations();
     } catch (e) {
@@ -4309,25 +4415,26 @@ const Chat = {
     // Called when user disables A/B mode while vote is pending
     if (!this.state.abVotePending) return;
 
+    const activeComparison = this.state.activeABComparison;
+    if (!activeComparison) return;
+
     // Submit 'tie' as a skip preference so the comparison is resolved in the DB
-    if (this.state.activeABComparison?.comparisonId) {
-      API.submitABPreference(this.state.activeABComparison.comparisonId, 'tie')
+    if (activeComparison.comparisonId) {
+      API.submitABPreference(activeComparison.comparisonId, 'tie')
         .catch(e => console.warn('Failed to submit skip preference:', e));
     }
 
     // Add response A to history as default
-    if (this.state.activeABComparison?.responseAText) {
-      this.state.history.push(['archi', this.state.activeABComparison.responseAText]);
+    if (activeComparison.responseAText) {
+      this.state.history.push(['archi', activeComparison.responseAText]);
     }
 
     // Mark as tie/skipped visually
-    UI.markABWinner('tie', this.state.activeABComparison);
+    UI.markABWinner('tie', activeComparison);
     UI.hideABVoteButtons();
 
     // Clear state
-    this.state.activeABComparison = null;
-    this.state.abVotePending = false;
-    UI.setInputDisabled(false);
+    this.removePendingABComparison(activeComparison.comparisonId);
     UI.showToast('A/B comparison skipped');
   },
 

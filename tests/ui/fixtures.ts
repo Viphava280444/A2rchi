@@ -224,7 +224,7 @@ export async function setupBasicMocks(page: Page) {
   });
 
   // Default: agents list (including ab_only variants for pool editor)
-  await page.route('**/api/agents/list', async (route) => {
+  await page.route('**/api/agents/list*', async (route) => {
     await route.fulfill({ status: 200, json: mockData.agentsList });
   });
 
@@ -251,7 +251,7 @@ export async function setupStreamMock(page: Page, response: string, delay = 0) {
 export async function setupABAdminMocks(page: Page) {
   // Register AFTER setupBasicMocks — Playwright processes routes LIFO,
   // so this handler runs first and the default non-admin one never fires.
-  await page.route('**/api/agents/list', async (route) => {
+  await page.route('**/api/agents/list*', async (route) => {
     await route.fulfill({ status: 200, json: mockData.agentsList });
   });
 
@@ -264,7 +264,7 @@ export async function setupABAdminMocks(page: Page) {
  * Set up route mocks for an admin who has NOT yet enabled a pool.
  */
 export async function setupABAdminInactiveMocks(page: Page) {
-  await page.route('**/api/agents/list', async (route) => {
+  await page.route('**/api/agents/list*', async (route) => {
     await route.fulfill({ status: 200, json: mockData.agentsList });
   });
 

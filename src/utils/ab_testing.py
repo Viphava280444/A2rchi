@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_AB_AGENTS_DIR = "/root/archi/ab_agents"
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,17 @@ class ABVariant:
 class ABPoolError(ValueError):
     """Raised when the ab_testing config is invalid."""
     pass
+
+
+@dataclass(frozen=True)
+class ABPoolLoadState:
+    """Represents the runtime/admin state of the configured A/B pool."""
+
+    pool: Optional["ABPool"]
+    warnings: List[str] = field(default_factory=list)
+    enabled_requested: bool = False
+    agent_dir: str = DEFAULT_AB_AGENTS_DIR
+    agent_dir_configured: bool = False
 
 
 class ABPool:
@@ -323,10 +336,72 @@ def load_ab_pool(config: Dict[str, Any]) -> Optional[ABPool]:
     if isinstance(services.get("ab_testing"), dict):
         logger.warning("Ignoring deprecated services.ab_testing config; use services.chat_app.ab_testing.")
 
+    return load_ab_pool_state(config).pool
+
+
+def resolve_ab_agents_dir(chat_app_config: Dict[str, Any]) -> Tuple[Path, bool]:
+    """Return the resolved A/B agent-spec directory and whether it was explicitly configured."""
+    ab_cfg = (chat_app_config or {}).get("ab_testing") or {}
+    raw_dir = ab_cfg.get("ab_agents_dir")
+    if isinstance(raw_dir, str) and raw_dir.strip():
+        return Path(raw_dir.strip()).expanduser(), True
+    return Path(DEFAULT_AB_AGENTS_DIR), False
+
+
+def load_ab_pool_state(config: Dict[str, Any]) -> ABPoolLoadState:
+    """
+    Inspect the chat_app A/B configuration and return both the active pool
+    (when valid) and non-fatal warnings for incomplete setup.
+    """
+    warnings: List[str] = []
+
+    if isinstance(config.get("ab_testing"), dict):
+        logger.warning("Ignoring deprecated top-level ab_testing config; use services.chat_app.ab_testing.")
+
+    services = config.get("services") or {}
+    if isinstance(services.get("ab_testing"), dict):
+        logger.warning("Ignoring deprecated services.ab_testing config; use services.chat_app.ab_testing.")
+
     chat_app = services.get("chat_app") or {}
+    agent_dir, configured = resolve_ab_agents_dir(chat_app)
     ab_config = chat_app.get("ab_testing")
     if not ab_config or not isinstance(ab_config, dict):
-        return None
-    if not ab_config.get("enabled", False):
-        return None
-    return ABPool.from_config(ab_config)
+        return ABPoolLoadState(pool=None, warnings=[], enabled_requested=False, agent_dir=str(agent_dir), agent_dir_configured=configured)
+
+    enabled_requested = bool(ab_config.get("enabled", False))
+    if enabled_requested and not configured:
+        warnings.append(
+            f"A/B testing is using the default ab_agents_dir '{agent_dir}'. "
+            "Create A/B-only agent specs from the admin UI before the experiment can activate."
+        )
+
+    if not enabled_requested:
+        return ABPoolLoadState(pool=None, warnings=warnings, enabled_requested=False, agent_dir=str(agent_dir), agent_dir_configured=configured)
+
+    try:
+        pool = ABPool.from_config(ab_config)
+    except ABPoolError as exc:
+        warnings.append(
+            "A/B testing is enabled but inactive until configuration is completed in the admin UI. "
+            f"{exc}"
+        )
+        return ABPoolLoadState(pool=None, warnings=warnings, enabled_requested=True, agent_dir=str(agent_dir), agent_dir_configured=configured)
+
+    missing_specs = [
+        variant.agent_spec
+        for variant in pool.variants
+        if not (agent_dir / variant.agent_spec).exists()
+    ]
+    if missing_specs:
+        warnings.append(
+            f"A/B testing is enabled but inactive because the A/B agent pool is missing: {sorted(missing_specs)} in '{agent_dir}'."
+        )
+        return ABPoolLoadState(pool=None, warnings=warnings, enabled_requested=True, agent_dir=str(agent_dir), agent_dir_configured=configured)
+
+    return ABPoolLoadState(
+        pool=pool,
+        warnings=warnings,
+        enabled_requested=True,
+        agent_dir=str(agent_dir),
+        agent_dir_configured=configured,
+    )

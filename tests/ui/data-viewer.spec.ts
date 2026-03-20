@@ -456,15 +456,25 @@ test.describe('Data Viewer Page', () => {
   test('Upload Data link navigates to upload', async ({ page }) => {
     await page.goto('/data');
     
-    const uploadLink = page.getByRole('link', { name: 'Upload Data' });
+    const uploadLink = page.getByRole('link', { name: 'Uploader' });
     await expect(uploadLink).toHaveAttribute('href', '/upload');
   });
 
   test('Database Viewer link navigates to admin', async ({ page }) => {
     await page.goto('/data');
     
-    const dbLink = page.getByRole('link', { name: 'Database Viewer' });
+    const dbLink = page.getByRole('link', { name: 'Postgres' });
     await expect(dbLink).toHaveAttribute('href', '/admin/database');
+  });
+
+  test('header uses labeled actions and hides expand-collapse buttons', async ({ page }) => {
+    await page.goto('/data');
+
+    await expect(page.getByRole('link', { name: 'Uploader' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Postgres' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible();
+    await expect(page.locator('#expand-all-btn')).toHaveCount(0);
+    await expect(page.locator('#collapse-all-btn')).toHaveCount(0);
   });
 
   // ============================================================

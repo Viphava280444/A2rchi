@@ -7,7 +7,7 @@ import yaml
 
 from src.cli.managers.templates_manager import BASE_CONFIG_TEMPLATE
 from src.cli.source_registry import source_registry
-from src.utils.ab_testing import ABPool, ABPoolError
+from src.utils.ab_testing import ABPool, ABPoolError, load_ab_pool_state
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -204,9 +204,27 @@ class ConfigurationManager:
         ab_cfg = chat_cfg.get("ab_testing")
         if not isinstance(ab_cfg, dict) or not ab_cfg.get("enabled", False):
             return
+        state = load_ab_pool_state({"services": {"chat_app": chat_cfg}})
+        for warning in state.warnings:
+            logger.warning("A/B testing config warning: %s", warning)
         try:
             ABPool.from_config(ab_cfg)
         except ABPoolError as exc:
+            incomplete_markers = (
+                "ab_testing.pool must be a mapping",
+                "ab_testing.pool.champion must be a non-empty string",
+                "ab_testing.pool.variants must be a non-empty list",
+                "at least 2 variants",
+                "not found in pool",
+                "must include a string 'label'",
+                "must include a string 'agent_spec'",
+            )
+            if any(marker in str(exc) for marker in incomplete_markers):
+                logger.warning(
+                    "A/B testing config is incomplete and will start inactive until configured in the admin UI: %s",
+                    exc,
+                )
+                return
             raise ValueError(
                 "Invalid field: 'services.chat_app.ab_testing' is misconfigured. "
                 f"{exc}"

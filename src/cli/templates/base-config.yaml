@@ -112,6 +112,9 @@ services:
     {%- if services.chat_app.ab_testing is defined and services.chat_app.ab_testing.enabled | default(false) %}
     ab_testing:
       enabled: {{ services.chat_app.ab_testing.enabled | default(false, true) }}
+      {%- if services.chat_app.ab_testing.ab_agents_dir is defined %}
+      ab_agents_dir: "{{ services.chat_app.ab_testing.ab_agents_dir }}"
+      {%- endif %}
       sample_rate: {{ services.chat_app.ab_testing.sample_rate | default(0.2, true) }}
       disclosure_mode: {{ services.chat_app.ab_testing.disclosure_mode | default("post_vote_reveal", true) }}
       default_trace_mode: {{ services.chat_app.ab_testing.default_trace_mode | default("minimal", true) }}
@@ -122,8 +125,12 @@ services:
       {%- if services.chat_app.ab_testing.target_permissions is defined %}
       target_permissions: {{ services.chat_app.ab_testing.target_permissions | tojson }}
       {%- endif %}
+      {%- if services.chat_app.ab_testing.pool is defined %}
       pool:
+        {%- if services.chat_app.ab_testing.pool.champion is defined %}
         champion: {{ services.chat_app.ab_testing.pool.champion }}
+        {%- endif %}
+        {%- if services.chat_app.ab_testing.pool.variants is defined %}
         variants:
           {%- for v in services.chat_app.ab_testing.pool.variants %}
           - label: {{ v.label }}
@@ -141,6 +148,8 @@ services:
             recursion_limit: {{ v.recursion_limit }}
             {%- endif %}
           {%- endfor %}
+        {%- endif %}
+      {%- endif %}
     {%- endif %}
   data_manager:
     auth:

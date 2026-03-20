@@ -1,14 +1,36 @@
 (function () {
   const ENDPOINTS = {
-    agents: '/api/agents/list',
+    agents: '/api/agents/list?scope=ab',
     pool: '/api/ab/pool',
-    save: '/api/ab/pool/set',
+    saveSettings: '/api/ab/pool/settings/set',
+    saveVariants: '/api/ab/pool/variants/set',
     disable: '/api/ab/pool/disable',
+    providers: '/api/providers',
+    agentTemplate: '/api/agents/template?scope=ab',
+    saveAgent: '/api/agents',
   };
+
+  const SETTINGS_DRAFT_STORAGE_KEY = 'archi_ab_admin_settings_draft_v1';
+  const VARIANTS_DRAFT_STORAGE_KEY = 'archi_ab_admin_variants_draft_v1';
 
   const state = {
     agents: [],
-    form: {
+    providers: [],
+    defaults: {
+      provider: '',
+      model: '',
+      recursion_limit: 50,
+      num_documents_to_retrieve: 5,
+      ab_agents_dir: '',
+      ab_agents_dir_configured: false,
+    },
+    warnings: [],
+    enabledRequested: false,
+    dirty: {
+      settings: false,
+      variants: false,
+    },
+    persisted: {
       enabled: false,
       champion: '',
       sample_rate: 1,
@@ -16,6 +38,19 @@
       default_trace_mode: 'minimal',
       max_pending_per_conversation: 1,
       variants: [],
+    },
+    settingsForm: {
+      champion: '',
+      sample_rate: 1,
+      disclosure_mode: 'post_vote_reveal',
+      default_trace_mode: 'minimal',
+      max_pending_per_conversation: 1,
+    },
+    variantForm: [],
+    modal: {
+      targetIndex: null,
+      tools: [],
+      sourceTemplate: '',
     },
   };
 
@@ -29,8 +64,19 @@
     save: document.getElementById('ab-admin-save'),
     disable: document.getElementById('ab-admin-disable'),
     addVariant: document.getElementById('ab-admin-add-variant'),
+    variantSave: document.getElementById('ab-admin-variant-save'),
     variantList: document.getElementById('ab-admin-variant-list'),
     message: document.getElementById('ab-admin-message'),
+    variantMessage: document.getElementById('ab-admin-variant-message'),
+    warnings: document.getElementById('ab-admin-warnings'),
+    modal: document.getElementById('ab-agent-modal'),
+    modalClose: document.getElementById('ab-agent-modal-close'),
+    modalCancel: document.getElementById('ab-agent-cancel'),
+    modalSave: document.getElementById('ab-agent-save'),
+    modalName: document.getElementById('ab-agent-name'),
+    modalPrompt: document.getElementById('ab-agent-prompt'),
+    modalTools: document.getElementById('ab-agent-tools-list'),
+    modalMessage: document.getElementById('ab-agent-message'),
   };
 
   function escapeHtml(value) {
@@ -62,6 +108,31 @@
     els.message.className = type ? `ab-pool-message ${type}` : 'ab-pool-message';
   }
 
+  function setModalMessage(text, type = '') {
+    if (!els.modalMessage) return;
+    els.modalMessage.textContent = text || '';
+    els.modalMessage.className = type ? `ab-pool-message ${type}` : 'ab-pool-message';
+  }
+
+  function setVariantMessage(text, type = '') {
+    if (!els.variantMessage) return;
+    els.variantMessage.textContent = text || '';
+    els.variantMessage.className = type ? `ab-pool-message ${type}` : 'ab-pool-message';
+  }
+
+  function providerCatalog() {
+    return state.providers.filter((provider) => provider);
+  }
+
+  function getProviderConfig(providerType) {
+    return providerCatalog().find((provider) => provider.type === providerType) || null;
+  }
+
+  function getDefaultModelForProvider(providerType) {
+    const provider = getProviderConfig(providerType);
+    return provider?.default_model || '';
+  }
+
   function normalizeVariant(variant = {}) {
     return {
       label: String(variant.label || '').trim(),
@@ -70,11 +141,26 @@
       model: String(variant.model || '').trim(),
       recursion_limit: variant.recursion_limit ?? '',
       num_documents_to_retrieve: variant.num_documents_to_retrieve ?? '',
+      _custom_model: false,
+    };
+  }
+
+  function normalizeDefaults(defaults = {}) {
+    return {
+      provider: String(defaults.provider || '').trim(),
+      model: String(defaults.model || '').trim(),
+      recursion_limit: Number(defaults.recursion_limit ?? 50),
+      num_documents_to_retrieve: Number(defaults.num_documents_to_retrieve ?? 5),
+      ab_agents_dir: String(defaults.ab_agents_dir || '').trim(),
+      ab_agents_dir_configured: defaults.ab_agents_dir_configured === true,
     };
   }
 
   function normalizePool(pool = {}) {
-    const details = Array.isArray(pool.variant_details) ? pool.variant_details : [];
+    let details = Array.isArray(pool.variant_details) ? pool.variant_details : [];
+    if (!details.length && Array.isArray(pool.variants) && pool.variants.some((entry) => entry && typeof entry === 'object')) {
+      details = pool.variants;
+    }
     return {
       enabled: pool.enabled === true,
       champion: String(pool.champion || '').trim(),
@@ -86,8 +172,117 @@
     };
   }
 
+  function cloneData(data) {
+    return JSON.parse(JSON.stringify(data));
+  }
+
+  function extractSettings(pool = {}) {
+    return {
+      champion: String(pool.champion || '').trim(),
+      sample_rate: Number(pool.sample_rate ?? 1),
+      disclosure_mode: pool.disclosure_mode || 'post_vote_reveal',
+      default_trace_mode: pool.default_trace_mode || 'minimal',
+      max_pending_per_conversation: Number(pool.max_pending_per_conversation ?? 1),
+    };
+  }
+
+  function saveSettingsDraft() {
+    try {
+      localStorage.setItem(SETTINGS_DRAFT_STORAGE_KEY, JSON.stringify({
+        settings: state.settingsForm,
+        timestamp: Date.now(),
+      }));
+    } catch (error) {
+      console.warn('Failed to persist A/B settings draft:', error);
+    }
+  }
+
+  function saveVariantsDraft() {
+    try {
+      localStorage.setItem(VARIANTS_DRAFT_STORAGE_KEY, JSON.stringify({
+        variants: state.variantForm,
+        timestamp: Date.now(),
+      }));
+    } catch (error) {
+      console.warn('Failed to persist A/B variants draft:', error);
+    }
+  }
+
+  function clearSettingsDraft() {
+    try {
+      localStorage.removeItem(SETTINGS_DRAFT_STORAGE_KEY);
+    } catch (error) {
+      console.warn('Failed to clear A/B settings draft:', error);
+    }
+  }
+
+  function clearVariantsDraft() {
+    try {
+      localStorage.removeItem(VARIANTS_DRAFT_STORAGE_KEY);
+    } catch (error) {
+      console.warn('Failed to clear A/B variants draft:', error);
+    }
+  }
+
+  function loadSettingsDraft() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_DRAFT_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || !parsed.settings) return null;
+      return parsed.settings;
+    } catch (error) {
+      console.warn('Failed to load A/B settings draft:', error);
+      return null;
+    }
+  }
+
+  function loadVariantsDraft() {
+    try {
+      const raw = localStorage.getItem(VARIANTS_DRAFT_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.variants)) return null;
+      return parsed.variants;
+    } catch (error) {
+      console.warn('Failed to load A/B variants draft:', error);
+      return null;
+    }
+  }
+
+  function setSettingsDirty(dirty) {
+    state.dirty.settings = dirty;
+    if (dirty) {
+      saveSettingsDraft();
+    } else {
+      clearSettingsDraft();
+    }
+  }
+
+  function setVariantsDirty(dirty) {
+    state.dirty.variants = dirty;
+    if (dirty) {
+      saveVariantsDraft();
+    } else {
+      clearVariantsDraft();
+    }
+  }
+
+  function renderWarnings() {
+    if (!els.warnings) return;
+    if (!state.warnings.length) {
+      els.warnings.style.display = 'none';
+      els.warnings.innerHTML = '';
+      return;
+    }
+    els.warnings.style.display = '';
+    els.warnings.innerHTML = state.warnings.map((warning) => (
+      `<div class="ab-admin-warning-item">${escapeHtml(warning)}</div>`
+    )).join('');
+  }
+
   function uniqueLabel(baseLabel) {
-    const used = new Set(state.form.variants.map((variant) => variant.label));
+    const used = new Set(state.variantForm.map((variant) => variant.label));
     let candidate = baseLabel || 'Variant';
     if (!used.has(candidate)) return candidate;
     let index = 2;
@@ -98,50 +293,74 @@
   }
 
   function currentLabels() {
-    return state.form.variants
+    return state.variantForm
+      .map((variant) => String(variant.label || '').trim())
+      .filter(Boolean);
+  }
+
+  function persistedLabels() {
+    return (state.persisted.variants || [])
       .map((variant) => String(variant.label || '').trim())
       .filter(Boolean);
   }
 
   function syncChampionOptions() {
     if (!els.champion) return;
-    const labels = currentLabels();
-    const champion = labels.includes(state.form.champion) ? state.form.champion : (labels[0] || '');
-    state.form.champion = champion;
+    const labels = persistedLabels();
+    const champion = labels.includes(state.settingsForm.champion) ? state.settingsForm.champion : (labels[0] || '');
+    state.settingsForm.champion = champion;
     els.champion.innerHTML = labels.map((label) => (
       `<option value="${escapeHtml(label)}"${label === champion ? ' selected' : ''}>${escapeHtml(label)}</option>`
     )).join('');
     els.champion.disabled = labels.length === 0;
   }
 
-  function validateForm() {
-    const labels = currentLabels();
-    if (state.form.variants.length < 2) {
-      return { valid: false, message: 'Add at least 2 variants to save the pool.' };
+  function validateSettingsForm() {
+    const labels = persistedLabels();
+    if (labels.length < 2) {
+      return { valid: false, message: 'Save at least 2 variants before saving experiment settings.' };
     }
-    if (labels.length !== state.form.variants.length) {
-      return { valid: false, message: 'Every variant needs a non-empty label.' };
+    if (!labels.includes(state.settingsForm.champion)) {
+      return { valid: false, message: 'Champion must match one of the saved variants.' };
     }
-    if (new Set(labels).size !== labels.length) {
-      return { valid: false, message: 'Variant labels must be unique.' };
-    }
-    if (state.form.variants.some((variant) => !String(variant.agent_spec || '').trim())) {
-      return { valid: false, message: 'Every variant needs an agent markdown file.' };
-    }
-    if (!labels.includes(state.form.champion)) {
-      return { valid: false, message: 'Champion must match one of the variant labels.' };
-    }
-    if (!Number.isFinite(state.form.sample_rate) || state.form.sample_rate < 0 || state.form.sample_rate > 1) {
+    if (!Number.isFinite(state.settingsForm.sample_rate) || state.settingsForm.sample_rate < 0 || state.settingsForm.sample_rate > 1) {
       return { valid: false, message: 'Sampling rate must be between 0 and 1.' };
     }
-    if (!Number.isInteger(state.form.max_pending_per_conversation) || state.form.max_pending_per_conversation < 1) {
+    if (!Number.isInteger(state.settingsForm.max_pending_per_conversation) || state.settingsForm.max_pending_per_conversation < 1) {
       return { valid: false, message: 'Max pending per conversation must be at least 1.' };
     }
     return { valid: true, message: '' };
   }
 
-  function updateSaveState() {
-    const validation = validateForm();
+  function validateVariantsForm() {
+    const labels = currentLabels();
+    if (state.variantForm.length < 2) {
+      return { valid: false, message: 'Add at least 2 variants to save the variants list.' };
+    }
+    if (labels.length !== state.variantForm.length) {
+      return { valid: false, message: 'Every variant needs a non-empty label.' };
+    }
+    if (new Set(labels).size !== labels.length) {
+      return { valid: false, message: 'Variant labels must be unique.' };
+    }
+    if (state.variantForm.some((variant) => !String(variant.agent_spec || '').trim())) {
+      return { valid: false, message: 'Every variant needs an A/B agent markdown file.' };
+    }
+    for (const variant of state.variantForm) {
+      const providerType = String(variant.provider || '').trim();
+      const modelValue = String(variant.model || '').trim();
+      if (providerType && !getProviderConfig(providerType)) {
+        return { valid: false, message: `Variant '${variant.label || 'untitled'}' uses an unknown provider.` };
+      }
+      if (providerType && variant._custom_model === true && !modelValue) {
+        return { valid: false, message: `Variant '${variant.label || 'untitled'}' needs a custom model value.` };
+      }
+    }
+    return { valid: true, message: '' };
+  }
+
+  function updateSettingsSaveState() {
+    const validation = validateSettingsForm();
     if (els.save) {
       els.save.disabled = !validation.valid;
     }
@@ -152,93 +371,229 @@
     }
   }
 
+  function updateVariantSaveState() {
+    const validation = validateVariantsForm();
+    if (els.variantSave) {
+      els.variantSave.disabled = !validation.valid;
+    }
+    if (!validation.valid) {
+      setVariantMessage(validation.message, 'error');
+    } else if (els.variantMessage?.classList.contains('error')) {
+      setVariantMessage('');
+    }
+  }
+
+  function providerOptionsHtml(selectedProvider) {
+    const inherited = state.defaults.provider || 'deployment default';
+    const options = [
+      `<option value="">Use default (${escapeHtml(inherited)})</option>`,
+    ];
+    for (const provider of providerCatalog()) {
+      options.push(
+        `<option value="${escapeHtml(provider.type)}"${provider.type === selectedProvider ? ' selected' : ''}>${escapeHtml(provider.display_name || provider.type)}${provider.enabled === false ? ' (disabled)' : ''}</option>`
+      );
+    }
+    return options.join('');
+  }
+
+  function buildModelSelectState(variant) {
+    const providerType = String(variant.provider || '').trim();
+    if (!providerType) {
+      return {
+        disabled: true,
+        selectedValue: '',
+        customVisible: false,
+        customValue: '',
+        options: `<option value="">Use default (${escapeHtml(state.defaults.model || 'deployment default')})</option>`,
+      };
+    }
+    const provider = getProviderConfig(providerType);
+    const models = Array.isArray(provider?.models) ? provider.models : [];
+    const modelValue = String(variant.model || '').trim();
+    const known = models.some((model) => model.id === modelValue);
+    const usingCustom = variant._custom_model === true || (Boolean(modelValue) && !known);
+    const providerDefault = provider?.default_model || state.defaults.model || 'provider default';
+    const options = [
+      `<option value="">Use provider default (${escapeHtml(providerDefault)})</option>`,
+      ...models.map((model) => (
+        `<option value="${escapeHtml(model.id)}"${model.id === modelValue ? ' selected' : ''}>${escapeHtml(model.display_name || model.name || model.id)}</option>`
+      )),
+      `<option value="__custom__"${usingCustom ? ' selected' : ''}>Custom model…</option>`,
+    ].join('');
+    return {
+      disabled: false,
+      selectedValue: usingCustom ? '__custom__' : modelValue,
+      customVisible: usingCustom,
+      customValue: usingCustom ? modelValue : '',
+      options,
+    };
+  }
+
   function agentOptionsHtml(selectedFilename) {
-    return state.agents.map((agent) => {
-      const selected = agent.filename === selectedFilename ? ' selected' : '';
-      const suffix = agent.ab_only ? ' [AB]' : '';
-      return `<option value="${escapeHtml(agent.filename)}"${selected}>${escapeHtml(agent.name)} (${escapeHtml(agent.filename)})${escapeHtml(suffix)}</option>`;
-    }).join('');
+    const options = ['<option value="">Select an A/B agent markdown</option>'];
+    for (const agent of state.agents) {
+      options.push(
+        `<option value="${escapeHtml(agent.filename)}"${agent.filename === selectedFilename ? ' selected' : ''}>${escapeHtml(agent.name)} (${escapeHtml(agent.filename)})</option>`
+      );
+    }
+    options.push('<option value="__create_new__">Add new A/B agent…</option>');
+    return options.join('');
   }
 
   function renderVariants() {
     if (!els.variantList) return;
-    if (!state.form.variants.length) {
+    if (!state.variantForm.length) {
       els.variantList.innerHTML = `
         <div class="ab-admin-empty-state">
           <strong>No variants configured.</strong>
           <span>Add at least two variants to enable champion/challenger comparisons.</span>
         </div>
       `;
-      syncChampionOptions();
-      updateSaveState();
+      updateVariantSaveState();
       return;
     }
 
-    els.variantList.innerHTML = state.form.variants.map((variant, index) => `
-      <article class="ab-variant-card" data-index="${index}">
-        <div class="ab-variant-card-header">
-          <div>
-            <h3>Variant ${index + 1}</h3>
-            <p>Configure the experiment label and concrete markdown file for this arm.</p>
+    els.variantList.innerHTML = state.variantForm.map((variant, index) => {
+      const modelState = buildModelSelectState(variant);
+      return `
+        <article class="ab-variant-card" data-index="${index}">
+          <div class="ab-variant-card-header">
+            <div>
+              <h3>Variant ${index + 1}</h3>
+              <p>Configure the experiment label, isolated A/B agent spec, and optional runtime overrides.</p>
+            </div>
+            <button class="ab-variant-remove" type="button" data-remove="${index}">Remove</button>
           </div>
-          <button class="ab-variant-remove" type="button" data-remove="${index}">Remove</button>
-        </div>
-        <div class="ab-variant-grid">
-          <label class="ab-admin-field">
-            <span>Label</span>
-            <input type="text" data-field="label" value="${escapeHtml(variant.label)}" placeholder="baseline">
-          </label>
-          <label class="ab-admin-field">
-            <span>Agent Spec</span>
-            <select data-field="agent_spec">
-              <option value="">Select an agent markdown</option>
-              ${agentOptionsHtml(variant.agent_spec)}
-            </select>
-          </label>
-          <label class="ab-admin-field">
-            <span>Provider Override</span>
-            <input type="text" data-field="provider" value="${escapeHtml(variant.provider)}" placeholder="default">
-          </label>
-          <label class="ab-admin-field">
-            <span>Model Override</span>
-            <input type="text" data-field="model" value="${escapeHtml(variant.model)}" placeholder="default">
-          </label>
-          <label class="ab-admin-field">
-            <span>Recursion Limit</span>
-            <input type="number" data-field="recursion_limit" min="1" step="1" value="${escapeHtml(variant.recursion_limit)}" placeholder="default">
-          </label>
-          <label class="ab-admin-field">
-            <span>Document Retrieval Override</span>
-            <input type="number" data-field="num_documents_to_retrieve" min="1" step="1" value="${escapeHtml(variant.num_documents_to_retrieve)}" placeholder="default">
-          </label>
-        </div>
-      </article>
-    `).join('');
+          <div class="ab-variant-grid">
+            <label class="ab-admin-field">
+              <span>Label</span>
+              <input type="text" data-field="label" value="${escapeHtml(variant.label)}" placeholder="baseline">
+            </label>
+            <div class="ab-admin-field">
+              <span>Agent Spec</span>
+              <div class="ab-agent-select-row">
+                <select data-field="agent_spec">
+                  ${agentOptionsHtml(variant.agent_spec)}
+                </select>
+              </div>
+            </div>
+            <label class="ab-admin-field">
+              <span>Provider Override</span>
+              <select data-field="provider">
+                ${providerOptionsHtml(variant.provider)}
+              </select>
+            </label>
+            <div class="ab-admin-field">
+              <span>Model Override</span>
+              <div class="ab-model-control">
+                <select data-field="model_select" ${modelState.disabled ? 'disabled' : ''}>
+                  ${modelState.options}
+                </select>
+                <input
+                  type="text"
+                  data-field="model_custom"
+                  value="${escapeHtml(modelState.customValue)}"
+                  placeholder="${escapeHtml((getDefaultModelForProvider(variant.provider) || state.defaults.model || 'custom-model') + ' (default)')}"
+                  style="${modelState.customVisible ? '' : 'display:none;'}"
+                >
+              </div>
+            </div>
+            <label class="ab-admin-field">
+              <span>Recursion Limit</span>
+              <input
+                type="number"
+                data-field="recursion_limit"
+                min="1"
+                step="1"
+                value="${escapeHtml(variant.recursion_limit)}"
+                placeholder="${escapeHtml(String(state.defaults.recursion_limit) + ' (default)')}"
+              >
+            </label>
+            <label class="ab-admin-field">
+              <span>Document Retrieval Override</span>
+              <input
+                type="number"
+                data-field="num_documents_to_retrieve"
+                min="1"
+                step="1"
+                value="${escapeHtml(variant.num_documents_to_retrieve)}"
+                placeholder="${escapeHtml(String(state.defaults.num_documents_to_retrieve) + ' (default)')}"
+              >
+            </label>
+          </div>
+        </article>
+      `;
+    }).join('');
 
-    syncChampionOptions();
-    updateSaveState();
+    updateVariantSaveState();
   }
 
   function renderForm() {
     if (els.status) {
-      els.status.textContent = state.form.enabled ? 'Active' : 'Inactive';
-      els.status.classList.toggle('active', state.form.enabled);
+      els.status.textContent = state.persisted.enabled ? 'Active' : 'Inactive';
+      els.status.classList.toggle('active', state.persisted.enabled);
     }
-    if (els.sampleRate) els.sampleRate.value = String(state.form.sample_rate ?? 1);
-    if (els.disclosureMode) els.disclosureMode.value = state.form.disclosure_mode || 'post_vote_reveal';
-    if (els.traceMode) els.traceMode.value = state.form.default_trace_mode || 'minimal';
-    if (els.maxPending) els.maxPending.value = String(state.form.max_pending_per_conversation ?? 1);
-    if (els.disable) els.disable.style.display = state.form.enabled ? '' : 'none';
+    if (els.sampleRate) els.sampleRate.value = String(state.settingsForm.sample_rate ?? 1);
+    if (els.disclosureMode) els.disclosureMode.value = state.settingsForm.disclosure_mode || 'post_vote_reveal';
+    if (els.traceMode) els.traceMode.value = state.settingsForm.default_trace_mode || 'minimal';
+    if (els.maxPending) els.maxPending.value = String(state.settingsForm.max_pending_per_conversation ?? 1);
+    if (els.disable) els.disable.style.display = state.enabledRequested ? '' : 'none';
+    renderWarnings();
+    syncChampionOptions();
     renderVariants();
+    updateSettingsSaveState();
+  }
+
+  function applyPoolResponseMeta(poolResponse = {}) {
+    state.defaults = normalizeDefaults(poolResponse.defaults || state.defaults || {});
+    state.warnings = Array.isArray(poolResponse.warnings) ? poolResponse.warnings : [];
+    state.enabledRequested = poolResponse.enabled_requested === true;
+  }
+
+  async function loadAgents() {
+    const agentsResponse = await fetchJson(ENDPOINTS.agents);
+    state.agents = Array.isArray(agentsResponse.agents) ? agentsResponse.agents : [];
+  }
+
+  function applyPersistedPool(pool = {}, options = {}) {
+    const {
+      useSettingsDraft = true,
+      useVariantsDraft = true,
+    } = options;
+    state.persisted = normalizePool(pool);
+
+    const settingsDraft = useSettingsDraft ? loadSettingsDraft() : null;
+    if (settingsDraft) {
+      state.settingsForm = extractSettings(settingsDraft);
+      state.dirty.settings = true;
+      setMessage('Restored unsaved experiment settings.', 'success');
+    } else {
+      state.settingsForm = extractSettings(state.persisted);
+      state.dirty.settings = false;
+      setMessage('');
+    }
+
+    const variantsDraft = useVariantsDraft ? loadVariantsDraft() : null;
+    if (variantsDraft) {
+      state.variantForm = variantsDraft.map(normalizeVariant);
+      state.dirty.variants = true;
+      setVariantMessage('Restored unsaved variant changes.', 'success');
+    } else {
+      state.variantForm = (state.persisted.variants || []).map(normalizeVariant);
+      state.dirty.variants = false;
+      setVariantMessage('');
+    }
   }
 
   async function loadState() {
-    const [agentsResponse, poolResponse] = await Promise.all([
-      fetchJson(ENDPOINTS.agents),
+    const [poolResponse, providersResponse] = await Promise.all([
       fetchJson(ENDPOINTS.pool),
+      fetchJson(ENDPOINTS.providers),
     ]);
-    state.agents = Array.isArray(agentsResponse.agents) ? agentsResponse.agents : [];
-    state.form = normalizePool(poolResponse);
+    await loadAgents();
+    state.providers = Array.isArray(providersResponse.providers) ? providersResponse.providers : [];
+    applyPoolResponseMeta(poolResponse);
+    applyPersistedPool(poolResponse);
     renderForm();
   }
 
@@ -249,39 +604,53 @@
     return Number.isFinite(parsed) ? parsed : null;
   }
 
-  function collectPayload() {
+  function collectSettingsPayload() {
     return {
-      champion: state.form.champion,
-      sample_rate: state.form.sample_rate,
-      disclosure_mode: state.form.disclosure_mode,
-      default_trace_mode: state.form.default_trace_mode,
-      max_pending_per_conversation: state.form.max_pending_per_conversation,
-      variants: state.form.variants.map((variant) => ({
-        label: String(variant.label || '').trim(),
-        agent_spec: String(variant.agent_spec || '').trim(),
-        provider: String(variant.provider || '').trim() || null,
-        model: String(variant.model || '').trim() || null,
-        recursion_limit: readOptionalInt(variant.recursion_limit),
-        num_documents_to_retrieve: readOptionalInt(variant.num_documents_to_retrieve),
-      })),
+      champion: state.settingsForm.champion,
+      sample_rate: state.settingsForm.sample_rate,
+      disclosure_mode: state.settingsForm.disclosure_mode,
+      default_trace_mode: state.settingsForm.default_trace_mode,
+      max_pending_per_conversation: state.settingsForm.max_pending_per_conversation,
+    };
+  }
+
+  function collectVariantPayload() {
+    return {
+      variants: state.variantForm.map((variant) => {
+        const provider = String(variant.provider || '').trim();
+        let model = String(variant.model || '').trim();
+        if (provider && !model) {
+          model = getDefaultModelForProvider(provider);
+        }
+        return {
+          label: String(variant.label || '').trim(),
+          agent_spec: String(variant.agent_spec || '').trim(),
+          provider: provider || null,
+          model: model || null,
+          recursion_limit: readOptionalInt(variant.recursion_limit),
+          num_documents_to_retrieve: readOptionalInt(variant.num_documents_to_retrieve),
+        };
+      }),
     };
   }
 
   function addVariant() {
     const firstAgent = state.agents[0] || {};
-    state.form.variants.push({
+    state.variantForm.push({
       label: uniqueLabel(firstAgent.name || 'Variant'),
       agent_spec: firstAgent.filename || '',
       provider: '',
       model: '',
       recursion_limit: '',
       num_documents_to_retrieve: '',
+      _custom_model: false,
     });
+    setVariantsDirty(true);
     renderVariants();
   }
 
-  async function savePool() {
-    const validation = validateForm();
+  async function saveSettings() {
+    const validation = validateSettingsForm();
     if (!validation.valid) {
       setMessage(validation.message, 'error');
       return;
@@ -289,31 +658,76 @@
     els.save.disabled = true;
     els.save.textContent = 'Saving…';
     try {
-      const result = await fetchJson(ENDPOINTS.save, {
+      const poolResponse = await fetchJson(ENDPOINTS.saveSettings, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(collectPayload()),
+        body: JSON.stringify(collectSettingsPayload()),
       });
-      state.form = normalizePool(result);
-      setMessage('A/B configuration saved.', 'success');
+      setSettingsDirty(false);
+      applyPoolResponseMeta(poolResponse);
+      applyPersistedPool(poolResponse, {
+        useSettingsDraft: false,
+        useVariantsDraft: state.dirty.variants,
+      });
       renderForm();
+      setMessage('Experiment settings saved.', 'success');
     } catch (error) {
-      setMessage(error.message || 'Failed to save A/B configuration.', 'error');
+      setMessage(error.message || 'Failed to save experiment settings.', 'error');
     } finally {
       els.save.textContent = 'Save Configuration';
-      updateSaveState();
+      updateSettingsSaveState();
+    }
+  }
+
+  async function saveVariants() {
+    const validation = validateVariantsForm();
+    if (!validation.valid) {
+      setVariantMessage(validation.message, 'error');
+      return;
+    }
+    if (els.variantSave) {
+      els.variantSave.disabled = true;
+      els.variantSave.textContent = 'Saving…';
+    }
+    try {
+      const poolResponse = await fetchJson(ENDPOINTS.saveVariants, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(collectVariantPayload()),
+      });
+      setVariantsDirty(false);
+      applyPoolResponseMeta(poolResponse);
+      applyPersistedPool(poolResponse, {
+        useSettingsDraft: state.dirty.settings,
+        useVariantsDraft: false,
+      });
+      renderForm();
+      setVariantMessage('Variants saved.', 'success');
+    } catch (error) {
+      setVariantMessage(error.message || 'Failed to save variants.', 'error');
+    } finally {
+      if (els.variantSave) {
+        els.variantSave.textContent = 'Save Variants';
+      }
+      updateVariantSaveState();
     }
   }
 
   async function disablePool() {
     els.disable.disabled = true;
     try {
-      await fetchJson(ENDPOINTS.disable, {
+      const poolResponse = await fetchJson(ENDPOINTS.disable, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });
-      await loadState();
-      setMessage('A/B testing disabled. Variant settings remain available for editing.', 'success');
+      setSettingsDirty(false);
+      applyPoolResponseMeta(poolResponse);
+      applyPersistedPool(poolResponse, {
+        useSettingsDraft: false,
+        useVariantsDraft: state.dirty.variants,
+      });
+      renderForm();
+      setMessage('A/B testing disabled. Variant settings remain available for later reactivation.', 'success');
     } catch (error) {
       setMessage(error.message || 'Failed to disable A/B testing.', 'error');
     } finally {
@@ -321,64 +735,231 @@
     }
   }
 
+  function serialiseAgentSpec(name, tools, prompt) {
+    let yaml = `---\nname: ${name}\nab_only: true\n`;
+    if (tools.length) {
+      yaml += 'tools:\n';
+      for (const tool of tools) yaml += `  - ${tool}\n`;
+    }
+    yaml += '---\n\n';
+    return yaml + String(prompt || '').trim();
+  }
+
+  async function openCreateAgentModal(targetIndex = null) {
+    state.modal.targetIndex = Number.isInteger(targetIndex) ? targetIndex : null;
+    setModalMessage('');
+    if (els.modalName) els.modalName.value = '';
+    if (els.modalPrompt) els.modalPrompt.value = '';
+    if (els.modalTools) els.modalTools.innerHTML = '<div class="ab-admin-empty-state">Loading template…</div>';
+    if (els.modal) els.modal.style.display = '';
+    try {
+      const template = await fetchJson(`${ENDPOINTS.agentTemplate}&name=${encodeURIComponent('New A/B Agent')}`);
+      state.modal.tools = Array.isArray(template.tools) ? template.tools : [];
+      state.modal.sourceTemplate = String(template.template || '');
+      if (els.modalPrompt) {
+        const match = state.modal.sourceTemplate.match(/^---\s*\n[\s\S]*?\n---\s*\n?([\s\S]*)$/);
+        els.modalPrompt.value = (match ? match[1] : '').trim();
+      }
+      if (els.modalTools) {
+        els.modalTools.innerHTML = state.modal.tools.map((tool) => `
+          <label class="ab-agent-tool-item">
+            <input type="checkbox" value="${escapeHtml(tool.name)}" checked>
+            <span>${escapeHtml(tool.name)}</span>
+            <small>${escapeHtml(tool.description || '')}</small>
+          </label>
+        `).join('');
+      }
+    } catch (error) {
+      setModalMessage(error.message || 'Unable to load A/B agent template.', 'error');
+    }
+  }
+
+  function closeCreateAgentModal() {
+    if (els.modal) els.modal.style.display = 'none';
+    state.modal.targetIndex = null;
+    setModalMessage('');
+  }
+
+  async function saveNewAgent() {
+    const name = String(els.modalName?.value || '').trim();
+    const prompt = String(els.modalPrompt?.value || '').trim();
+    const tools = [...(els.modalTools?.querySelectorAll('input[type="checkbox"]:checked') || [])].map((checkbox) => checkbox.value);
+    if (!name) {
+      setModalMessage('Agent name is required.', 'error');
+      els.modalName?.focus();
+      return;
+    }
+    if (!prompt) {
+      setModalMessage('Prompt is required.', 'error');
+      els.modalPrompt?.focus();
+      return;
+    }
+
+    els.modalSave.disabled = true;
+    els.modalSave.textContent = 'Creating…';
+    try {
+      const content = serialiseAgentSpec(name, tools, prompt);
+      const response = await fetchJson(ENDPOINTS.saveAgent, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          scope: 'ab',
+          mode: 'create',
+          content,
+        }),
+      });
+      await loadAgents();
+      if (Number.isInteger(state.modal.targetIndex) && state.variantForm[state.modal.targetIndex]) {
+        state.variantForm[state.modal.targetIndex].agent_spec = response.filename;
+        if (!state.variantForm[state.modal.targetIndex].label) {
+          state.variantForm[state.modal.targetIndex].label = uniqueLabel(response.name);
+        }
+        setVariantsDirty(true);
+        renderVariants();
+      }
+      closeCreateAgentModal();
+      setVariantMessage(`Created A/B agent '${response.name}'.`, 'success');
+    } catch (error) {
+      setModalMessage(error.message || 'Unable to create A/B agent.', 'error');
+    } finally {
+      els.modalSave.disabled = false;
+      els.modalSave.textContent = 'Create Agent';
+    }
+  }
+
+  function handleVariantFieldChange(target, isInputEvent = false) {
+    const card = target.closest('.ab-variant-card');
+    if (!card) return;
+    const index = Number.parseInt(card.dataset.index || '-1', 10);
+    const field = target.dataset.field;
+    if (!state.variantForm[index] || !field) return;
+    const variant = state.variantForm[index];
+
+    if (field === 'provider') {
+      variant.provider = target.value;
+      if (!variant.provider) {
+        variant.model = '';
+        variant._custom_model = false;
+      } else {
+        const provider = getProviderConfig(variant.provider);
+        const models = Array.isArray(provider?.models) ? provider.models : [];
+        if (!models.some((model) => model.id === variant.model)) {
+          variant.model = '';
+        }
+        variant._custom_model = false;
+      }
+      setVariantsDirty(true);
+      renderVariants();
+      return;
+    }
+
+    if (field === 'model_select') {
+      if (target.value === '__custom__') {
+        variant._custom_model = true;
+        if (!String(variant.model || '').trim() || getProviderConfig(variant.provider)?.models?.some((model) => model.id === variant.model)) {
+          variant.model = '';
+        }
+      } else {
+        variant._custom_model = false;
+        variant.model = target.value;
+      }
+      setVariantsDirty(true);
+      renderVariants();
+      return;
+    }
+
+    if (field === 'model_custom') {
+      variant.model = target.value;
+      setVariantsDirty(true);
+      updateVariantSaveState();
+      return;
+    }
+
+    if (field === 'agent_spec') {
+      if (target.value === '__create_new__') {
+        openCreateAgentModal(index);
+        renderVariants();
+        return;
+      }
+      variant.agent_spec = target.value;
+      setVariantsDirty(true);
+      renderVariants();
+      return;
+    }
+
+    variant[field] = target.value;
+    setVariantsDirty(true);
+    if (!isInputEvent) {
+      renderVariants();
+      return;
+    }
+    updateVariantSaveState();
+  }
+
   function bindEvents() {
     els.sampleRate?.addEventListener('input', (event) => {
-      state.form.sample_rate = Number(event.target.value);
-      updateSaveState();
+      state.settingsForm.sample_rate = Number(event.target.value);
+      setSettingsDirty(true);
+      updateSettingsSaveState();
     });
     els.disclosureMode?.addEventListener('change', (event) => {
-      state.form.disclosure_mode = event.target.value;
-      updateSaveState();
+      state.settingsForm.disclosure_mode = event.target.value;
+      setSettingsDirty(true);
+      updateSettingsSaveState();
     });
     els.traceMode?.addEventListener('change', (event) => {
-      state.form.default_trace_mode = event.target.value;
-      updateSaveState();
+      state.settingsForm.default_trace_mode = event.target.value;
+      setSettingsDirty(true);
+      updateSettingsSaveState();
     });
     els.maxPending?.addEventListener('input', (event) => {
-      state.form.max_pending_per_conversation = Number.parseInt(event.target.value || '0', 10);
-      updateSaveState();
+      state.settingsForm.max_pending_per_conversation = Number.parseInt(event.target.value || '0', 10);
+      setSettingsDirty(true);
+      updateSettingsSaveState();
     });
     els.champion?.addEventListener('change', (event) => {
-      state.form.champion = event.target.value;
-      updateSaveState();
+      state.settingsForm.champion = event.target.value;
+      setSettingsDirty(true);
+      updateSettingsSaveState();
     });
     els.addVariant?.addEventListener('click', addVariant);
-    els.save?.addEventListener('click', savePool);
+    els.variantSave?.addEventListener('click', saveVariants);
+    els.save?.addEventListener('click', saveSettings);
     els.disable?.addEventListener('click', disablePool);
+    els.modalClose?.addEventListener('click', closeCreateAgentModal);
+    els.modalCancel?.addEventListener('click', closeCreateAgentModal);
+    els.modalSave?.addEventListener('click', saveNewAgent);
+    els.modal?.addEventListener('click', (event) => {
+      if (event.target?.dataset?.closeModal === 'true') {
+        closeCreateAgentModal();
+      }
+    });
 
     els.variantList?.addEventListener('input', (event) => {
-      const card = event.target.closest('.ab-variant-card');
-      if (!card) return;
-      const index = Number.parseInt(card.dataset.index || '-1', 10);
-      const field = event.target.dataset.field;
-      if (!state.form.variants[index] || !field) return;
-      state.form.variants[index][field] = event.target.value;
-      if (field === 'label') {
-        syncChampionOptions();
-      }
-      updateSaveState();
+      handleVariantFieldChange(event.target, true);
     });
 
     els.variantList?.addEventListener('change', (event) => {
-      const card = event.target.closest('.ab-variant-card');
-      if (!card) return;
-      const index = Number.parseInt(card.dataset.index || '-1', 10);
-      const field = event.target.dataset.field;
-      if (!state.form.variants[index] || !field) return;
-      state.form.variants[index][field] = event.target.value;
-      if (field === 'label') {
-        syncChampionOptions();
-      }
-      updateSaveState();
+      handleVariantFieldChange(event.target, false);
     });
 
     els.variantList?.addEventListener('click', (event) => {
-      const button = event.target.closest('[data-remove]');
-      if (!button) return;
-      const index = Number.parseInt(button.dataset.remove || '-1', 10);
-      if (index < 0) return;
-      state.form.variants.splice(index, 1);
-      renderVariants();
+      const removeButton = event.target.closest('[data-remove]');
+      if (removeButton) {
+        const index = Number.parseInt(removeButton.dataset.remove || '-1', 10);
+        if (index >= 0) {
+          state.variantForm.splice(index, 1);
+          setVariantsDirty(true);
+          renderVariants();
+        }
+        return;
+      }
+    });
+
+    window.addEventListener('beforeunload', (event) => {
+      if (!state.dirty.settings && !state.dirty.variants) return;
+      event.preventDefault();
+      event.returnValue = '';
     });
   }
 

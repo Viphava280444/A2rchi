@@ -56,7 +56,7 @@ def cli():
 @click.option('--dry', '--dry-run', is_flag=True, help="Validate configuration and show what would be created without actually deploying")
 def create(name: str, config_files: list, config_dir: str, env_file: str, services: list,
            force: bool, dry: bool, verbosity: int, **other_flags):
-    """Create an ARCHI deployment with selected services and data sources."""
+    """Create an Archi deployment with selected services and data sources."""
 
     if not (bool(config_files) ^ bool(config_dir)): 
         raise click.ClickException(f"Must specify only one of config files or config dir")
@@ -66,7 +66,7 @@ def create(name: str, config_files: list, config_dir: str, env_file: str, servic
     if len(config_files) != 1:
         raise click.ClickException("Exactly one config file is supported; please provide a single -c file.")
 
-    click.echo("Starting ARCHI deployment process...")
+    click.echo("Starting Archi deployment process...")
     setup_cli_logging(verbosity=verbosity)
     logger = get_logger(__name__)
 
@@ -183,7 +183,7 @@ def create(name: str, config_files: list, config_dir: str, env_file: str, servic
 @click.option('--podman', '-p', is_flag=True, default=False, help="specify if podman is being used")
 def delete(name: str, rmi: bool, rmv: bool, keep_files: bool, list_deployments: bool, verbosity: int, podman: bool):
     """
-    Delete an ARCHI deployment with the specified name.
+    Delete an Archi deployment with the specified name.
     
     This command stops containers and optionally removes images, volumes, and files.
     
@@ -426,7 +426,7 @@ def restart(
 def list_services():
     """List all available services"""
     
-    click.echo("Available ARCHI services:\n")
+    click.echo("Available Archi services:\n")
     
     # Application services
     app_services = service_registry.get_application_services()
@@ -497,7 +497,7 @@ def list_deployments():
 @click.option('--tag', '-t', type=str, default="2000", help="Image tag for built containers")
 @click.option('--verbosity', '-v', type=int, default=3, help="Logging verbosity level (0-4)")
 def evaluate(name: str, config_file: str, config_dir: str, env_file: str, force: bool, verbosity: int, **other_flags):
-    """Create an ARCHI deployment with selected services and data sources."""
+    """Create an Archi deployment with selected services and data sources."""
     if not (bool(config_file) ^ bool(config_dir)): 
         raise click.ClickException(f"Must specify only one of config files or config dir")
     if config_dir: 
@@ -506,7 +506,7 @@ def evaluate(name: str, config_file: str, config_dir: str, env_file: str, force:
     else: 
         config_files = [item for item in config_file.split(",")]
 
-    click.echo("Starting ARCHI benchmarking process...")
+    click.echo("Starting Archi benchmarking process...")
     setup_cli_logging(verbosity=verbosity)
     logger = get_logger(__name__)
 

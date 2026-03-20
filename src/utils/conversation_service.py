@@ -18,7 +18,8 @@ from src.utils.sql import (
     SQL_UPDATE_AB_PREFERENCE,
     SQL_GET_AB_COMPARISON,
     SQL_GET_AB_COMPARISON_FOR_UPDATE,
-    SQL_GET_PENDING_AB_COMPARISON,
+    SQL_GET_PENDING_AB_COMPARISONS,
+    SQL_COUNT_PENDING_AB_COMPARISONS,
     SQL_DELETE_AB_COMPARISON,
     SQL_GET_AB_COMPARISONS_BY_CONVERSATION,
     SQL_UPSERT_VARIANT_METRIC,
@@ -100,6 +101,29 @@ class ConversationService:
             self._pool.release_connection(conn)
         else:
             conn.close()
+
+    @staticmethod
+    def _row_to_ab_comparison(row) -> ABComparison:
+        """Convert a database row into an ABComparison."""
+        return ABComparison(
+            comparison_id=row[0],
+            conversation_id=row[1],
+            user_prompt_mid=row[2],
+            response_a_mid=row[3],
+            response_b_mid=row[4],
+            model_a=row[5],
+            pipeline_a=row[6],
+            model_b=row[7],
+            pipeline_b=row[8],
+            variant_a_name=row[9],
+            variant_b_name=row[10],
+            variant_a_meta=row[11],
+            variant_b_meta=row[12],
+            is_config_a_first=row[13],
+            preference=row[14],
+            preference_ts=row[15],
+            created_at=row[16],
+        )
     
     # =========================================================================
     # Message Operations
@@ -452,25 +476,7 @@ class ConversationService:
                 if not row:
                     return None
                 
-                return ABComparison(
-                    comparison_id=row[0],
-                    conversation_id=row[1],
-                    user_prompt_mid=row[2],
-                    response_a_mid=row[3],
-                    response_b_mid=row[4],
-                    model_a=row[5],
-                    pipeline_a=row[6],
-                    model_b=row[7],
-                    pipeline_b=row[8],
-                    variant_a_name=row[9],
-                    variant_b_name=row[10],
-                    variant_a_meta=row[11],
-                    variant_b_meta=row[12],
-                    is_config_a_first=row[13],
-                    preference=row[14],
-                    preference_ts=row[15],
-                    created_at=row[16],
-                )
+                return self._row_to_ab_comparison(row)
         finally:
             self._release_connection(conn)
     
@@ -487,34 +493,50 @@ class ConversationService:
         Returns:
             ABComparison or None if no pending comparisons
         """
+        pending = self.get_pending_ab_comparisons(conversation_id)
+        return pending[-1] if pending else None
+
+    def get_pending_ab_comparisons(
+        self,
+        conversation_id: str,
+    ) -> List[ABComparison]:
+        """
+        Get all pending (unvoted) A/B comparisons for a conversation.
+
+        Args:
+            conversation_id: Conversation to check
+
+        Returns:
+            Pending comparisons ordered by creation time ascending
+        """
         conn = self._get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute(SQL_GET_PENDING_AB_COMPARISON, (conversation_id,))
+                cur.execute(SQL_GET_PENDING_AB_COMPARISONS, (conversation_id,))
+                rows = cur.fetchall()
+                return [self._row_to_ab_comparison(row) for row in rows]
+        finally:
+            self._release_connection(conn)
+
+    def count_pending_ab_comparisons(
+        self,
+        conversation_id: str,
+    ) -> int:
+        """
+        Count unresolved A/B comparisons for a conversation.
+
+        Args:
+            conversation_id: Conversation to check
+
+        Returns:
+            Number of unresolved comparisons
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(SQL_COUNT_PENDING_AB_COMPARISONS, (conversation_id,))
                 row = cur.fetchone()
-                
-                if not row:
-                    return None
-                
-                return ABComparison(
-                    comparison_id=row[0],
-                    conversation_id=row[1],
-                    user_prompt_mid=row[2],
-                    response_a_mid=row[3],
-                    response_b_mid=row[4],
-                    model_a=row[5],
-                    pipeline_a=row[6],
-                    model_b=row[7],
-                    pipeline_b=row[8],
-                    variant_a_name=row[9],
-                    variant_b_name=row[10],
-                    variant_a_meta=row[11],
-                    variant_b_meta=row[12],
-                    is_config_a_first=row[13],
-                    preference=row[14],
-                    preference_ts=row[15],
-                    created_at=row[16],
-                )
+                return int(row[0]) if row else 0
         finally:
             self._release_connection(conn)
     
@@ -540,28 +562,7 @@ class ConversationService:
                 )
                 rows = cur.fetchall()
                 
-                return [
-                    ABComparison(
-                        comparison_id=row[0],
-                        conversation_id=row[1],
-                        user_prompt_mid=row[2],
-                        response_a_mid=row[3],
-                        response_b_mid=row[4],
-                        model_a=row[5],
-                        pipeline_a=row[6],
-                        model_b=row[7],
-                        pipeline_b=row[8],
-                        variant_a_name=row[9],
-                        variant_b_name=row[10],
-                        variant_a_meta=row[11],
-                        variant_b_meta=row[12],
-                        is_config_a_first=row[13],
-                        preference=row[14],
-                        preference_ts=row[15],
-                        created_at=row[16],
-                    )
-                    for row in rows
-                ]
+                return [self._row_to_ab_comparison(row) for row in rows]
         finally:
             self._release_connection(conn)
     

@@ -228,6 +228,22 @@ ORDER BY created_at DESC
 LIMIT 1;
 """
 
+SQL_GET_PENDING_AB_COMPARISONS = """
+SELECT comparison_id, conversation_id, user_prompt_mid, response_a_mid, response_b_mid,
+       model_a, pipeline_a, model_b, pipeline_b,
+       variant_a_name, variant_b_name, variant_a_meta, variant_b_meta,
+       is_config_a_first, preference, preference_ts, created_at
+FROM ab_comparisons
+WHERE conversation_id = %s AND preference IS NULL
+ORDER BY created_at ASC, comparison_id ASC;
+"""
+
+SQL_COUNT_PENDING_AB_COMPARISONS = """
+SELECT COUNT(*)
+FROM ab_comparisons
+WHERE conversation_id = %s AND preference IS NULL;
+"""
+
 SQL_DELETE_AB_COMPARISON = """
 DELETE FROM ab_comparisons
 WHERE comparison_id = %s;
