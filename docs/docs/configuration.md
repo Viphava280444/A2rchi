@@ -101,7 +101,7 @@ services:
 
 Authentication can be enabled with SSO or basic auth.
 
-For production RBAC, use SSO plus `auth_roles`. For short-lived local testing where SSO credentials are not available, Archi also supports a temporary basic-auth RBAC bridge that can grant selected basic-auth usernames one or more configured roles.
+For RBAC-managed admin access, use SSO plus `auth_roles`. Basic auth supports identity-only login, but it does not assign RBAC roles.
 
 ```yaml
 services:
@@ -110,14 +110,6 @@ services:
       enabled: true
       basic:
         enabled: true
-        temporary_role_grants:
-          enabled: true
-          tracking_id: ab-admin-ui-testing
-          remove_after: Remove after A/B admin-page validation is complete
-          users:
-            pmlugato:
-              roles:
-                - ab-admin
       auth_roles:
         default_role: base-user
         roles:
@@ -130,12 +122,6 @@ services:
               - config:modify
               - view:metrics
 ```
-
-Temporary basic-auth role grants are intended only for controlled test deployments. When `temporary_role_grants.enabled` is true:
-
-- `tracking_id` is required and should identify the temporary override
-- `remove_after` is required and should describe when the override must be deleted
-- each granted role must already exist under `services.chat_app.auth.auth_roles.roles`
 
 #### Provider Configuration
 

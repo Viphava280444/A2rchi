@@ -28,10 +28,10 @@ test.describe('Provider & Model Selection', () => {
 
     await page.route('**/api/agents/list', async (route) => {
       const agents = deleted
-        ? [{ name: 'Challenger GPT-4o', ab_only: true }]
+        ? [{ name: 'Reviewer Agent', ab_only: false }]
         : [
             { name: 'CMS CompOps Agent', ab_only: false },
-            { name: 'Challenger GPT-4o', ab_only: true },
+            { name: 'Reviewer Agent', ab_only: false },
           ];
       await route.fulfill({ status: 200, json: { agents, active_name: agents[0]?.name || null } });
     });
@@ -65,7 +65,7 @@ test.describe('Provider & Model Selection', () => {
     await page.locator('.agent-dropdown-confirm-yes').click();
     await expect(dropdownMenu).toBeVisible();
     await expect(page.locator('.agent-dropdown-item', { hasText: 'CMS CompOps Agent' })).toHaveCount(0);
-    await expect(page.locator('.agent-dropdown-item', { hasText: 'Challenger GPT-4o' })).toBeVisible();
+    await expect(page.locator('.agent-dropdown-item', { hasText: 'Reviewer Agent' })).toBeVisible();
   });
 
   test('settings modal opens and shows Models tab', async ({ page }) => {

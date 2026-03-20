@@ -198,7 +198,6 @@ class ConfigurationManager:
             raise ValueError(f"Invalid field: '{timeout_path}' must be <= 86400 seconds")
 
         self._validate_ab_testing_config(chat_cfg)
-        self._validate_basic_auth_temporary_role_grants(chat_cfg)
 
     def _validate_ab_testing_config(self, chat_cfg: Dict[str, Any]) -> None:
         ab_cfg = chat_cfg.get("ab_testing")
@@ -229,88 +228,6 @@ class ConfigurationManager:
                 "Invalid field: 'services.chat_app.ab_testing' is misconfigured. "
                 f"{exc}"
             )
-
-    def _validate_basic_auth_temporary_role_grants(self, chat_cfg: Dict[str, Any]) -> None:
-        auth_cfg = chat_cfg.get("auth", {}) or {}
-        basic_cfg = auth_cfg.get("basic", {}) or {}
-        grants_cfg = basic_cfg.get("temporary_role_grants")
-
-        if not isinstance(grants_cfg, dict) or not grants_cfg.get("enabled", False):
-            return
-
-        if not auth_cfg.get("enabled", False):
-            raise ValueError(
-                "Invalid field: 'services.chat_app.auth.basic.temporary_role_grants' "
-                "requires 'services.chat_app.auth.enabled=true'."
-            )
-        if not basic_cfg.get("enabled", False):
-            raise ValueError(
-                "Invalid field: 'services.chat_app.auth.basic.temporary_role_grants' "
-                "requires 'services.chat_app.auth.basic.enabled=true'."
-            )
-
-        tracking_id = grants_cfg.get("tracking_id")
-        if not isinstance(tracking_id, str) or not tracking_id.strip():
-            raise ValueError(
-                "Invalid field: 'services.chat_app.auth.basic.temporary_role_grants.tracking_id' "
-                "must be a non-empty string when temporary grants are enabled."
-            )
-
-        remove_after = grants_cfg.get("remove_after")
-        if not isinstance(remove_after, str) or not remove_after.strip():
-            raise ValueError(
-                "Invalid field: 'services.chat_app.auth.basic.temporary_role_grants.remove_after' "
-                "must be a non-empty string when temporary grants are enabled."
-            )
-
-        users_cfg = grants_cfg.get("users")
-        if not isinstance(users_cfg, dict) or not users_cfg:
-            raise ValueError(
-                "Invalid field: 'services.chat_app.auth.basic.temporary_role_grants.users' "
-                "must be a non-empty mapping of usernames to role grants."
-            )
-
-        auth_roles_cfg = auth_cfg.get("auth_roles")
-        role_defs = auth_roles_cfg.get("roles") if isinstance(auth_roles_cfg, dict) else None
-        if not isinstance(role_defs, dict) or not role_defs:
-            raise ValueError(
-                "Invalid field: 'services.chat_app.auth.auth_roles.roles' must define the roles "
-                "used by 'services.chat_app.auth.basic.temporary_role_grants'."
-            )
-
-        for username, user_cfg in users_cfg.items():
-            if not isinstance(username, str) or not username.strip():
-                raise ValueError(
-                    "Invalid field: 'services.chat_app.auth.basic.temporary_role_grants.users' "
-                    "contains an empty username."
-                )
-            if not isinstance(user_cfg, dict):
-                raise ValueError(
-                    "Invalid field: "
-                    f"'services.chat_app.auth.basic.temporary_role_grants.users.{username}' "
-                    "must be a mapping with a 'roles' list."
-                )
-            roles = user_cfg.get("roles")
-            if not isinstance(roles, list) or not roles:
-                raise ValueError(
-                    "Invalid field: "
-                    f"'services.chat_app.auth.basic.temporary_role_grants.users.{username}.roles' "
-                    "must be a non-empty list."
-                )
-            for idx, role in enumerate(roles):
-                if not isinstance(role, str) or not role.strip():
-                    raise ValueError(
-                        "Invalid field: "
-                        f"'services.chat_app.auth.basic.temporary_role_grants.users.{username}.roles[{idx}]' "
-                        "must be a non-empty string."
-                    )
-                if role not in role_defs:
-                    raise ValueError(
-                        "Invalid field: "
-                        f"'services.chat_app.auth.basic.temporary_role_grants.users.{username}.roles[{idx}]' "
-                        f"references undefined role '{role}'. Define it under "
-                        "'services.chat_app.auth.auth_roles.roles'."
-                    )
 
     def _validate_benchmarking_config(self, config: Dict[str, Any], services: List[str]) -> None:
         if not services or "benchmarking" not in services:

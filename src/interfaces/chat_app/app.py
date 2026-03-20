@@ -2217,8 +2217,7 @@ class FlaskAppWrapper(object):
         # Initialize config service for dynamic settings
         self.config_service = ConfigService(pg_config=self.pg_config)
 
-        # Refresh the RBAC registry against the current deployment config so
-        # fresh deployments and basic-auth temporary grants use the right roles.
+        # Refresh the RBAC registry against the current deployment config.
         try:
             get_registry(force_reload=True)
         except Exception as exc:
@@ -2241,9 +2240,6 @@ class FlaskAppWrapper(object):
         self.auth_enabled = auth_config.get('enabled', False)
         self.sso_enabled = auth_config.get('sso', {}).get('enabled', False)
         self.basic_auth_enabled = auth_config.get('basic', {}).get('enabled', False)
-        self.basic_temp_role_grants = self._load_basic_temporary_role_grants(
-            auth_config.get('basic', {}) or {}
-        )
         
         logger.info(f"Auth enabled: {self.auth_enabled}, SSO: {self.sso_enabled}, Basic: {self.basic_auth_enabled}")
         
@@ -2412,64 +2408,6 @@ class FlaskAppWrapper(object):
         """Get user roles from session. Returns empty list if not logged in."""
         return session.get('roles', [])
 
-    def _load_basic_temporary_role_grants(self, basic_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        grants_cfg = basic_cfg.get('temporary_role_grants')
-        if not isinstance(grants_cfg, dict) or not grants_cfg.get('enabled', False):
-            return None
-
-        tracking_id = str(grants_cfg.get('tracking_id') or '').strip()
-        remove_after = str(grants_cfg.get('remove_after') or '').strip()
-        users_cfg = grants_cfg.get('users') or {}
-
-        registry = get_registry()
-        auth_cfg = self.chat_app_config.get('auth', {}) or {}
-        auth_roles_cfg = auth_cfg.get('auth_roles', {}) or {}
-        declared_roles = set(((auth_roles_cfg.get('roles') or {}) if isinstance(auth_roles_cfg, dict) else {}).keys())
-        normalized_users: Dict[str, List[str]] = {}
-        for username, user_cfg in users_cfg.items():
-            if not isinstance(username, str) or not username.strip() or not isinstance(user_cfg, dict):
-                continue
-            roles = [
-                role.strip()
-                for role in (user_cfg.get('roles') or [])
-                if isinstance(role, str) and role.strip()
-            ]
-            valid_roles = [
-                role for role in roles if role in declared_roles
-            ] if declared_roles else registry.filter_valid_roles(roles)
-            if valid_roles:
-                normalized_users[username.strip()] = valid_roles
-
-        grant_info = {
-            'enabled': True,
-            'tracking_id': tracking_id,
-            'remove_after': remove_after,
-            'users': normalized_users,
-        }
-
-        logger.warning(
-            "Temporary basic-auth RBAC grants enabled: tracking_id=%s remove_after=%s users=%s",
-            tracking_id,
-            remove_after,
-            sorted(normalized_users.keys()),
-        )
-        return grant_info
-
-    def _get_basic_auth_roles_for_username(self, username: str) -> List[str]:
-        if not self.basic_temp_role_grants or not username:
-            return []
-
-        roles = list(self.basic_temp_role_grants.get('users', {}).get(username, []) or [])
-        if roles:
-            logger.warning(
-                "Applying temporary basic-auth RBAC grant for user '%s': roles=%s tracking_id=%s remove_after=%s",
-                username,
-                roles,
-                self.basic_temp_role_grants.get('tracking_id', ''),
-                self.basic_temp_role_grants.get('remove_after', ''),
-            )
-        return roles
-
     def _setup_sso(self):
         """Initialize OAuth client for SSO using OpenID Connect"""
         auth_config = self.chat_app_config.get('auth', {})
@@ -2524,15 +2462,14 @@ class FlaskAppWrapper(object):
             password = request.form.get('password')
             
             if check_credentials(username, password, self.salt, self.app.config['ACCOUNTS_FOLDER']):
-                basic_roles = self._get_basic_auth_roles_for_username(username or '')
                 self._set_user_session(
                     email=username,
                     name=username,
                     username=username,
                     auth_method='basic',
-                    roles=basic_roles
+                    roles=[]
                 )
-                logger.info(f"Basic auth login successful for user: {username} with roles: {basic_roles}")
+                logger.info(f"Basic auth login successful for user: {username}")
                 return redirect(url_for('index'))
             else:
                 flash('Invalid credentials')

@@ -78,8 +78,8 @@ test.describe('A/B Admin Page -- Variant List', () => {
 
     const cards = page.locator('.ab-variant-card');
     await expect(cards).toHaveCount(mockData.abPoolAdmin.variant_details!.length);
-    await expect(cards.first().locator('[data-field="label"]')).toHaveValue('CMS CompOps Agent');
-    await expect(cards.first().locator('[data-field="agent_spec"]')).toHaveValue('cms-comp-ops.md');
+    await expect(cards.first().locator('[data-field="label"]')).toHaveValue('Baseline');
+    await expect(cards.first().locator('[data-field="agent_spec"]')).toHaveValue('baseline-ab.md');
   });
 
   test('champion select is pre-populated', async ({ page }) => {
@@ -94,7 +94,24 @@ test.describe('A/B Admin Page -- Variant List', () => {
     await setupABAdminMocks(page);
     await openABAdminPage(page);
     const options = page.locator('.ab-variant-card').first().locator('[data-field="agent_spec"] option');
-    await expect(options).toHaveCount(mockData.agentsList.agents.length + 1);
+    await expect(options).toHaveCount(mockData.abAgentsList.agents.length + 2);
+  });
+
+  test('agent markdown selector can create a new A/B-only agent inline', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+    await openABAdminPage(page);
+
+    const secondCard = page.locator('.ab-variant-card').nth(1);
+    await secondCard.locator('[data-field="agent_spec"]').selectOption('__create_new__');
+
+    await expect(page.locator('#ab-agent-modal')).toBeVisible();
+    await page.locator('#ab-agent-name').fill('Fresh AB Agent');
+    await page.locator('#ab-agent-prompt').fill('You are a freshly created A/B-only agent.');
+    await page.locator('#ab-agent-save').click();
+
+    await expect(page.locator('#ab-agent-modal')).toBeHidden();
+    await expect(secondCard.locator('[data-field="agent_spec"]')).toHaveValue('fresh-ab-agent.md');
   });
 
   test('provider selector uses provider dropdown options', async ({ page }) => {
@@ -166,7 +183,9 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     await setupBasicMocks(page);
 
     await page.route('**/api/agents/list*', async (route) => {
-      await route.fulfill({ status: 200, json: mockData.agentsList });
+      const url = route.request().url();
+      const isABScope = url.includes('scope=ab');
+      await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
     });
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
       await route.fulfill({ status: 200, json: mockData.abPoolAdmin });
@@ -218,7 +237,9 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     await setupBasicMocks(page);
 
     await page.route('**/api/agents/list*', async (route) => {
-      await route.fulfill({ status: 200, json: mockData.agentsList });
+      const url = route.request().url();
+      const isABScope = url.includes('scope=ab');
+      await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
     });
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
       await route.fulfill({ status: 200, json: mockData.abPoolAdmin });
@@ -229,10 +250,10 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
         json: {
           ...mockData.abPoolAdmin,
           variant_details: [
-            { label: 'CMS CompOps Agent', agent_spec: 'cms-comp-ops.md' },
-            { label: 'Poet', agent_spec: 'challenger-claude.md', provider: 'openrouter', model: 'anthropic/claude-3.5-sonnet' },
+            { label: 'Baseline', agent_spec: 'baseline-ab.md' },
+            { label: 'Poet', agent_spec: 'poet-ab.md', provider: 'openrouter', model: 'anthropic/claude-3.5-sonnet' },
           ],
-          variants: ['CMS CompOps Agent', 'Poet'],
+          variants: ['Baseline', 'Poet'],
         },
       });
     });
@@ -240,13 +261,13 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     await openABAdminPage(page);
     const secondCard = page.locator('.ab-variant-card').nth(1);
     await secondCard.locator('[data-field="label"]').fill('Poet');
-    await secondCard.locator('[data-field="agent_spec"]').selectOption('challenger-claude.md');
+    await secondCard.locator('[data-field="agent_spec"]').selectOption('poet-ab.md');
     await secondCard.locator('[data-field="provider"]').selectOption('openrouter');
     await secondCard.locator('[data-field="model_select"]').selectOption('anthropic/claude-3.5-sonnet');
     await page.locator('#ab-admin-variant-save').click();
 
     await expect(secondCard.locator('[data-field="label"]')).toHaveValue('Poet');
-    await expect(secondCard.locator('[data-field="agent_spec"]')).toHaveValue('challenger-claude.md');
+    await expect(secondCard.locator('[data-field="agent_spec"]')).toHaveValue('poet-ab.md');
     await expect(secondCard.locator('[data-field="provider"]')).toHaveValue('openrouter');
     await expect(secondCard.locator('[data-field="model_select"]')).toHaveValue('anthropic/claude-3.5-sonnet');
   });
@@ -255,7 +276,9 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     await setupBasicMocks(page);
     let poolState = { ...mockData.abPoolAdmin };
     await page.route('**/api/agents/list*', async (route) => {
-      await route.fulfill({ status: 200, json: mockData.agentsList });
+      const url = route.request().url();
+      const isABScope = url.includes('scope=ab');
+      await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
     });
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
       await route.fulfill({ status: 200, json: poolState });
@@ -293,7 +316,7 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     await page.locator('.ab-variant-card').first().locator('[data-field="label"]').fill('Renamed baseline');
 
     await expect(page.locator('#ab-admin-save')).toBeEnabled();
-    await expect(page.locator('#ab-admin-champion')).toHaveValue('CMS CompOps Agent');
+    await expect(page.locator('#ab-admin-champion')).toHaveValue('Baseline');
   });
 
   test('unsaved draft is restored after navigation', async ({ page }) => {
@@ -322,8 +345,8 @@ test.describe('A/B Admin Page -- Champion Selection', () => {
     await setupABAdminMocks(page);
     await openABAdminPage(page);
 
-    await page.locator('#ab-admin-champion').selectOption('Challenger GPT-4o');
-    await expect(page.locator('#ab-admin-champion')).toHaveValue('Challenger GPT-4o');
+    await page.locator('#ab-admin-champion').selectOption('Poet');
+    await expect(page.locator('#ab-admin-champion')).toHaveValue('Poet');
   });
 
   test('adding an unsaved variant does not change champion choices yet', async ({ page }) => {
@@ -332,7 +355,7 @@ test.describe('A/B Admin Page -- Champion Selection', () => {
     await openABAdminPage(page);
 
     await page.locator('#ab-admin-add-variant').click();
-    await page.locator('.ab-variant-card').last().locator('[data-field="label"]').fill('Challenger Claude');
+    await page.locator('.ab-variant-card').last().locator('[data-field="label"]').fill('Critic');
 
     const championOptions = page.locator('#ab-admin-champion option');
     await expect(championOptions).toHaveCount(2);
@@ -345,7 +368,7 @@ test.describe('A/B Admin Page -- Champion Selection', () => {
 
     await page.locator('.ab-variant-remove').first().click();
 
-    await expect(page.locator('#ab-admin-champion')).toHaveValue('CMS CompOps Agent');
+    await expect(page.locator('#ab-admin-champion')).toHaveValue('Baseline');
   });
 });
 
@@ -373,7 +396,7 @@ test.describe('A/B Comparison Streaming', () => {
     await page.getByLabel('Message input').fill('Hello');
     await page.getByRole('button', { name: 'Send message' }).click();
 
-    const comparison = page.locator('#ab-comparison-active');
+    const comparison = page.locator('.ab-comparison').last();
     await expect(comparison).toBeVisible();
 
     const arms = comparison.locator('.ab-arm');
@@ -428,8 +451,8 @@ test.describe('A/B Comparison Streaming', () => {
       JSON.stringify({ type: 'meta', event: 'stream_started' }),
       JSON.stringify({
         type: 'ab_arms',
-        arm_a_name: 'CMS CompOps Agent',
-        arm_b_name: 'Challenger GPT-4o',
+        arm_a_name: 'Baseline',
+        arm_b_name: 'Poet',
         disclosure_mode: 'named',
       }),
       JSON.stringify({ arm: 'a', type: 'chunk', content: 'Champion says hello' }),
@@ -440,8 +463,8 @@ test.describe('A/B Comparison Streaming', () => {
         conversation_id: 1,
         arm_a_message_id: 101,
         arm_b_message_id: 102,
-        arm_a_variant: 'CMS CompOps Agent',
-        arm_b_variant: 'Challenger GPT-4o',
+        arm_a_variant: 'Baseline',
+        arm_b_variant: 'Poet',
         disclosure_mode: 'named',
       }),
     ].join('\n') + '\n';
@@ -455,8 +478,8 @@ test.describe('A/B Comparison Streaming', () => {
     await page.getByRole('button', { name: 'Send message' }).click();
 
     await expect(page.locator('.ab-arm-title-row')).toHaveCount(2);
-    await expect(page.locator('.ab-arm-variant-name').first()).toHaveText('CMS CompOps Agent');
-    await expect(page.locator('.ab-arm-variant-name').nth(1)).toHaveText('Challenger GPT-4o');
+    await expect(page.locator('.ab-arm-variant-name').first()).toHaveText('Baseline');
+    await expect(page.locator('.ab-arm-variant-name').nth(1)).toHaveText('Poet');
     await expect(page.locator('.ab-comparison .trace-container')).toHaveCount(0);
   });
 
@@ -556,6 +579,133 @@ test.describe('A/B Comparison Streaming', () => {
     await page.locator('.ab-vote-btn-a').click();
 
     await expect(page.getByLabel('Message input')).not.toBeDisabled();
+  });
+
+  test('restores a single pending comparison below the limit without locking input', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          enabled: true,
+          is_admin: false,
+          can_manage: false,
+          sample_rate: 1,
+          disclosure_mode: 'post_vote_reveal',
+          default_trace_mode: 'minimal',
+          max_pending_per_conversation: 2,
+        },
+      });
+    });
+
+    await page.route('**/api/load_conversation', async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          conversation_id: 1,
+          title: 'Pending queue',
+          created_at: new Date().toISOString(),
+          last_message_at: new Date().toISOString(),
+          messages: [],
+          pending_ab_comparisons: [
+            {
+              comparison_id: 2001,
+              variant_a_name: 'Baseline',
+              variant_b_name: 'Poet',
+              disclosure_mode: 'post_vote_reveal',
+              default_trace_mode: 'minimal',
+              response_a: { message_id: 501, content: 'Pending A', model_used: 'openai/gpt-4o' },
+              response_b: { message_id: 502, content: 'Pending B', model_used: 'anthropic/claude-3.5-sonnet' },
+            },
+          ],
+          pending_ab_comparison: {
+            comparison_id: 2001,
+            variant_a_name: 'Baseline',
+            variant_b_name: 'Poet',
+            disclosure_mode: 'post_vote_reveal',
+            default_trace_mode: 'minimal',
+            response_a: { message_id: 501, content: 'Pending A', model_used: 'openai/gpt-4o' },
+            response_b: { message_id: 502, content: 'Pending B', model_used: 'anthropic/claude-3.5-sonnet' },
+          },
+        },
+      });
+    });
+
+    await page.goto('/chat');
+    await page.evaluate(() => (window as any).Chat.loadConversation(1));
+
+    await expect(page.locator('.ab-comparison')).toHaveCount(1);
+    await expect(page.locator('.ab-vote-container')).toBeVisible();
+    await expect(page.getByLabel('Message input')).not.toBeDisabled();
+  });
+
+  test('restores multiple pending comparisons and locks input when the limit is reached', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          enabled: true,
+          is_admin: false,
+          can_manage: false,
+          sample_rate: 1,
+          disclosure_mode: 'post_vote_reveal',
+          default_trace_mode: 'minimal',
+          max_pending_per_conversation: 2,
+        },
+      });
+    });
+
+    await page.route('**/api/load_conversation', async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          conversation_id: 1,
+          title: 'Pending queue',
+          created_at: new Date().toISOString(),
+          last_message_at: new Date().toISOString(),
+          messages: [],
+          pending_ab_comparisons: [
+            {
+              comparison_id: 2001,
+              variant_a_name: 'Baseline',
+              variant_b_name: 'Poet',
+              disclosure_mode: 'post_vote_reveal',
+              default_trace_mode: 'minimal',
+              response_a: { message_id: 501, content: 'Pending A1', model_used: 'openai/gpt-4o' },
+              response_b: { message_id: 502, content: 'Pending B1', model_used: 'anthropic/claude-3.5-sonnet' },
+            },
+            {
+              comparison_id: 2002,
+              variant_a_name: 'Baseline',
+              variant_b_name: 'Critic',
+              disclosure_mode: 'post_vote_reveal',
+              default_trace_mode: 'minimal',
+              response_a: { message_id: 503, content: 'Pending A2', model_used: 'openai/gpt-4o' },
+              response_b: { message_id: 504, content: 'Pending B2', model_used: 'anthropic/claude-3.5-sonnet' },
+            },
+          ],
+          pending_ab_comparison: {
+            comparison_id: 2002,
+            variant_a_name: 'Baseline',
+            variant_b_name: 'Critic',
+            disclosure_mode: 'post_vote_reveal',
+            default_trace_mode: 'minimal',
+            response_a: { message_id: 503, content: 'Pending A2', model_used: 'openai/gpt-4o' },
+            response_b: { message_id: 504, content: 'Pending B2', model_used: 'anthropic/claude-3.5-sonnet' },
+          },
+        },
+      });
+    });
+
+    await page.goto('/chat');
+    await page.evaluate(() => (window as any).Chat.loadConversation(1));
+
+    await expect(page.locator('.ab-comparison')).toHaveCount(2);
+    await expect(page.locator('.ab-vote-container')).toBeVisible();
+    await expect(page.getByLabel('Message input')).toBeDisabled();
   });
 });
 
@@ -687,7 +837,7 @@ test.describe('A/B Vote Submission', () => {
     await expect(page.locator('.ab-vote-container')).toBeVisible();
     await page.locator('.ab-vote-btn-a').click();
 
-    await expect(page.locator('#ab-comparison-active')).toHaveCount(0);
+    await expect(page.locator('.ab-comparison')).toHaveCount(0);
   });
 
   test('choosing Tie keeps both arms with tie styling', async ({ page }) => {
@@ -788,6 +938,6 @@ test.describe('A/B Inactive -- Normal Chat', () => {
     await page.waitForTimeout(500);
     expect(abCompareCalled).toBe(false);
 
-    await expect(page.locator('#ab-comparison-active')).toHaveCount(0);
+    await expect(page.locator('.ab-comparison')).toHaveCount(0);
   });
 });

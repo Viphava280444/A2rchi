@@ -76,32 +76,51 @@ export const mockData = {
   agentsList: {
     agents: [
       { name: 'CMS CompOps Agent', filename: 'cms-comp-ops.md', ab_only: false },
-      { name: 'Challenger GPT-4o', filename: 'challenger-gpt4o.md', ab_only: true },
-      { name: 'Challenger Claude', filename: 'challenger-claude.md', ab_only: true },
+      { name: 'Reviewer Agent', filename: 'reviewer.md', ab_only: false },
     ],
     active_name: 'CMS CompOps Agent',
+  },
+
+  abAgentsList: {
+    agents: [
+      { name: 'Baseline AB Agent', filename: 'baseline-ab.md', ab_only: true },
+      { name: 'Poet AB Agent', filename: 'poet-ab.md', ab_only: true },
+      { name: 'Critic AB Agent', filename: 'critic-ab.md', ab_only: true },
+    ],
+    active_name: null,
   },
 
   abPoolAdmin: {
     enabled: true,
     is_admin: true,
     can_manage: true,
-    champion: 'CMS CompOps Agent',
-    variants: ['CMS CompOps Agent', 'Challenger GPT-4o'],
+    enabled_requested: true,
+    champion: 'Baseline',
+    variants: ['Baseline', 'Poet'],
     variant_details: [
-      { label: 'CMS CompOps Agent', agent_spec: 'cms-comp-ops.md' },
-      { label: 'Challenger GPT-4o', agent_spec: 'challenger-gpt4o.md', provider: 'openai', model: 'gpt-4o' },
+      { label: 'Baseline', agent_spec: 'baseline-ab.md' },
+      { label: 'Poet', agent_spec: 'poet-ab.md', provider: 'openrouter', model: 'anthropic/claude-3.5-sonnet' },
     ],
     sample_rate: 1,
     disclosure_mode: 'post_vote_reveal',
     default_trace_mode: 'minimal',
     max_pending_per_conversation: 1,
+    defaults: {
+      provider: 'openrouter',
+      model: 'openai/gpt-4o',
+      recursion_limit: 50,
+      num_documents_to_retrieve: 5,
+      ab_agents_dir: '/root/archi/ab_agents',
+      ab_agents_dir_configured: true,
+    },
+    warnings: [],
   },
 
   abPoolAdminInactive: {
     enabled: false,
     is_admin: true,
     can_manage: true,
+    enabled_requested: false,
     champion: '',
     variants: [],
     variant_details: [],
@@ -109,6 +128,15 @@ export const mockData = {
     disclosure_mode: 'post_vote_reveal',
     default_trace_mode: 'minimal',
     max_pending_per_conversation: 1,
+    defaults: {
+      provider: 'openrouter',
+      model: 'openai/gpt-4o',
+      recursion_limit: 50,
+      num_documents_to_retrieve: 5,
+      ab_agents_dir: '/root/archi/ab_agents',
+      ab_agents_dir_configured: true,
+    },
+    warnings: ['A/B testing is inactive until at least two variants are configured.'],
   },
 
   abPoolNonAdmin: {
@@ -120,7 +148,7 @@ export const mockData = {
   abMetrics: {
     metrics: [
       {
-        variant: 'CMS CompOps Agent',
+        variant: 'Baseline',
         is_champion: true,
         comparisons: 10,
         wins: 6,
@@ -129,7 +157,7 @@ export const mockData = {
         win_rate: 0.6,
       },
       {
-        variant: 'Challenger GPT-4o',
+        variant: 'Poet',
         is_champion: false,
         comparisons: 10,
         wins: 3,
@@ -223,9 +251,41 @@ export async function setupBasicMocks(page: Page) {
     await route.fulfill({ status: 200, json: { conversation_id: null } });
   });
 
-  // Default: agents list (including ab_only variants for pool editor)
+  // Default agent lists
   await page.route('**/api/agents/list*', async (route) => {
-    await route.fulfill({ status: 200, json: mockData.agentsList });
+    const url = route.request().url();
+    const isABScope = url.includes('scope=ab');
+    await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
+  });
+
+  await page.route('**/api/agents/template*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        name: 'New A/B Agent',
+        tools: [
+          { name: 'search_docs', description: 'Search indexed documents' },
+          { name: 'fetch_ticket', description: 'Fetch ticket details' },
+        ],
+        template: '---\nname: New A/B Agent\nab_only: true\ntools:\n  - search_docs\n  - fetch_ticket\n---\n\nYou are an A/B-only agent.',
+      },
+    });
+  });
+
+  await page.route('**/api/agents', async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.fallback();
+      return;
+    }
+    const body = route.request().postDataJSON();
+    const content = String(body.content || '');
+    const match = content.match(/^name:\s*(.+)$/m);
+    const name = match ? match[1].trim() : 'New A/B Agent';
+    const filename = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'new-ab-agent'}.md`;
+    await route.fulfill({
+      status: 200,
+      json: { success: true, name, filename, scope: body.scope || 'default' },
+    });
   });
 
   // Default A/B pool: non-admin, disabled.
@@ -252,7 +312,9 @@ export async function setupABAdminMocks(page: Page) {
   // Register AFTER setupBasicMocks — Playwright processes routes LIFO,
   // so this handler runs first and the default non-admin one never fires.
   await page.route('**/api/agents/list*', async (route) => {
-    await route.fulfill({ status: 200, json: mockData.agentsList });
+    const url = route.request().url();
+    const isABScope = url.includes('scope=ab');
+    await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
   });
 
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
@@ -265,7 +327,9 @@ export async function setupABAdminMocks(page: Page) {
  */
 export async function setupABAdminInactiveMocks(page: Page) {
   await page.route('**/api/agents/list*', async (route) => {
-    await route.fulfill({ status: 200, json: mockData.agentsList });
+    const url = route.request().url();
+    const isABScope = url.includes('scope=ab');
+    await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
   });
 
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
@@ -283,28 +347,43 @@ export function createABStreamResponse(options: {
   conversationId?: number;
   armAVariant?: string;
   armBVariant?: string;
+  armAMessageId?: number;
+  armBMessageId?: number;
+  disclosureMode?: string;
 } = {}) {
   const {
     armAContent = 'Response from arm A',
     armBContent = 'Response from arm B',
     comparisonId = 42,
     conversationId = 1,
-    armAVariant = 'CMS CompOps Agent',
-    armBVariant = 'Challenger GPT-4o',
+    armAVariant = 'Baseline',
+    armBVariant = 'Poet',
+    armAMessageId = 101,
+    armBMessageId = 102,
+    disclosureMode = 'post_vote_reveal',
   } = options;
 
   const events = [
     { type: 'meta', event: 'stream_started' },
+    {
+      type: 'ab_arms',
+      arm_a_name: armAVariant,
+      arm_b_name: armBVariant,
+      disclosure_mode: disclosureMode,
+    },
     { arm: 'a', type: 'chunk', content: armAContent },
     { arm: 'b', type: 'chunk', content: armBContent },
+    { arm: 'a', type: 'final', response: armAContent, model_used: 'openai/gpt-4o' },
+    { arm: 'b', type: 'final', response: armBContent, model_used: 'anthropic/claude-3.5-sonnet' },
     {
       type: 'ab_meta',
       comparison_id: comparisonId,
       conversation_id: conversationId,
-      arm_a_message_id: 101,
-      arm_b_message_id: 102,
+      arm_a_message_id: armAMessageId,
+      arm_b_message_id: armBMessageId,
       arm_a_variant: armAVariant,
       arm_b_variant: armBVariant,
+      disclosure_mode: disclosureMode,
     },
   ];
 
@@ -319,8 +398,9 @@ export async function enableABMode(page: Page) {
     if (typeof Chat !== 'undefined') {
       Chat.state.abPool = {
         enabled: true,
-        champion: 'CMS CompOps Agent',
-        variants: ['CMS CompOps Agent', 'Challenger GPT-4o'],
+        champion: 'Baseline',
+        variants: ['Baseline', 'Poet'],
+        max_pending_per_conversation: 1,
       };
     }
   });

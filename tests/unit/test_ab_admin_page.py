@@ -1,5 +1,6 @@
 from flask import Flask
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.interfaces.chat_app.app import ChatWrapper, FlaskAppWrapper
@@ -122,3 +123,80 @@ def test_data_template_uses_labeled_header_actions_without_expand_collapse_butto
     assert ">Refresh<" in template
     assert 'id="expand-all-btn"' not in template
     assert 'id="collapse-all-btn"' not in template
+
+
+def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults():
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.services_config = {
+        "chat_app": {
+            "default_provider": "openrouter",
+            "default_model": "openai/gpt-4o",
+            "ab_testing": {
+                "enabled": True,
+                "sample_rate": 0.5,
+                "default_trace_mode": "minimal",
+                "max_pending_per_conversation": 2,
+                "pool": {
+                    "champion": "Baseline",
+                    "variants": [
+                        {"label": "Baseline", "agent_spec": "baseline-ab.md"},
+                        {"label": "Poet", "agent_spec": "poet-ab.md"},
+                    ],
+                },
+            },
+        },
+    }
+    wrapper.global_config = {"DATA_PATH": "/root/data"}
+    wrapper._get_ab_agents_dir = Mock(return_value=Path("/root/archi/ab_agents"))
+    wrapper._is_admin_request = Mock(return_value=True)
+    wrapper.chat = SimpleNamespace(
+        ab_pool=SimpleNamespace(
+            enabled=True,
+            champion_name="Baseline",
+            sample_rate=0.5,
+            disclosure_mode="post_vote_reveal",
+            default_trace_mode="minimal",
+            max_pending_per_conversation=2,
+            variants=[
+                SimpleNamespace(to_meta=lambda: {"label": "Baseline", "agent_spec": "baseline-ab.md"}),
+                SimpleNamespace(to_meta=lambda: {"label": "Poet", "agent_spec": "poet-ab.md", "provider": "openrouter", "model": "anthropic/claude-3.5-sonnet"}),
+            ],
+        ),
+        ab_pool_state=SimpleNamespace(warnings=["A/B testing is active."]),
+    )
+
+    payload = FlaskAppWrapper._build_admin_ab_pool_payload(wrapper)
+
+    assert payload["enabled"] is True
+    assert payload["enabled_requested"] is True
+    assert payload["champion"] == "Baseline"
+    assert payload["variants"] == ["Baseline", "Poet"]
+    assert payload["defaults"]["ab_agents_dir"] == "/root/archi/ab_agents"
+    assert payload["defaults"]["provider"] == "openrouter"
+    assert payload["warnings"] == ["A/B testing is active."]
+
+
+def test_ab_disable_pool_persists_disable_and_returns_admin_payload():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+    wrapper.config_service = Mock()
+    wrapper._can_manage_ab_testing = Mock(return_value=True)
+    wrapper._refresh_runtime_config = Mock()
+    wrapper._build_admin_ab_pool_payload = Mock(return_value={"enabled": False, "enabled_requested": False})
+
+    with app.test_request_context("/api/ab/pool/disable", method="POST"):
+        response, status = FlaskAppWrapper.ab_disable_pool(wrapper)
+
+    payload = response.get_json()
+    assert status == 200
+    assert payload["enabled"] is False
+    assert payload["enabled_requested"] is False
+    wrapper.config_service.update_services_config.assert_called_once_with({
+        "chat_app": {
+            "ab_testing": {
+                "enabled": False,
+            }
+        }
+    })
+    wrapper._refresh_runtime_config.assert_called_once()
