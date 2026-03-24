@@ -328,3 +328,57 @@ ORDER BY
 SQL_DELETE_ALERT = """
 DELETE FROM service_alerts WHERE id = %s;
 """
+
+# =============================================================================
+# Conversation Share Queries
+# =============================================================================
+
+SQL_INSERT_SHARE = """
+INSERT INTO conversation_shares (
+    share_token, conversation_id, visibility, created_by_user, created_by_client
+)
+VALUES (%s, %s, %s, %s, %s);
+"""
+
+SQL_GET_SHARE_BY_TOKEN = """
+SELECT share_token, conversation_id, visibility,
+       created_by_user, created_by_client, created_at,
+       expires_at, revoked_at
+FROM conversation_shares
+WHERE share_token = %s AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > NOW());
+"""
+
+SQL_GET_SHARE_BY_CONVERSATION = """
+SELECT share_token, conversation_id, visibility,
+       created_by_user, created_by_client, created_at,
+       expires_at, revoked_at
+FROM conversation_shares
+WHERE conversation_id = %s AND revoked_at IS NULL
+  AND (expires_at IS NULL OR expires_at > NOW());
+"""
+
+SQL_REVOKE_SHARE = """
+UPDATE conversation_shares
+SET revoked_at = NOW()
+WHERE share_token = %s AND revoked_at IS NULL;
+"""
+
+SQL_REVOKE_SHARES_BY_CONVERSATION = """
+UPDATE conversation_shares
+SET revoked_at = NOW()
+WHERE conversation_id = %s AND revoked_at IS NULL;
+"""
+
+SQL_GET_SHARED_CONVERSATION_MESSAGES = """
+SELECT c.sender, c.content, c.ts
+FROM conversations c
+WHERE c.conversation_id = %s
+ORDER BY c.message_id ASC;
+"""
+
+SQL_GET_SHARED_CONVERSATION_METADATA = """
+SELECT conversation_id, title, created_at, last_message_at
+FROM conversation_metadata
+WHERE conversation_id = %s;
+"""
