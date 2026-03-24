@@ -50,6 +50,10 @@ const CONFIG = {
     LIKE: '/api/like',
     DISLIKE: '/api/dislike',
     TEXT_FEEDBACK: '/api/text_feedback',
+    SHARE_CONVERSATION: '/api/share_conversation',
+    REVOKE_SHARE: '/api/revoke_share',
+    GET_SHARE_INFO: '/api/get_share_info',
+    SHARING_CONFIG: '/api/sharing_config',
   },
   STREAMING: {
     TIMEOUT: 600000, // 10 minutes
@@ -256,6 +260,44 @@ const API = {
         client_id: this.clientId,
       }),
     });
+  },
+
+  async shareConversation(conversationId, visibility) {
+    return this.fetchJson(CONFIG.ENDPOINTS.SHARE_CONVERSATION, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversation_id: conversationId,
+        client_id: this.clientId,
+        visibility: visibility,
+      }),
+    });
+  },
+
+  async revokeShare(conversationId) {
+    return this.fetchJson(CONFIG.ENDPOINTS.REVOKE_SHARE, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversation_id: conversationId,
+        client_id: this.clientId,
+      }),
+    });
+  },
+
+  async getShareInfo(conversationId) {
+    return this.fetchJson(CONFIG.ENDPOINTS.GET_SHARE_INFO, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversation_id: conversationId,
+        client_id: this.clientId,
+      }),
+    });
+  },
+
+  async getSharingConfig() {
+    return this.fetchJson(CONFIG.ENDPOINTS.SHARING_CONFIG);
   },
 
   async *streamResponse(history, conversationId, configName, signal = null, provider = null, model = null) {
@@ -1785,6 +1827,15 @@ const UI = {
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
             </svg>
             <span class="conversation-item-title">${title}</span>
+            ${Chat.sharingConfig?.enabled ? `<button class="conversation-item-share" data-id="${conv.conversation_id}" aria-label="Share conversation" title="Share conversation">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <circle cx="18" cy="5" r="3"></circle>
+                <circle cx="6" cy="12" r="3"></circle>
+                <circle cx="18" cy="19" r="3"></circle>
+                <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+                <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+              </svg>
+            </button>` : ''}
             <button class="conversation-item-delete" data-id="${conv.conversation_id}" aria-label="Delete conversation" title="Delete conversation">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
                 <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
@@ -1802,8 +1853,17 @@ const UI = {
     list.querySelectorAll('.conversation-item').forEach((item) => {
       item.addEventListener('click', (e) => {
         if (e.target.closest('.conversation-item-delete')) return;
+        if (e.target.closest('.conversation-item-share')) return;
         const id = Number(item.dataset.id);
         Chat.loadConversation(id);
+      });
+    });
+
+    list.querySelectorAll('.conversation-item-share').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const id = Number(btn.dataset.id);
+        Chat.openShareDialog(id);
       });
     });
 
@@ -2972,6 +3032,7 @@ const Chat = {
       this.loadProviders(),
       this.loadPipelineDefaultModel(),
       this.loadApiKeyStatus(),
+      this.loadSharingConfig(),
       UI.loadUserProfile(),
       this.loadAgents(),
     ]);
@@ -3407,10 +3468,10 @@ const Chat = {
 
   async deleteConversation(conversationId) {
     if (!confirm('Delete this conversation?')) return;
-    
+
     try {
       await API.deleteConversation(conversationId);
-      
+
       if (this.state.conversationId === conversationId) {
         this.state.conversationId = null;
         this.state.messages = [];
@@ -3418,10 +3479,126 @@ const Chat = {
         Storage.setActiveConversationId(null);
         UI.renderMessages([]);
       }
-      
+
       await this.loadConversations();
     } catch (e) {
       console.error('Failed to delete conversation:', e);
+    }
+  },
+
+  // --- Conversation Sharing ---
+
+  sharingConfig: null,
+
+  async loadSharingConfig() {
+    try {
+      this.sharingConfig = await API.getSharingConfig();
+    } catch (e) {
+      this.sharingConfig = { enabled: false };
+    }
+  },
+
+  async openShareDialog(conversationId) {
+    if (!this.sharingConfig) await this.loadSharingConfig();
+    if (!this.sharingConfig.enabled) {
+      UI.showToast('Sharing is disabled by the administrator.');
+      return;
+    }
+
+    // Remove existing dialog if any
+    const existing = document.querySelector('.share-dialog-backdrop');
+    if (existing) existing.remove();
+
+    // Get current share status
+    let shareInfo = { shared: false };
+    try {
+      shareInfo = await API.getShareInfo(conversationId);
+    } catch (e) {
+      console.error('Failed to get share info:', e);
+    }
+
+    const cfg = this.sharingConfig;
+    const defaultVis = shareInfo.shared ? shareInfo.visibility : cfg.default_visibility;
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'share-dialog-backdrop';
+    backdrop.innerHTML = `
+      <div class="share-dialog">
+        <div class="share-dialog-header">
+          <h3>Share Conversation</h3>
+          <button class="share-dialog-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="share-dialog-body">
+          ${shareInfo.shared ? `
+            <div class="share-link-row">
+              <input type="text" class="share-link-input" value="${window.location.origin}${shareInfo.share_url}" readonly>
+              <button class="share-link-copy">Copy</button>
+            </div>
+          ` : ''}
+          <div class="share-visibility-options">
+            <label>Who can view:</label>
+            ${cfg.allow_public ? `
+              <label class="share-visibility-option">
+                <input type="radio" name="share-visibility" value="public" ${defaultVis === 'public' ? 'checked' : ''}>
+                Anyone with the link
+              </label>
+            ` : ''}
+            ${cfg.allow_authenticated ? `
+              <label class="share-visibility-option">
+                <input type="radio" name="share-visibility" value="authed" ${defaultVis === 'authed' ? 'checked' : ''}>
+                Anyone with the link who is signed in
+              </label>
+            ` : ''}
+          </div>
+        </div>
+        <div class="share-dialog-footer">
+          ${shareInfo.shared ? `<button class="share-revoke-btn">Revoke Link</button>` : ''}
+          <button class="share-create-btn">${shareInfo.shared ? 'Update Link' : 'Create Link'}</button>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(backdrop);
+
+    // Bind events
+    backdrop.querySelector('.share-dialog-close').addEventListener('click', () => backdrop.remove());
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) backdrop.remove(); });
+
+    const copyBtn = backdrop.querySelector('.share-link-copy');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', () => {
+        const input = backdrop.querySelector('.share-link-input');
+        navigator.clipboard.writeText(input.value).then(() => {
+          copyBtn.textContent = 'Copied!';
+          setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2000);
+        });
+      });
+    }
+
+    backdrop.querySelector('.share-create-btn').addEventListener('click', async () => {
+      const visibility = backdrop.querySelector('input[name="share-visibility"]:checked')?.value;
+      if (!visibility) { UI.showToast('Please select a visibility option.'); return; }
+      try {
+        const result = await API.shareConversation(conversationId, visibility);
+        backdrop.remove();
+        this.openShareDialog(conversationId); // Re-open to show updated state
+        UI.showToast('Share link created!');
+      } catch (e) {
+        UI.showToast('Failed to create share link.');
+      }
+    });
+
+    const revokeBtn = backdrop.querySelector('.share-revoke-btn');
+    if (revokeBtn) {
+      revokeBtn.addEventListener('click', async () => {
+        try {
+          await API.revokeShare(conversationId);
+          backdrop.remove();
+          UI.showToast('Share link revoked.');
+        } catch (e) {
+          UI.showToast('Failed to revoke share link.');
+        }
+      });
     }
   },
 
