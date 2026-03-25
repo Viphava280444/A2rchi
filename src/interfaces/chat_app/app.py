@@ -96,6 +96,44 @@ def generate_share_token(length: int = 22) -> str:
     return ''.join(secrets.choice(_BASE62_CHARS) for _ in range(length))
 
 
+class RateLimiter:
+    """In-memory per-IP rate limiter using a sliding window."""
+
+    def __init__(self, max_requests: int = 30, window_seconds: int = 60):
+        self._max = max_requests
+        self._window = window_seconds
+        self._hits: dict[str, list[float]] = {}
+        self._lock = Lock()
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - self._window
+        with self._lock:
+            timestamps = self._hits.get(key, [])
+            timestamps = [t for t in timestamps if t > cutoff]
+            if len(timestamps) >= self._max:
+                self._hits[key] = timestamps
+                return False
+            timestamps.append(now)
+            self._hits[key] = timestamps
+            return True
+
+
+_share_view_limiter = RateLimiter(max_requests=30, window_seconds=60)
+
+
+def rate_limit_shared(f):
+    """Rate limit decorator for shared conversation routes (30 req/min per IP)."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from flask import request as req
+        client_ip = req.remote_addr or 'unknown'
+        if not _share_view_limiter.is_allowed(client_ip):
+            return jsonify({'error': 'Too many requests. Please try again later.'}), 429
+        return f(*args, **kwargs)
+    return decorated
+
+
 def _build_provider_config_from_payload(config_payload: Dict[str, Any], provider_type: ProviderType) -> Optional[ProviderConfig]:
     """Helper to build ProviderConfig from loaded YAML for a provider."""
     services_cfg = config_payload.get("services", {}) or {}
@@ -2228,8 +2266,8 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/api/share_conversation', 'share_conversation', self.require_auth(self.share_conversation), methods=["POST"])
         self.add_endpoint('/api/revoke_share', 'revoke_share', self.require_auth(self.revoke_share), methods=["POST"])
         self.add_endpoint('/api/get_share_info', 'get_share_info', self.require_auth(self.get_share_info), methods=["POST"])
-        self.add_endpoint('/api/shared/<token>', 'get_shared_conversation', self.get_shared_conversation, methods=["GET"])
-        self.add_endpoint('/s/<token>', 'shared_view', self.shared_view, methods=["GET"])
+        self.add_endpoint('/api/shared/<token>', 'get_shared_conversation', rate_limit_shared(self.get_shared_conversation), methods=["GET"])
+        self.add_endpoint('/s/<token>', 'shared_view', rate_limit_shared(self.shared_view), methods=["GET"])
         self.add_endpoint('/api/sharing_config', 'get_sharing_config', self.require_auth(self.get_sharing_config), methods=["GET"])
 
         # A/B testing endpoints
@@ -4071,7 +4109,7 @@ class FlaskAppWrapper(object):
             conversation_id = data.get('conversation_id')
             client_id = data.get('client_id')
             visibility = data.get('visibility', sharing_config['default_visibility'])
-            user_id = session.get('user_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not conversation_id:
                 return jsonify({'error': 'conversation_id is required'}), 400
@@ -4088,7 +4126,10 @@ class FlaskAppWrapper(object):
             cursor = conn.cursor()
 
             # Verify ownership
-            cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+            if user_id:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
             if not cursor.fetchone():
                 cursor.close()
                 conn.close()
@@ -4131,6 +4172,7 @@ class FlaskAppWrapper(object):
             data = request.json
             conversation_id = data.get('conversation_id')
             client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not conversation_id:
                 return jsonify({'error': 'conversation_id is required'}), 400
@@ -4141,7 +4183,10 @@ class FlaskAppWrapper(object):
             cursor = conn.cursor()
 
             # Verify ownership
-            cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+            if user_id:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
             if not cursor.fetchone():
                 cursor.close()
                 conn.close()
@@ -4171,6 +4216,7 @@ class FlaskAppWrapper(object):
             data = request.json
             conversation_id = data.get('conversation_id')
             client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
 
             if not conversation_id:
                 return jsonify({'error': 'conversation_id is required'}), 400
@@ -4181,7 +4227,10 @@ class FlaskAppWrapper(object):
             cursor = conn.cursor()
 
             # Verify ownership
-            cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+            if user_id:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
             if not cursor.fetchone():
                 cursor.close()
                 conn.close()
