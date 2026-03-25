@@ -111,6 +111,12 @@
       overflow-wrap: break-word;
     }
 
+    .shared-message-model {
+      font-size: 11px;
+      color: #9ca3af;
+      margin-top: 8px;
+    }
+
     .shared-message-content p { margin-bottom: 0.75em; }
     .shared-message-content p:last-child { margin-bottom: 0; }
     .shared-message-content code {
@@ -258,10 +264,12 @@
               const senderLabel = isUser ? 'You' : 'Archi';
               const cssClass = isUser ? 'user' : 'assistant';
               const content = isUser ? '<p>' + escapeHtml(msg.content) + '</p>' : renderMarkdown(msg.content);
+              const modelTag = (!isUser && msg.model_used) ? `<div class="shared-message-model">${escapeHtml(msg.model_used)}</div>` : '';
               html += `
                 <div class="shared-message ${cssClass}">
                   <div class="shared-message-sender">${senderLabel}</div>
                   <div class="shared-message-content">${content}</div>
+                  ${modelTag}
                 </div>`;
             }
             container.innerHTML = html;
