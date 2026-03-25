@@ -468,6 +468,172 @@ body {
   color: var(--error-text);
 }
 
+.conversation-item-share {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--touch-target-min);
+  min-height: var(--touch-target-min);
+  width: 32px;
+  height: 32px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+}
+
+.conversation-item:hover .conversation-item-share {
+  display: flex;
+}
+
+.conversation-item-share:hover {
+  background: rgba(59, 130, 246, 0.1);
+  color: #3b82f6;
+}
+
+/* Share Dialog */
+.share-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.share-dialog {
+  background: var(--surface-primary, #fff);
+  border-radius: 12px;
+  width: 440px;
+  max-width: 90vw;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+}
+
+.share-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.share-dialog-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.share-dialog-close {
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  color: var(--text-tertiary);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+.share-dialog-close:hover {
+  background: var(--surface-secondary);
+}
+
+.share-dialog-body {
+  padding: 20px;
+}
+
+.share-link-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.share-link-input {
+  flex: 1;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 13px;
+  background: var(--surface-secondary);
+  color: var(--text-primary);
+}
+
+.share-link-copy {
+  padding: 8px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--surface-primary, #fff);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.share-link-copy:hover {
+  background: var(--surface-secondary);
+}
+
+.share-visibility-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.share-visibility-options > label:first-child {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.share-visibility-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.share-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-color);
+}
+
+.share-create-btn {
+  padding: 8px 20px;
+  border: none;
+  border-radius: 6px;
+  background: #3b82f6;
+  color: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.share-create-btn:hover {
+  opacity: 0.9;
+}
+
+.share-revoke-btn {
+  padding: 8px 20px;
+  border: 1px solid var(--error-text);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--error-text);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.share-revoke-btn:hover {
+  background: var(--error-bg);
+}
+
 /* -----------------------------------------------------------------------------
    User Profile Widget (Bottom of Sidebar)
    ----------------------------------------------------------------------------- */

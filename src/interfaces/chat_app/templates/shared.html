@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>Shared Conversation - Archi</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+  <!-- Markdown rendering -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@9.0.0/marked.min.js"></script>
+
+  <!-- Syntax highlighting -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='images/archi_notext.png') }}">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #f9fafb;
+      color: #1f2937;
+      line-height: 1.6;
+    }
+
+    .shared-page {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 24px 16px;
+      min-height: 100vh;
+    }
+
+    .shared-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #e5e7eb;
+      margin-bottom: 24px;
+    }
+
+    .shared-header img {
+      width: 32px;
+      height: 32px;
+    }
+
+    .shared-header-text h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #111827;
+    }
+
+    .shared-header-text .shared-subtitle {
+      font-size: 13px;
+      color: #6b7280;
+    }
+
+    .shared-badge {
+      margin-left: auto;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: #eff6ff;
+      color: #3b82f6;
+      font-weight: 500;
+    }
+
+    .shared-messages {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .shared-message {
+      padding: 16px 20px;
+      border-radius: 12px;
+      font-size: 15px;
+    }
+
+    .shared-message.user {
+      background: #eff6ff;
+      border: 1px solid #dbeafe;
+    }
+
+    .shared-message.assistant {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+    }
+
+    .shared-message-sender {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+      color: #6b7280;
+    }
+
+    .shared-message.user .shared-message-sender {
+      color: #3b82f6;
+    }
+
+    .shared-message-content {
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+    }
+
+    .shared-message-model {
+      font-size: 11px;
+      color: #9ca3af;
+      margin-top: 8px;
+    }
+
+    .shared-message-content p { margin-bottom: 0.75em; }
+    .shared-message-content p:last-child { margin-bottom: 0; }
+    .shared-message-content code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9em;
+      background: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .shared-message-content pre {
+      background: #1e1e2e;
+      color: #cdd6f4;
+      padding: 16px;
+      border-radius: 8px;
+      overflow-x: auto;
+      margin: 12px 0;
+    }
+    .shared-message-content pre code {
+      background: none;
+      padding: 0;
+      color: inherit;
+    }
+
+    .shared-error {
+      text-align: center;
+      padding: 60px 20px;
+    }
+
+    .shared-error h2 {
+      font-size: 20px;
+      color: #374151;
+      margin-bottom: 8px;
+    }
+
+    .shared-error p {
+      color: #6b7280;
+      font-size: 15px;
+    }
+
+    .shared-loading {
+      text-align: center;
+      padding: 60px 20px;
+      color: #6b7280;
+    }
+
+    .shared-footer {
+      margin-top: 40px;
+      padding-top: 16px;
+      border-top: 1px solid #e5e7eb;
+      text-align: center;
+      font-size: 13px;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+  <div class="shared-page">
+    {% if error == 'not_found' %}
+      <div class="shared-error">
+        <h2>Conversation Not Found</h2>
+        <p>This shared link is invalid, has been revoked, or has expired.</p>
+      </div>
+    {% elif error == 'server_error' %}
+      <div class="shared-error">
+        <h2>Something Went Wrong</h2>
+        <p>An error occurred while loading the shared conversation. Please try again later.</p>
+      </div>
+    {% else %}
+      <div class="shared-header">
+        <img src="{{ url_for('static', filename='images/archi-logo.png') }}" alt="archi logo">
+        <div class="shared-header-text">
+          <h1 id="shared-title">Loading...</h1>
+          <div class="shared-subtitle">Shared conversation</div>
+        </div>
+        <span class="shared-badge">Read-only</span>
+      </div>
+      <div class="shared-messages" id="shared-messages">
+        <div class="shared-loading">Loading conversation...</div>
+      </div>
+      <div class="shared-footer">
+        Shared via Archi
+      </div>
+
+      <script>
+        const ARCHI_SENDER = 'archi';
+
+        function escapeHtml(text) {
+          const div = document.createElement('div');
+          div.textContent = text;
+          return div.innerHTML;
+        }
+
+        function renderMarkdown(text) {
+          if (typeof marked !== 'undefined') {
+            marked.setOptions({
+              highlight: function(code, lang) {
+                if (typeof hljs !== 'undefined' && lang && hljs.getLanguage(lang)) {
+                  return hljs.highlight(code, { language: lang }).value;
+                }
+                return escapeHtml(code);
+              },
+              breaks: true,
+            });
+            return marked.parse(text);
+          }
+          return '<p>' + escapeHtml(text) + '</p>';
+        }
+
+        async function loadSharedConversation() {
+          const token = {{ token | tojson }};
+          const container = document.getElementById('shared-messages');
+          const titleEl = document.getElementById('shared-title');
+
+          try {
+            const response = await fetch('/api/shared/' + encodeURIComponent(token));
+
+            if (response.status === 401) {
+              const data = await response.json();
+              if (data.login_required) {
+                window.location.href = '/login?next=/s/' + encodeURIComponent(token);
+                return;
+              }
+            }
+
+            if (!response.ok) {
+              container.innerHTML = `
+                <div class="shared-error">
+                  <h2>Conversation Not Found</h2>
+                  <p>This shared link is invalid, has been revoked, or has expired.</p>
+                </div>`;
+              return;
+            }
+
+            const data = await response.json();
+            titleEl.textContent = data.title || 'Shared Conversation';
+
+            if (!data.messages || data.messages.length === 0) {
+              container.innerHTML = '<div class="shared-loading">This conversation is empty.</div>';
+              return;
+            }
+
+            let html = '';
+            for (const msg of data.messages) {
+              const isUser = msg.sender !== ARCHI_SENDER;
+              const senderLabel = isUser ? 'You' : 'Archi';
+              const cssClass = isUser ? 'user' : 'assistant';
+              const content = isUser ? '<p>' + escapeHtml(msg.content) + '</p>' : renderMarkdown(msg.content);
+              const modelTag = (!isUser && msg.model_used) ? `<div class="shared-message-model">${escapeHtml(msg.model_used)}</div>` : '';
+              html += `
+                <div class="shared-message ${cssClass}">
+                  <div class="shared-message-sender">${senderLabel}</div>
+                  <div class="shared-message-content">${content}</div>
+                  ${modelTag}
+                </div>`;
+            }
+            container.innerHTML = html;
+
+          } catch (e) {
+            console.error('Failed to load shared conversation:', e);
+            container.innerHTML = `
+              <div class="shared-error">
+                <h2>Something Went Wrong</h2>
+                <p>Failed to load the conversation. Please try again later.</p>
+              </div>`;
+          }
+        }
+
+        document.addEventListener('DOMContentLoaded', loadSharedConversation);
+      </script>
+    {% endif %}
+  </div>
+</body>
+</html>
