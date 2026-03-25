@@ -371,7 +371,7 @@ WHERE conversation_id = %s AND revoked_at IS NULL;
 """
 
 SQL_GET_SHARED_CONVERSATION_MESSAGES = """
-SELECT c.sender, c.content, c.ts
+SELECT c.sender, c.content, c.ts, c.model_used
 FROM conversations c
 WHERE c.conversation_id = %s
 ORDER BY c.message_id ASC;
