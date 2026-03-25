@@ -226,7 +226,7 @@
         }
 
         async function loadSharedConversation() {
-          const token = '{{ token }}';
+          const token = {{ token | tojson }};
           const container = document.getElementById('shared-messages');
           const titleEl = document.getElementById('shared-title');
 
