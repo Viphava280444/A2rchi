@@ -3531,7 +3531,7 @@ const Chat = {
         <div class="share-dialog-body">
           ${shareInfo.shared ? `
             <div class="share-link-row">
-              <input type="text" class="share-link-input" value="${window.location.origin}${shareInfo.share_url}" readonly>
+              <input type="text" class="share-link-input" value="${Utils.escapeHtml(window.location.origin + shareInfo.share_url)}" readonly>
               <button class="share-link-copy">Copy</button>
             </div>
           ` : ''}
