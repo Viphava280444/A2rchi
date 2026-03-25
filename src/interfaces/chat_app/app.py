@@ -4252,11 +4252,14 @@ class FlaskAppWrapper(object):
 
             messages = []
             for row in message_rows:
-                messages.append({
+                msg = {
                     'sender': row[0],
                     'content': row[1],
                     'ts': row[2].isoformat() if row[2] else None,
-                })
+                }
+                if row[3]:
+                    msg['model_used'] = row[3]
+                messages.append(msg)
 
             return jsonify({
                 'title': meta_row[1] or "Shared Conversation",
