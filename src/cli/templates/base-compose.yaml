@@ -203,10 +203,22 @@ services:
       OPENAI_API_KEYS: "unused"
       ENABLE_OLLAMA_API: "false"
       ENABLE_RAG_WEB_SEARCH: "false"
+      {% if sso_enabled -%}
+      WEBUI_AUTH: "true"
+      ENABLE_SIGNUP: "false"
+      ENABLE_OAUTH_SIGNUP: "true"
+      OAUTH_MERGE_ACCOUNTS_BY_EMAIL: "true"
+      OAUTH_PROVIDER_NAME: "{{ sso_provider_name }}"
+      OPENID_PROVIDER_URL: "{{ sso_server_metadata_url }}"
+      OAUTH_SCOPES: "{{ sso_scopes }}"
+      OAUTH_CLIENT_ID: ${SSO_CLIENT_ID}
+      OAUTH_CLIENT_SECRET: ${SSO_CLIENT_SECRET}
+      {% else -%}
       WEBUI_AUTH: "false"
       ENABLE_SIGNUP: "true"
+      {% endif -%}
     ports:
-      - 3001:8080
+      - {{ openwebui_port }}:8080
     volumes:
       - openwebui-data:/app/backend/data
     logging:
