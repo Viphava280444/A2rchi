@@ -216,7 +216,7 @@ services:
       {% else -%}
       WEBUI_AUTH: "false"
       ENABLE_SIGNUP: "true"
-      {% endif -%}
+      {% endif %}
     ports:
       - {{ openwebui_port }}:8080
     volumes:
