@@ -191,6 +191,33 @@ services:
     {%- endif %}
   {%- endif %}
 
+  {% if chatbot_enabled -%}
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:0.5.20
+    container_name: {{ name }}-openwebui
+    depends_on:
+      chatbot:
+        condition: service_started
+    environment:
+      OPENAI_API_BASE_URLS: http://{{ 'localhost' if host_mode else 'chatbot' }}:{{ chatbot_port_container }}/v1
+      OPENAI_API_KEYS: "unused"
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_RAG_WEB_SEARCH: "false"
+      WEBUI_AUTH: "false"
+      ENABLE_SIGNUP: "true"
+    ports:
+      - 3001:8080
+    volumes:
+      - openwebui-data:/app/backend/data
+    logging:
+      options:
+        max-size: 10m
+    restart: always
+    {% if host_mode -%}
+    network_mode: host
+    {% endif %}
+  {%- endif %}
+
   {% if grafana_enabled -%}
   grafana:
     image: {{ grafana_image }}:{{ grafana_tag }}
@@ -654,6 +681,9 @@ volumes:
   {{ volume }}:
     external: true
   {% endfor %}
+  {% if chatbot_enabled -%}
+  openwebui-data:
+  {% endif %}
 
 {% if required_secrets %}
 secrets:
