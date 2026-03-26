@@ -74,15 +74,25 @@ def translate_events(
     """
     chunk_id = _make_chunk_id()
     created = int(time.time())
+    last_accumulated = ""  # track accumulated text to compute deltas
 
     for event in archi_events:
         event_type = event.get("type", "")
 
         if event_type == "chunk":
             content = event.get("content", "")
-            if content:
+            if not content:
+                continue
+            # ARCHI chunks with accumulated=True contain the full text so far;
+            # OpenAI SSE expects only the new delta.
+            if event.get("accumulated"):
+                delta = content[len(last_accumulated):]
+                last_accumulated = content
+            else:
+                delta = content
+            if delta:
                 yield _sse_line(
-                    _delta_chunk(chunk_id, model, created, content=content)
+                    _delta_chunk(chunk_id, model, created, content=delta)
                 )
 
         elif event_type == "tool_start":
@@ -148,12 +158,18 @@ def build_non_streaming_response(
     created = int(time.time())
     content_parts: list[str] = []
     usage_raw: dict = {}
+    last_accumulated = ""
 
     for event in archi_events:
         event_type = event.get("type", "")
 
         if event_type == "chunk":
-            content_parts.append(event.get("content", ""))
+            content = event.get("content", "")
+            if event.get("accumulated"):
+                # Only keep the final accumulated value
+                last_accumulated = content
+            else:
+                content_parts.append(content)
         elif event_type == "tool_start":
             content_parts.append(_format_tool_start(event))
         elif event_type == "tool_output":
@@ -181,7 +197,7 @@ def build_non_streaming_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": "".join(content_parts),
+                    "content": last_accumulated + "".join(content_parts),
                 },
                 "finish_reason": "stop",
             }
