@@ -36,6 +36,24 @@ class TestTranslateChunkEvents:
         assert chunk["choices"][0]["finish_reason"] is None
         assert chunk["model"] == "test-agent"
 
+    def test_accumulated_chunks_emit_only_deltas(self):
+        events = [
+            {"type": "chunk", "content": "I'm", "accumulated": True},
+            {"type": "chunk", "content": "I'm sorry", "accumulated": True},
+            {"type": "chunk", "content": "I'm sorry, but", "accumulated": True},
+            {"type": "final", "usage": {}},
+        ]
+        lines = list(translate_events(iter(events), model="m"))
+        # 3 deltas + finish + [DONE]
+        assert len(lines) == 5
+
+        delta1 = _parse_sse(lines[0])["choices"][0]["delta"]["content"]
+        delta2 = _parse_sse(lines[1])["choices"][0]["delta"]["content"]
+        delta3 = _parse_sse(lines[2])["choices"][0]["delta"]["content"]
+        assert delta1 == "I'm"
+        assert delta2 == " sorry"
+        assert delta3 == ", but"
+
     def test_empty_chunk_is_skipped(self):
         events = [
             {"type": "chunk", "content": ""},
