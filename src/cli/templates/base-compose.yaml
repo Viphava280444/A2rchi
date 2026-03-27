@@ -193,7 +193,7 @@ services:
 
   {% if chatbot_enabled -%}
   openwebui:
-    image: ghcr.io/open-webui/open-webui:0.5.20
+    image: ghcr.io/open-webui/open-webui:0.8.12
     container_name: {{ name }}-openwebui
     depends_on:
       chatbot:
@@ -203,6 +203,7 @@ services:
       OPENAI_API_KEYS: "unused"
       ENABLE_OLLAMA_API: "false"
       ENABLE_RAG_WEB_SEARCH: "false"
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
       {% if sso_enabled -%}
       WEBUI_AUTH: "true"
       ENABLE_SIGNUP: "false"

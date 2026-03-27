@@ -328,3 +328,17 @@ ORDER BY
 SQL_DELETE_ALERT = """
 DELETE FROM service_alerts WHERE id = %s;
 """
+
+# =============================================================================
+# Open WebUI Conversation Mapping
+# =============================================================================
+
+SQL_LOOKUP_OPENWEBUI_CONVERSATION = """
+SELECT conversation_id FROM openwebui_conversation_map WHERE chat_id = %s;
+"""
+
+SQL_STORE_OPENWEBUI_CONVERSATION = """
+INSERT INTO openwebui_conversation_map (chat_id, conversation_id)
+VALUES (%s, %s)
+ON CONFLICT (chat_id) DO NOTHING;
+"""

@@ -1,9 +1,15 @@
 """Translate ARCHI streaming events to OpenAI Chat Completions SSE format."""
 
+import html
 import json
 import time
 import uuid
 from typing import Any, Dict, Iterator
+
+
+def _html_escape_attr(value: str) -> str:
+    """Escape a string for use inside an HTML attribute value."""
+    return html.escape(value, quote=True)
 
 
 def _make_chunk_id() -> str:
@@ -46,21 +52,33 @@ def _delta_chunk(
 def _format_tool_start(event: dict) -> str:
     tool_name = event.get("tool_name", "unknown")
     tool_args = event.get("tool_args", {})
-    if isinstance(tool_args, dict) and tool_args:
-        args_str = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-        return f"\n> **Running** `{tool_name}({args_str})`\n"
-    return f"\n> **Running** `{tool_name}()`\n"
+    args_json = json.dumps(tool_args, default=str) if tool_args else "{}"
+    escaped_args = _html_escape_attr(args_json)
+    escaped_name = _html_escape_attr(tool_name)
+    return (
+        f'\n<details type="tool_calls" done="false" name="{escaped_name}"'
+        f' arguments="{escaped_args}">'
+        f"<summary>Executing...</summary>"
+        f"</details>\n"
+    )
 
 
-def _format_tool_output(event: dict) -> str:
+def _format_tool_output(event: dict, tool_name: str = "unknown", tool_args: dict | None = None) -> str:
     output = event.get("output", "")
     truncated = event.get("truncated", False)
-    if not output:
-        return ""
-    text = f"\n> **Result:**\n> {output}"
     if truncated:
-        text += " *(truncated)*"
-    return text + "\n"
+        output = output + " (truncated)" if output else "(truncated)"
+    args_json = json.dumps(tool_args or {}, default=str)
+    result_json = json.dumps({"output": output}, default=str)
+    escaped_name = _html_escape_attr(tool_name)
+    escaped_args = _html_escape_attr(args_json)
+    escaped_result = _html_escape_attr(result_json)
+    return (
+        f'\n<details type="tool_calls" done="true" name="{escaped_name}"'
+        f' arguments="{escaped_args}" result="{escaped_result}">'
+        f"<summary>Tool Executed</summary>"
+        f"</details>\n"
+    )
 
 
 def translate_events(
@@ -75,6 +93,9 @@ def translate_events(
     chunk_id = _make_chunk_id()
     created = int(time.time())
     last_accumulated = ""  # track accumulated text to compute deltas
+    # Track the most recent tool_start info for pairing with tool_output
+    pending_tool_name = "unknown"
+    pending_tool_args: dict = {}
 
     for event in archi_events:
         event_type = event.get("type", "")
@@ -96,6 +117,8 @@ def translate_events(
                 )
 
         elif event_type == "tool_start":
+            pending_tool_name = event.get("tool_name", "unknown")
+            pending_tool_args = event.get("tool_args", {})
             text = _format_tool_start(event)
             if text:
                 yield _sse_line(
@@ -103,7 +126,7 @@ def translate_events(
                 )
 
         elif event_type == "tool_output":
-            text = _format_tool_output(event)
+            text = _format_tool_output(event, tool_name=pending_tool_name, tool_args=pending_tool_args)
             if text:
                 yield _sse_line(
                     _delta_chunk(chunk_id, model, created, content=text)
@@ -159,6 +182,8 @@ def build_non_streaming_response(
     content_parts: list[str] = []
     usage_raw: dict = {}
     last_accumulated = ""
+    pending_tool_name = "unknown"
+    pending_tool_args: dict = {}
 
     for event in archi_events:
         event_type = event.get("type", "")
@@ -171,9 +196,11 @@ def build_non_streaming_response(
             else:
                 content_parts.append(content)
         elif event_type == "tool_start":
+            pending_tool_name = event.get("tool_name", "unknown")
+            pending_tool_args = event.get("tool_args", {})
             content_parts.append(_format_tool_start(event))
         elif event_type == "tool_output":
-            text = _format_tool_output(event)
+            text = _format_tool_output(event, tool_name=pending_tool_name, tool_args=pending_tool_args)
             if text:
                 content_parts.append(text)
         elif event_type == "final":

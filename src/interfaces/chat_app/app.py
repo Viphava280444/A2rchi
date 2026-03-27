@@ -61,6 +61,7 @@ from src.utils.sql import (
     SQL_GET_PENDING_AB_COMPARISON, SQL_DELETE_AB_COMPARISON, SQL_GET_AB_COMPARISONS_BY_CONVERSATION,
     SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
+    SQL_LOOKUP_OPENWEBUI_CONVERSATION, SQL_STORE_OPENWEBUI_CONVERSATION,
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.service_alerts import (
@@ -1106,6 +1107,25 @@ class ChatWrapper:
 
         logger.info(f"Created new conversation with ID: {conversation_id}")
         return conversation_id
+
+    def _lookup_openwebui_conversation(self, chat_id: str) -> Optional[int]:
+        """Look up an ARCHI conversation_id for an Open WebUI chat_id."""
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        cursor.execute(SQL_LOOKUP_OPENWEBUI_CONVERSATION, (chat_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return row[0] if row else None
+
+    def _store_openwebui_conversation(self, chat_id: str, conversation_id: int) -> None:
+        """Persist the mapping from Open WebUI chat_id to ARCHI conversation_id."""
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        cursor.execute(SQL_STORE_OPENWEBUI_CONVERSATION, (chat_id, conversation_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
 
     def update_conversation_timestamp(self, conversation_id: int, client_id: str, user_id: Optional[str] = None):
         """
@@ -3041,8 +3061,17 @@ class FlaskAppWrapper(object):
         # Build ARCHI message format: [("User", content)]
         archi_message = [("User", last_user_content)]
 
-        # Generate identifiers for this request
-        client_id = f"openwebui-{uuid.uuid4().hex[:12]}"
+        # Extract chat_id from Open WebUI header or request body
+        chat_id = request.headers.get("X-OpenWebUI-Chat-Id") or payload.get("chat_id")
+
+        # Derive stable client_id and look up existing conversation
+        if chat_id:
+            client_id = f"openwebui-{chat_id[:12]}"
+            conversation_id = self.chat._lookup_openwebui_conversation(chat_id)
+        else:
+            client_id = f"openwebui-{uuid.uuid4().hex[:12]}"
+            conversation_id = None
+
         server_received_msg_ts = datetime.now(timezone.utc)
         config_name = self.chat.default_config_name
 
@@ -3057,7 +3086,7 @@ class FlaskAppWrapper(object):
         def _archi_events():
             for event in self.chat.stream(
                 archi_message,
-                None,          # conversation_id — create new
+                conversation_id,
                 client_id,
                 False,         # is_refresh
                 server_received_msg_ts,
@@ -3069,6 +3098,11 @@ class FlaskAppWrapper(object):
                 provider=provider,
                 model=model,
             ):
+                # On first turn, capture the new conversation_id from the final event
+                if chat_id and conversation_id is None and event.get("type") == "final":
+                    new_conv_id = event.get("conversation_id")
+                    if new_conv_id:
+                        self.chat._store_openwebui_conversation(chat_id, new_conv_id)
                 yield event
 
         if stream:
