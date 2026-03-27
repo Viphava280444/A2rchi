@@ -191,6 +191,46 @@ services:
     {%- endif %}
   {%- endif %}
 
+  {% if chatbot_enabled -%}
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:0.8.12
+    container_name: {{ name }}-openwebui
+    depends_on:
+      chatbot:
+        condition: service_started
+    environment:
+      OPENAI_API_BASE_URLS: http://{{ 'localhost' if host_mode else 'chatbot' }}:{{ chatbot_port_container }}/v1
+      OPENAI_API_KEYS: "unused"
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_RAG_WEB_SEARCH: "false"
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+      {% if sso_enabled -%}
+      WEBUI_AUTH: "true"
+      ENABLE_SIGNUP: "false"
+      ENABLE_OAUTH_SIGNUP: "true"
+      OAUTH_MERGE_ACCOUNTS_BY_EMAIL: "true"
+      OAUTH_PROVIDER_NAME: "{{ sso_provider_name }}"
+      OPENID_PROVIDER_URL: "{{ sso_server_metadata_url }}"
+      OAUTH_SCOPES: "{{ sso_scopes }}"
+      OAUTH_CLIENT_ID: ${SSO_CLIENT_ID}
+      OAUTH_CLIENT_SECRET: ${SSO_CLIENT_SECRET}
+      {% else -%}
+      WEBUI_AUTH: "false"
+      ENABLE_SIGNUP: "true"
+      {% endif %}
+    ports:
+      - {{ openwebui_port }}:8080
+    volumes:
+      - openwebui-data:/app/backend/data
+    logging:
+      options:
+        max-size: 10m
+    restart: always
+    {% if host_mode -%}
+    network_mode: host
+    {% endif %}
+  {%- endif %}
+
   {% if grafana_enabled -%}
   grafana:
     image: {{ grafana_image }}:{{ grafana_tag }}
@@ -654,6 +694,9 @@ volumes:
   {{ volume }}:
     external: true
   {% endfor %}
+  {% if chatbot_enabled -%}
+  openwebui-data:
+  {% endif %}
 
 {% if required_secrets %}
 secrets:

@@ -30,6 +30,7 @@ from pygments.lexers import (BashLexer, CLexer, CppLexer, FortranLexer,
                              TypeScriptLexer)
 
 from src.archi.archi import archi
+from src.interfaces.chat_app.openai_compat import translate_events, build_non_streaming_response
 from src.archi.pipelines.agents.agent_spec import (
     AgentSpecError,
     list_agent_files,
@@ -60,6 +61,7 @@ from src.utils.sql import (
     SQL_GET_PENDING_AB_COMPARISON, SQL_DELETE_AB_COMPARISON, SQL_GET_AB_COMPARISONS_BY_CONVERSATION,
     SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
+    SQL_LOOKUP_OPENWEBUI_CONVERSATION, SQL_STORE_OPENWEBUI_CONVERSATION,
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.service_alerts import (
@@ -1105,6 +1107,25 @@ class ChatWrapper:
 
         logger.info(f"Created new conversation with ID: {conversation_id}")
         return conversation_id
+
+    def _lookup_openwebui_conversation(self, chat_id: str) -> Optional[int]:
+        """Look up an ARCHI conversation_id for an Open WebUI chat_id."""
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        cursor.execute(SQL_LOOKUP_OPENWEBUI_CONVERSATION, (chat_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return row[0] if row else None
+
+    def _store_openwebui_conversation(self, chat_id: str, conversation_id: int) -> None:
+        """Persist the mapping from Open WebUI chat_id to ARCHI conversation_id."""
+        conn = psycopg2.connect(**self.pg_config)
+        cursor = conn.cursor()
+        cursor.execute(SQL_STORE_OPENWEBUI_CONVERSATION, (chat_id, conversation_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
 
     def update_conversation_timestamp(self, conversation_id: int, client_id: str, user_id: Optional[str] = None):
         """
@@ -2241,6 +2262,11 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/api/agents', 'delete_agent_spec', self.require_auth(self.delete_agent_spec), methods=["DELETE"])
         self.add_endpoint('/api/agents/active', 'set_active_agent', self.require_auth(self.set_active_agent), methods=["POST"])
 
+        # OpenAI-compatible endpoints (for Open WebUI integration)
+        logger.info("Adding OpenAI-compatible API endpoints")
+        self.add_endpoint('/v1/models', 'v1_models', self.v1_list_models, methods=["GET"])
+        self.add_endpoint('/v1/chat/completions', 'v1_chat_completions', self.v1_chat_completions, methods=["POST"])
+
         # Data viewer endpoints
         # View data page and list documents - requires documents:view permission
         # Enable/disable documents - requires documents:select permission
@@ -2900,6 +2926,201 @@ class FlaskAppWrapper(object):
         except Exception as exc:
             logger.error(f"Error listing agents: {exc}")
             return jsonify({"error": str(exc)}), 500
+
+    # ── OpenAI-compatible endpoints (for Open WebUI) ──────────────────
+
+    @staticmethod
+    def _agent_slug(name: str) -> str:
+        """Convert agent display name to a URL-safe slug."""
+        return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "agent"
+
+    def _list_agent_specs(self):
+        """Return all valid agent specs from the agents directory."""
+        try:
+            agents_dir = self._get_agents_dir()
+            agent_files = list_agent_files(agents_dir)
+        except AgentSpecError:
+            return []
+        specs = []
+        for path in agent_files:
+            try:
+                specs.append(load_agent_spec(path))
+            except AgentSpecError:
+                continue
+        return specs
+
+    def _list_enabled_provider_models(self):
+        """Return a flat list of (provider_type, model_id, display_label) for enabled providers."""
+        results = []
+        try:
+            from src.archi.providers import list_provider_types, get_provider
+            for pt in list_provider_types():
+                try:
+                    cfg = _build_provider_config_from_payload(self.config, pt)
+                    provider = get_provider(pt, config=cfg) if cfg else get_provider(pt)
+                    if not provider.is_enabled:
+                        continue
+                    for m in provider.list_models():
+                        label = f"{provider.display_name} {m.display_name or m.name}"
+                        results.append((pt.value, m.id, label))
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+        return results
+
+    def v1_list_models(self):
+        """GET /v1/models — list ARCHI agents as OpenAI-compatible model objects."""
+        try:
+            specs = self._list_agent_specs()
+            provider_models = self._list_enabled_provider_models()
+            now = int(time.time())
+            data = []
+
+            for spec in specs:
+                slug = self._agent_slug(spec.name)
+                # Default entry (uses the agent's configured default provider)
+                data.append({
+                    "id": slug,
+                    "object": "model",
+                    "created": now,
+                    "owned_by": "archi",
+                    "name": spec.name,
+                })
+                # One entry per enabled provider+model combination
+                for ptype, mid, label in provider_models:
+                    data.append({
+                        "id": f"{slug}--{ptype}-{mid}",
+                        "object": "model",
+                        "created": now,
+                        "owned_by": "archi",
+                        "name": f"{spec.name} ({label})",
+                    })
+
+            return jsonify({"object": "list", "data": data}), 200
+        except Exception as exc:
+            logger.error("Error listing OpenAI-compatible models: %s", exc)
+            return jsonify({"object": "list", "data": []}), 200
+
+    def _parse_openai_model_id(self, model_id: str):
+        """Parse an OpenAI model ID into (agent_slug, provider, model).
+
+        Returns (agent_slug, None, None) for default provider requests,
+        or (agent_slug, provider_type, model_name) for override requests.
+        """
+        if "--" in model_id:
+            agent_slug, provider_model = model_id.split("--", 1)
+            parts = provider_model.split("-", 1)
+            if len(parts) == 2:
+                return agent_slug, parts[0], parts[1]
+            return agent_slug, provider_model, None
+        return model_id, None, None
+
+    def _resolve_agent_name(self, slug: str):
+        """Find the agent display name matching a slug, or None."""
+        for spec in self._list_agent_specs():
+            if self._agent_slug(spec.name) == slug:
+                return spec.name
+        return None
+
+    def v1_chat_completions(self):
+        """POST /v1/chat/completions — OpenAI-compatible chat completions."""
+        payload = request.get_json(silent=True) or {}
+        model_id = payload.get("model", "")
+        messages = payload.get("messages", [])
+        stream = payload.get("stream", True)
+
+        # Parse model ID → agent + optional provider override
+        agent_slug, provider, model = self._parse_openai_model_id(model_id)
+
+        # Validate agent exists
+        agent_name = self._resolve_agent_name(agent_slug)
+        if agent_name is None:
+            return jsonify({
+                "error": {
+                    "message": f"Model not found: {model_id}",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
+            }), 404
+
+        # Extract the last user message
+        last_user_content = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                last_user_content = msg.get("content", "")
+                break
+        if not last_user_content:
+            return jsonify({
+                "error": {
+                    "message": "No user message found in messages array",
+                    "type": "invalid_request_error",
+                }
+            }), 400
+
+        # Build ARCHI message format: [("User", content)]
+        archi_message = [("User", last_user_content)]
+
+        # Extract chat_id from Open WebUI header or request body
+        chat_id = request.headers.get("X-OpenWebUI-Chat-Id") or payload.get("chat_id")
+
+        # Derive stable client_id and look up existing conversation
+        if chat_id:
+            client_id = f"openwebui-{chat_id[:12]}"
+            conversation_id = self.chat._lookup_openwebui_conversation(chat_id)
+        else:
+            client_id = f"openwebui-{uuid.uuid4().hex[:12]}"
+            conversation_id = None
+
+        server_received_msg_ts = datetime.now(timezone.utc)
+        config_name = self.chat.default_config_name
+
+        # Switch active agent if needed
+        if agent_name != self.chat.current_agent_name:
+            try:
+                cfg = ConfigService(pg_config=self.chat.pg_config)
+                cfg.update_dynamic_config(active_agent_name=agent_name, updated_by="openwebui")
+            except Exception as exc:
+                logger.warning("Failed to switch agent to '%s': %s", agent_name, exc)
+
+        def _archi_events():
+            for event in self.chat.stream(
+                archi_message,
+                conversation_id,
+                client_id,
+                False,         # is_refresh
+                server_received_msg_ts,
+                server_received_msg_ts.timestamp(),  # client_sent_msg_ts
+                3600,          # client_timeout (1 hour)
+                config_name,
+                include_agent_steps=True,
+                include_tool_steps=True,
+                provider=provider,
+                model=model,
+            ):
+                # On first turn, capture the new conversation_id from the final event
+                if chat_id and conversation_id is None and event.get("type") == "final":
+                    new_conv_id = event.get("conversation_id")
+                    if new_conv_id:
+                        self.chat._store_openwebui_conversation(chat_id, new_conv_id)
+                yield event
+
+        if stream:
+            def _sse_stream():
+                for line in translate_events(_archi_events(), model=model_id):
+                    yield line
+
+            headers = {
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Content-Type": "text/event-stream",
+            }
+            return Response(stream_with_context(_sse_stream()), headers=headers)
+        else:
+            result = build_non_streaming_response(_archi_events(), model=model_id)
+            return jsonify(result), 200
+
+    # ── End OpenAI-compatible endpoints ─────────────────────────────
 
     def get_agent_spec(self):
         """
