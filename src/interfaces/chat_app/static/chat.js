@@ -2160,7 +2160,15 @@ const UI = {
       }
     }
     if (this.elements.abParticipationInactive) {
-      this.elements.abParticipationInactive.style.display = abState.enabled === false ? '' : 'none';
+      const reason = String(abState.participant_reason || '');
+      let inactiveMessage = '';
+      if (reason === 'not_targeted') {
+        inactiveMessage = 'The current experiment does not target your role or permissions. Your saved rate will apply automatically if a future experiment includes you.';
+      } else if (reason === 'disabled') {
+        inactiveMessage = 'Experiments are currently inactive. Your preference will be used again if A/B testing is enabled.';
+      }
+      this.elements.abParticipationInactive.textContent = inactiveMessage;
+      this.elements.abParticipationInactive.style.display = inactiveMessage ? '' : 'none';
     }
   },
 

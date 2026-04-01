@@ -327,7 +327,7 @@ If `enabled: true` is set before the A/B pool is fully configured, Archi starts 
 
 The runtime source of truth for A/B agent specs is now PostgreSQL. The optional `ab_agents_dir` path is treated only as a legacy import source during reconciliation; runtime A/B loading never falls back to reading staged container markdown files directly.
 
-New A/B specs created through the admin UI are stored in the same PostgreSQL-backed catalog. Editing an existing A/B spec is immutable: Archi creates a new suffixed spec such as `_v2` and switches the edited variant to that new catalog entry, preserving the older spec for audit and historical comparison references.
+New A/B specs created through the admin UI are stored in the same PostgreSQL-backed catalog. Existing A/B specs are not edited through the admin page; if you need a changed prompt or tool selection, create a new A/B spec and point the variant at that new catalog entry.
 
 ### Variant Fields
 
@@ -367,6 +367,8 @@ Use RBAC to separate participation, read-only review, metrics access, and write 
 | `ab:manage` | Allows editing variants, A/B agent specs, and experiment settings |
 
 `services.chat_app.ab_testing.sample_rate` remains the deployment default. Users with `ab:participate` can override that default per account with a `0..1` slider in chat settings.
+
+Users with `ab:view`, `ab:metrics`, or `ab:manage` can open the dedicated A/B Testing page from the data viewer and from chat settings. Users with `ab:participate` but not A/B page access still get the personal sampling slider in chat settings.
 
 Variant metrics (wins, losses, ties) are tracked in the `ab_variant_metrics` database table and available via `GET /api/ab/metrics`.
 

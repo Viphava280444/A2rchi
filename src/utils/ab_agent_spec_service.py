@@ -8,7 +8,6 @@ keeping the default chat agent workflow unchanged.
 from __future__ import annotations
 
 import hashlib
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -258,60 +257,6 @@ class ABAgentSpecService:
             candidate = f"{stem}-{counter}{suffix}"
             counter += 1
 
-    @staticmethod
-    def _canonical_edit_base_name(name: str) -> str:
-        cleaned = str(name or "").strip()
-        if not cleaned:
-            return cleaned
-        match = re.match(r"^(.*?)(?:_v(\d+))?$", cleaned)
-        if not match:
-            return cleaned
-        base = (match.group(1) or "").strip()
-        return base or cleaned
-
-    def _next_copy_name(self, cursor, base_name: str) -> str:
-        canonical = self._canonical_edit_base_name(base_name)
-        pattern = re.compile(r"^%s(?:_v(\d+))?$" % re.escape(canonical))
-        cursor.execute(
-            """
-            SELECT current_name
-            FROM ab_agent_specs
-            WHERE current_name = %s OR current_name LIKE %s
-            """,
-            (canonical, f"{canonical}_v%"),
-        )
-        next_version = 2
-        for row in cursor.fetchall():
-            current_name = row[0] if not isinstance(row, dict) else row.get("current_name")
-            match = pattern.match(str(current_name or "").strip())
-            if not match:
-                continue
-            suffix = match.group(1)
-            if suffix is None:
-                next_version = max(next_version, 2)
-                continue
-            try:
-                next_version = max(next_version, int(suffix) + 1)
-            except (TypeError, ValueError):
-                continue
-        return f"{canonical}_v{next_version}"
-
-    @staticmethod
-    def _serialize_agent_spec_content(name: str, tools: List[str], prompt: str, *, ab_only: bool) -> str:
-        lines = [
-            "---",
-            f"name: {name}",
-        ]
-        if ab_only:
-            lines.append("ab_only: true")
-        if tools:
-            lines.append("tools:")
-            for tool in tools:
-                lines.append(f"  - {tool}")
-        lines.extend(["---", ""])
-        body = str(prompt or "").rstrip()
-        return "\n".join(lines) + "\n" + body + "\n"
-
     def _insert_version(
         self,
         cursor,
@@ -478,45 +423,6 @@ class ABAgentSpecService:
             raise
         finally:
             self._release_connection(conn)
-
-    def save_edited_copy(
-        self,
-        content: str,
-        *,
-        existing_name: str,
-        created_by: Optional[str] = None,
-        source_type: str = "ui-edit",
-        source_path: Optional[str] = None,
-    ) -> ABAgentSpecRecord:
-        current = self.get_spec_by_name(existing_name)
-        if current is None:
-            raise AgentSpecError(f"A/B agent '{existing_name}' not found")
-
-        parsed = load_agent_spec_from_text(content)
-        if self._content_hash(content) == current.content_hash:
-            return current
-
-        conn = self._get_connection()
-        try:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
-                new_name = self._next_copy_name(cursor, current.name)
-                new_content = self._serialize_agent_spec_content(
-                    new_name,
-                    list(parsed.tools or []),
-                    parsed.prompt,
-                    ab_only=bool(parsed.ab_only),
-                )
-            self._release_connection(conn)
-            conn = None
-            return self.save_spec(
-                new_content,
-                created_by=created_by,
-                source_type=source_type,
-                source_path=source_path,
-            )
-        finally:
-            if conn is not None:
-                self._release_connection(conn)
 
     def delete_spec_by_name(self, name: str) -> bool:
         conn = self._get_connection()

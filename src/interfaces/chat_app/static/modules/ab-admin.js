@@ -1,14 +1,14 @@
 (function () {
   const ENDPOINTS = {
-    agents: '/api/agents/list?scope=ab',
+    agents: '/api/ab/agents/list',
     pool: '/api/ab/pool',
     saveSettings: '/api/ab/pool/settings/set',
     saveVariants: '/api/ab/pool/variants/set',
     disable: '/api/ab/pool/disable',
     metrics: '/api/ab/metrics',
     providers: '/api/providers',
-    agentTemplate: '/api/agents/template?scope=ab',
-    saveAgent: '/api/agents',
+    agentTemplate: '/api/ab/agents/template',
+    saveAgent: '/api/ab/agents',
   };
 
   const SETTINGS_DRAFT_STORAGE_KEY = 'archi_ab_admin_settings_draft_v1';
@@ -49,10 +49,7 @@
     },
     variantForm: [],
     modal: {
-      mode: 'create',
       targetIndex: null,
-      sourceName: '',
-      sourceFilename: '',
       tools: [],
       sourceTemplate: '',
     },
@@ -100,6 +97,19 @@
       .replace(/'/g, '&#39;');
   }
 
+  function normalizeToolItem(tool) {
+    if (tool && typeof tool === 'object') {
+      return {
+        name: String(tool.name || '').trim(),
+        description: String(tool.description || '').trim(),
+      };
+    }
+    return {
+      name: String(tool || '').trim(),
+      description: '',
+    };
+  }
+
   async function fetchJson(url, options = {}) {
     const response = await fetch(url, options);
     if (response.status === 401) {
@@ -134,11 +144,6 @@
 
   function providerCatalog() {
     return state.providers.filter((provider) => provider);
-  }
-
-  function getAgentByFilename(filename) {
-    const target = String(filename || '').trim();
-    return state.agents.find((agent) => String(agent.filename || '').trim() === target) || null;
   }
 
   function getProviderConfig(providerType) {
@@ -495,12 +500,6 @@
                 <select data-field="agent_spec" ${disabledAttr}>
                   ${agentOptionsHtml(variant.agent_spec)}
                 </select>
-                <button
-                  class="ab-variant-inline-btn"
-                  type="button"
-                  data-edit-agent="${index}"
-                  ${!state.canManage || !String(variant.agent_spec || '').trim() ? 'disabled' : ''}
-                >Edit</button>
               </div>
             </div>
             <label class="ab-admin-field">
@@ -830,119 +829,49 @@
     }
   }
 
-  function serialiseAgentSpec(name, tools, prompt) {
-    let yaml = `---\nname: ${name}\nab_only: true\n`;
-    if (tools.length) {
-      yaml += 'tools:\n';
-      for (const tool of tools) yaml += `  - ${tool}\n`;
-    }
-    yaml += '---\n\n';
-    return yaml + String(prompt || '').trim();
-  }
-
-  function configureModalForMode(mode, options = {}) {
-    state.modal.mode = mode === 'edit' ? 'edit' : 'create';
-    state.modal.targetIndex = Number.isInteger(options.targetIndex) ? options.targetIndex : null;
-    state.modal.sourceName = String(options.sourceName || '').trim();
-    state.modal.sourceFilename = String(options.sourceFilename || '').trim();
-    if (els.modalTitle) {
-      els.modalTitle.textContent = state.modal.mode === 'edit' ? 'Edit A/B Agent' : 'New A/B Agent';
-    }
-    if (els.modalDescription) {
-      els.modalDescription.textContent = state.modal.mode === 'edit'
-        ? 'Editing creates a new immutable A/B agent spec and switches the current variant to that new copy.'
-        : 'Create an agent spec that is only available to A/B experiments.';
-    }
-    if (els.modalNameLabel) {
-      els.modalNameLabel.textContent = state.modal.mode === 'edit' ? 'Source Agent Name' : 'Agent Name';
-    }
-    if (els.modalName) {
-      els.modalName.disabled = state.modal.mode === 'edit';
-      els.modalName.placeholder = state.modal.mode === 'edit' ? 'Immutable copy will be named automatically' : 'A/B Candidate';
-    }
-    if (els.modalSave) {
-      els.modalSave.textContent = state.modal.mode === 'edit' ? 'Save Edited Copy' : 'Create Agent';
-    }
-  }
-
   async function openCreateAgentModal(targetIndex = null) {
     if (!state.canManage) return;
-    configureModalForMode('create', { targetIndex });
+    state.modal.targetIndex = Number.isInteger(targetIndex) ? targetIndex : null;
     setModalMessage('');
+    if (els.modalTitle) els.modalTitle.textContent = 'New A/B Agent';
+    if (els.modalDescription) els.modalDescription.textContent = 'Create an agent spec that is only available to A/B experiments.';
+    if (els.modalNameLabel) els.modalNameLabel.textContent = 'Agent Name';
     if (els.modalName) els.modalName.value = '';
+    if (els.modalName) els.modalName.disabled = false;
+    if (els.modalName) els.modalName.placeholder = 'A/B Candidate';
     if (els.modalPrompt) els.modalPrompt.value = '';
+    if (els.modalSave) els.modalSave.textContent = 'Create Agent';
     if (els.modalTools) els.modalTools.innerHTML = '<div class="ab-admin-empty-state">Loading template…</div>';
     if (els.modal) els.modal.style.display = '';
     try {
-      const template = await fetchJson(`${ENDPOINTS.agentTemplate}&name=${encodeURIComponent('New A/B Agent')}`);
-      state.modal.tools = Array.isArray(template.tools) ? template.tools : [];
+      const template = await fetchJson(`${ENDPOINTS.agentTemplate}?name=${encodeURIComponent('New A/B Agent')}`);
+      state.modal.tools = Array.isArray(template.tools)
+        ? template.tools.map(normalizeToolItem).filter((tool) => tool.name)
+        : [];
       state.modal.sourceTemplate = String(template.template || '');
       if (els.modalPrompt) {
-        const match = state.modal.sourceTemplate.match(/^---\s*\n[\s\S]*?\n---\s*\n?([\s\S]*)$/);
-        els.modalPrompt.value = (match ? match[1] : '').trim();
+        els.modalPrompt.value = String(template.prompt || '').trim();
       }
       if (els.modalTools) {
-        els.modalTools.innerHTML = state.modal.tools.map((tool) => `
-          <label class="ab-agent-tool-item">
-            <input type="checkbox" value="${escapeHtml(tool.name)}" checked>
-            <span>${escapeHtml(tool.name)}</span>
-            <small>${escapeHtml(tool.description || '')}</small>
-          </label>
-        `).join('');
+        if (!state.modal.tools.length) {
+          els.modalTools.innerHTML = '<div class="ab-admin-empty-state">No tools are available for the active agent class.</div>';
+        } else {
+          els.modalTools.innerHTML = state.modal.tools.map((tool) => `
+            <label class="ab-agent-tool-item">
+              <input type="checkbox" value="${escapeHtml(tool.name)}" checked>
+              <span>${escapeHtml(tool.name)}</span>
+              <small>${escapeHtml(tool.description || '')}</small>
+            </label>
+          `).join('');
+        }
       }
     } catch (error) {
       setModalMessage(error.message || 'Unable to load A/B agent template.', 'error');
     }
   }
 
-  async function openEditAgentModal(targetIndex) {
-    if (!state.canManage || !Number.isInteger(targetIndex) || !state.variantForm[targetIndex]) return;
-    const variant = state.variantForm[targetIndex];
-    const selectedAgent = getAgentByFilename(variant.agent_spec);
-    if (!selectedAgent) {
-      setVariantMessage('Select an A/B agent before editing it.', 'error');
-      return;
-    }
-
-    configureModalForMode('edit', {
-      targetIndex,
-      sourceName: selectedAgent.name,
-      sourceFilename: selectedAgent.filename,
-    });
-    setModalMessage('');
-    if (els.modalName) els.modalName.value = selectedAgent.name;
-    if (els.modalPrompt) els.modalPrompt.value = '';
-    if (els.modalTools) els.modalTools.innerHTML = '<div class="ab-admin-empty-state">Loading agent…</div>';
-    if (els.modal) els.modal.style.display = '';
-
-    try {
-      const [template, spec] = await Promise.all([
-        fetchJson(`${ENDPOINTS.agentTemplate}&name=${encodeURIComponent(selectedAgent.name)}`),
-        fetchJson(`/api/agents/spec?scope=ab&filename=${encodeURIComponent(selectedAgent.filename)}`),
-      ]);
-      state.modal.tools = Array.isArray(template.tools) ? template.tools : [];
-      state.modal.sourceTemplate = String(template.template || '');
-      if (els.modalPrompt) {
-        els.modalPrompt.value = String(spec.prompt || '').trim();
-      }
-      const enabledTools = new Set(Array.isArray(spec.tools) ? spec.tools : []);
-      if (els.modalTools) {
-        els.modalTools.innerHTML = state.modal.tools.map((tool) => `
-          <label class="ab-agent-tool-item">
-            <input type="checkbox" value="${escapeHtml(tool.name)}" ${enabledTools.has(tool.name) ? 'checked' : ''}>
-            <span>${escapeHtml(tool.name)}</span>
-            <small>${escapeHtml(tool.description || '')}</small>
-          </label>
-        `).join('');
-      }
-    } catch (error) {
-      setModalMessage(error.message || 'Unable to load the selected A/B agent.', 'error');
-    }
-  }
-
   function closeCreateAgentModal() {
     if (els.modal) els.modal.style.display = 'none';
-    configureModalForMode('create', { targetIndex: null });
     state.modal.targetIndex = null;
     setModalMessage('');
   }
@@ -952,8 +881,7 @@
     const name = String(els.modalName?.value || '').trim();
     const prompt = String(els.modalPrompt?.value || '').trim();
     const tools = [...(els.modalTools?.querySelectorAll('input[type="checkbox"]:checked') || [])].map((checkbox) => checkbox.value);
-    const isEdit = state.modal.mode === 'edit';
-    if (!isEdit && !name) {
+    if (!name) {
       setModalMessage('Agent name is required.', 'error');
       els.modalName?.focus();
       return;
@@ -965,17 +893,15 @@
     }
 
     els.modalSave.disabled = true;
-    els.modalSave.textContent = isEdit ? 'Saving…' : 'Creating…';
+    els.modalSave.textContent = 'Creating…';
     try {
-      const content = serialiseAgentSpec(isEdit ? state.modal.sourceName : name, tools, prompt);
       const response = await fetchJson(ENDPOINTS.saveAgent, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          scope: 'ab',
-          mode: isEdit ? 'edit' : 'create',
-          existing_name: isEdit ? state.modal.sourceName : null,
-          content,
+          name,
+          tools,
+          prompt,
         }),
       });
       await loadAgents();
@@ -988,17 +914,12 @@
         renderVariants();
       }
       closeCreateAgentModal();
-      setVariantMessage(
-        isEdit
-          ? `Saved edited copy '${response.name}' and updated the variant to use it.`
-          : `Created A/B agent '${response.name}'.`,
-        'success',
-      );
+      setVariantMessage(`Created A/B agent '${response.name}'.`, 'success');
     } catch (error) {
-      setModalMessage(error.message || (isEdit ? 'Unable to save edited A/B agent copy.' : 'Unable to create A/B agent.'), 'error');
+      setModalMessage(error.message || 'Unable to create A/B agent.', 'error');
     } finally {
       els.modalSave.disabled = false;
-      els.modalSave.textContent = isEdit ? 'Save Edited Copy' : 'Create Agent';
+      els.modalSave.textContent = 'Create Agent';
     }
   }
 
@@ -1131,13 +1052,6 @@
         return;
       }
 
-      const editButton = event.target.closest('[data-edit-agent]');
-      if (editButton) {
-        const index = Number.parseInt(editButton.dataset.editAgent || '-1', 10);
-        if (index >= 0) {
-          openEditAgentModal(index);
-        }
-      }
     });
 
     window.addEventListener('beforeunload', (event) => {

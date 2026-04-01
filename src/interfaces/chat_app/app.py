@@ -2410,6 +2410,9 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/api/ab/pool/disable', 'ab_pool_disable', self.require_auth(self.ab_disable_pool), methods=["POST"])
         self.add_endpoint('/api/ab/compare', 'ab_compare', self.require_auth(self.ab_compare_stream), methods=["POST"])
         self.add_endpoint('/api/ab/metrics', 'ab_metrics', self.require_auth(self.ab_get_metrics), methods=["GET"])
+        self.add_endpoint('/api/ab/agents/list', 'list_ab_agents', self.require_auth(self.list_ab_agents), methods=["GET"])
+        self.add_endpoint('/api/ab/agents/template', 'get_ab_agent_template', self.require_auth(self.get_ab_agent_template), methods=["GET"])
+        self.add_endpoint('/api/ab/agents', 'save_ab_agent_spec', self.require_auth(self.save_ab_agent_spec), methods=["POST"])
 
         # Agent trace endpoints
         logger.info("Adding agent trace API endpoints")
@@ -3072,6 +3075,7 @@ class FlaskAppWrapper(object):
         raw_pool = raw_ab_cfg.get("pool") or {}
         state = getattr(self.chat, "ab_pool_state", None)
         active_pool = getattr(self.chat, "ab_pool", None)
+        participation = self._get_ab_participation_state()
         defaults = self._get_ab_runtime_defaults()
 
         variant_details = self._normalize_ab_variant_details(raw_pool.get("variants"))
@@ -3095,7 +3099,10 @@ class FlaskAppWrapper(object):
             "can_view": self._can_view_ab_testing(),
             "can_manage": self._can_manage_ab_testing(),
             "can_view_metrics": self._can_view_ab_metrics(),
-            "can_participate": has_permission(Permission.AB.PARTICIPATE),
+            "can_participate": participation["can_participate"],
+            "participant_eligible": participation["eligible"],
+            "participant_reason": participation["reason"],
+            "participant_targeted": participation["targeted"],
             "enabled": bool(active_pool and active_pool.enabled),
             "enabled_requested": bool(raw_ab_cfg.get("enabled", False)),
             "champion": champion,
@@ -3309,6 +3316,108 @@ class FlaskAppWrapper(object):
             "Write your system prompt here.\n\n"
         )
 
+    def _build_agent_template_payload(self, name: str, *, scope: str = "default") -> Dict[str, Any]:
+        tool_items = self._get_agent_tools()
+        tools = [tool["name"] for tool in tool_items]
+        return {
+            "name": name,
+            "tools": tool_items,
+            "prompt": "Write your system prompt here.",
+            "template": self._build_agent_template(name, tools),
+            "scope": scope,
+        }
+
+    def _build_ab_agent_content(self, name: str, tools: List[str], prompt: str) -> str:
+        normalized_name = str(name or "").strip()
+        normalized_prompt = str(prompt or "").strip()
+        normalized_tools = [
+            str(tool).strip()
+            for tool in (tools or [])
+            if isinstance(tool, str) and str(tool).strip()
+        ]
+        if not normalized_name:
+            raise AgentSpecError("Agent name is required.")
+        if not normalized_tools:
+            raise AgentSpecError("At least one tool is required.")
+        if not normalized_prompt:
+            raise AgentSpecError("Prompt body is required.")
+        frontmatter = yaml.safe_dump(
+            {
+                "name": normalized_name,
+                "ab_only": True,
+                "tools": normalized_tools,
+            },
+            sort_keys=False,
+            default_flow_style=False,
+            allow_unicode=False,
+        ).strip()
+        return f"---\n{frontmatter}\n---\n\n{normalized_prompt}\n"
+
+    def _list_ab_agent_catalog_payload(self) -> Dict[str, Any]:
+        agents = []
+        for record in self._get_ab_agent_spec_service().list_specs():
+            agents.append({"name": record.name, "filename": record.filename, "ab_only": True})
+        return {
+            "agents": agents,
+            "active_name": None,
+            "scope": "ab",
+            "directory": None,
+        }
+
+    def list_ab_agents(self):
+        try:
+            if not self._can_view_ab_testing():
+                return jsonify({"error": "A/B agent visibility requires A/B page access"}), 403
+            return jsonify(self._list_ab_agent_catalog_payload()), 200
+        except Exception as exc:
+            logger.error(f"Error listing A/B agents: {exc}")
+            return jsonify({"error": str(exc)}), 500
+
+    def get_ab_agent_template(self):
+        try:
+            if not self._can_manage_ab_testing():
+                return jsonify({"error": "A/B agent management requires admin access"}), 403
+            agent_name = request.args.get("name") or "New A/B Agent"
+            return jsonify(self._build_agent_template_payload(agent_name, scope="ab")), 200
+        except Exception as exc:
+            logger.error(f"Error building A/B agent template: {exc}")
+            return jsonify({"error": str(exc)}), 500
+
+    def save_ab_agent_spec(self):
+        try:
+            if not self._can_manage_ab_testing():
+                return jsonify({"error": "A/B agent management requires admin access"}), 403
+            data = request.get_json(force=True) or {}
+            name = data.get("name")
+            tools = data.get("tools")
+            prompt = data.get("prompt")
+            if not isinstance(tools, list):
+                return jsonify({"error": "tools must be a list"}), 400
+            content = self._build_ab_agent_content(name, tools, prompt)
+            created_by = (
+                session.get("user", {}).get("email")
+                or session.get("user", {}).get("id")
+                or data.get("client_id")
+                or "system"
+            )
+            record = self._get_ab_agent_spec_service().save_spec(
+                content,
+                created_by=created_by,
+            )
+            return jsonify({
+                "success": True,
+                "name": record.name,
+                "filename": record.filename,
+                "path": None,
+                "scope": "ab",
+            }), 200
+        except AgentSpecError as exc:
+            logger.error(f"Invalid A/B agent spec: {exc}")
+            return jsonify({"error": f"Invalid agent spec: {exc}"}), 400
+        except Exception as exc:
+            logger.error(f"Error saving A/B agent spec: {exc}")
+            return jsonify({"error": str(exc)}), 500
+
     def list_agents(self):
         """
         List available agent specs for the dropdown.
@@ -3318,15 +3427,7 @@ class FlaskAppWrapper(object):
             if scope == "ab":
                 if not self._can_view_ab_testing():
                     return jsonify({"error": "A/B agent visibility requires A/B view access"}), 403
-                agents = []
-                for record in self._get_ab_agent_spec_service().list_specs():
-                    agents.append({"name": record.name, "filename": record.filename, "ab_only": True})
-                return jsonify({
-                    "agents": agents,
-                    "active_name": None,
-                    "scope": scope,
-                    "directory": None,
-                }), 200
+                return jsonify(self._list_ab_agent_catalog_payload()), 200
             agents_dir = self._get_agent_dir_for_scope(scope, create=(scope == "ab"))
             agent_files = list_agent_files(agents_dir)
             agents = []
@@ -3417,14 +3518,7 @@ class FlaskAppWrapper(object):
             if scope == "ab" and not self._can_manage_ab_testing():
                 return jsonify({"error": "A/B agent management requires admin access"}), 403
             agent_name = request.args.get("name") or "New Agent"
-            tool_items = self._get_agent_tools()
-            tools = [tool["name"] for tool in tool_items]
-            return jsonify({
-                "name": agent_name,
-                "tools": tool_items,
-                "template": self._build_agent_template(agent_name, tools),
-                "scope": scope,
-            }), 200
+            return jsonify(self._build_agent_template_payload(agent_name, scope=scope)), 200
         except Exception as exc:
             logger.error(f"Error building agent template: {exc}")
             return jsonify({'error': str(exc)}), 500
@@ -3482,19 +3576,14 @@ class FlaskAppWrapper(object):
                     return jsonify({"error": "A/B agent management requires admin access"}), 403
                 created_by = session.get("user", {}).get("email") or session.get("user", {}).get("id") or data.get("client_id") or "system"
                 ab_service = self._get_ab_agent_spec_service()
-                if mode == "edit":
-                    if not existing_name:
-                        return jsonify({'error': 'existing_name required for edit'}), 400
-                    record = ab_service.save_edited_copy(
-                        content,
-                        existing_name=existing_name,
-                        created_by=created_by,
-                    )
-                else:
-                    record = ab_service.save_spec(
-                        content,
-                        created_by=created_by,
-                    )
+                if mode == "edit" or existing_name:
+                    return jsonify({
+                        "error": "Editing A/B agent specs is not supported. Create a new A/B agent spec instead."
+                    }), 400
+                record = ab_service.save_spec(
+                    content,
+                    created_by=created_by,
+                )
                 return jsonify({
                     'success': True,
                     'name': record.name,
@@ -3989,7 +4078,11 @@ class FlaskAppWrapper(object):
             return False
 
     def _can_view_ab_testing(self) -> bool:
-        return self._can_manage_ab_testing() or has_permission(Permission.AB.VIEW)
+        return (
+            self._can_manage_ab_testing()
+            or has_permission(Permission.AB.VIEW)
+            or has_permission(Permission.AB.METRICS)
+        )
 
     def _can_manage_ab_testing(self) -> bool:
         return self._is_admin_request() or has_permission(Permission.AB.MANAGE)
@@ -4027,16 +4120,43 @@ class FlaskAppWrapper(object):
             effective_rate = float(user.ab_participation_rate)
         return min(max(effective_rate, 0.0), 1.0)
 
-    def _can_use_ab_testing(self) -> bool:
-        pool = self.chat.ab_pool
+    def _get_ab_participation_state(self) -> Dict[str, Any]:
+        pool = getattr(self.chat, "ab_pool", None)
+        can_participate = has_permission(Permission.AB.PARTICIPATE)
+        if not can_participate:
+            return {
+                "can_participate": False,
+                "eligible": False,
+                "reason": "not_participant",
+                "targeted": False,
+            }
         if not pool or not pool.enabled:
-            return False
-        if not has_permission(Permission.AB.PARTICIPATE):
-            return False
-        return pool.is_targeted_user(
+            return {
+                "can_participate": True,
+                "eligible": False,
+                "reason": "disabled",
+                "targeted": False,
+            }
+        targeted = pool.is_targeted_user(
             roles=self._current_request_roles(),
             permissions=self._current_request_permissions(),
         )
+        if not targeted:
+            return {
+                "can_participate": True,
+                "eligible": False,
+                "reason": "not_targeted",
+                "targeted": False,
+            }
+        return {
+            "can_participate": True,
+            "eligible": True,
+            "reason": "eligible",
+            "targeted": True,
+        }
+
+    def _can_use_ab_testing(self) -> bool:
+        return bool(self._get_ab_participation_state()["eligible"])
 
     def _refresh_runtime_config(self) -> None:
         static = self.config_service.get_static_config(force_reload=True)
@@ -4713,8 +4833,9 @@ class FlaskAppWrapper(object):
             pool = self.chat.ab_pool
             can_view = self._can_view_ab_testing()
             can_manage = self._can_manage_ab_testing()
-            can_use = self._can_use_ab_testing()
-            can_participate = has_permission(Permission.AB.PARTICIPATE)
+            participation = self._get_ab_participation_state()
+            can_use = participation["eligible"]
+            can_participate = participation["can_participate"]
             raw_ab_cfg = ((self.services_config.get("chat_app", {}) or {}).get("ab_testing") or {})
             default_sample_rate = float(raw_ab_cfg.get("sample_rate", getattr(pool, "sample_rate", 1.0) or 1.0))
             if can_view:
@@ -4728,6 +4849,9 @@ class FlaskAppWrapper(object):
                     'can_manage': False,
                     'can_view_metrics': False,
                     'can_participate': can_participate,
+                    'participant_eligible': True,
+                    'participant_reason': participation["reason"],
+                    'participant_targeted': True,
                     **pool.participant_info(),
                     'sample_rate': effective_rate,
                     'default_sample_rate': default_sample_rate,
@@ -4741,6 +4865,9 @@ class FlaskAppWrapper(object):
                 'can_manage': can_manage,
                 'can_view_metrics': self._can_view_ab_metrics(),
                 'can_participate': can_participate,
+                'participant_eligible': participation["eligible"],
+                'participant_reason': participation["reason"],
+                'participant_targeted': participation["targeted"],
                 'sample_rate': self._get_effective_ab_sample_rate(default_sample_rate) if can_participate else default_sample_rate,
                 'default_sample_rate': default_sample_rate,
             }), 200
@@ -4760,11 +4887,14 @@ class FlaskAppWrapper(object):
             conversation_id = request.args.get('conversation_id', type=int)
             user_id = session.get('user', {}).get('id') or None
             pool = self.chat.ab_pool
+            participation = self._get_ab_participation_state()
 
             if not pool or not pool.enabled:
                 return jsonify({'success': True, 'enabled': False, 'use_ab': False, 'reason': 'disabled'}), 200
-            if not self._can_use_ab_testing():
-                return jsonify({'success': True, 'enabled': True, 'use_ab': False, 'reason': 'not_targeted'}), 200
+            if not participation["can_participate"]:
+                return jsonify({'success': True, 'enabled': True, 'use_ab': False, 'reason': 'not_participant'}), 200
+            if not participation["eligible"]:
+                return jsonify({'success': True, 'enabled': True, 'use_ab': False, 'reason': participation["reason"]}), 200
 
             if conversation_id:
                 try:
@@ -5178,7 +5308,7 @@ class FlaskAppWrapper(object):
         """Render the data viewer page."""
         return render_template(
             'data.html',
-            can_manage_ab_testing=self._can_manage_ab_testing(),
+            can_view_ab_testing=self._can_view_ab_testing(),
         )
 
     def ab_testing_admin_page(self):
