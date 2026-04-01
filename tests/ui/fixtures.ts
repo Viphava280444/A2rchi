@@ -181,22 +181,18 @@ export const mockData = {
   abMetrics: {
     metrics: [
       {
-        variant: 'Baseline',
-        is_champion: true,
-        comparisons: 10,
+        variant_name: 'Baseline',
         wins: 6,
         losses: 3,
         ties: 1,
-        win_rate: 0.6,
+        total_comparisons: 10,
       },
       {
-        variant: 'Poet',
-        is_champion: false,
-        comparisons: 10,
+        variant_name: 'Poet',
         wins: 3,
         losses: 6,
         ties: 1,
-        win_rate: 0.3,
+        total_comparisons: 10,
       },
     ],
   },
@@ -400,6 +396,10 @@ export async function setupBasicMocks(page: Page) {
 
   await page.route('**/api/providers/keys', async (route) => {
     await route.fulfill({ status: 200, json: mockData.providerKeys });
+  });
+
+  await page.route('**/api/ab/metrics*', async (route) => {
+    await route.fulfill({ status: 200, json: mockData.abMetrics });
   });
 
   await page.route('**/api/users/me/preferences', async (route) => {

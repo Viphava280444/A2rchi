@@ -21,7 +21,23 @@ import {
 // ---------------------------------------------------------------------------
 
 async function openABAdminPage(page: import('@playwright/test').Page) {
+  const poolLoaded = page.waitForResponse((response) =>
+    response.url().includes('/api/ab/pool') && response.request().method() === 'GET',
+  );
+  const providersLoaded = page.waitForResponse((response) =>
+    response.url().includes('/api/providers') && response.request().method() === 'GET',
+  );
+  const agentsLoaded = page.waitForResponse((response) =>
+    response.url().includes('/api/ab/agents/list') && response.request().method() === 'GET',
+  );
+  const metricsLoaded = page.waitForResponse((response) =>
+    response.url().includes('/api/ab/metrics') && response.request().method() === 'GET',
+  );
   await page.goto('/admin/ab-testing');
+  await poolLoaded;
+  await providersLoaded;
+  await agentsLoaded;
+  await metricsLoaded;
   await expect(page.locator('#ab-admin-status')).toBeVisible();
 }
 
