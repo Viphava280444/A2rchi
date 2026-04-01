@@ -93,7 +93,13 @@ export const mockData = {
   abPoolAdmin: {
     enabled: true,
     is_admin: true,
+    can_view: true,
     can_manage: true,
+    can_view_metrics: true,
+    can_participate: true,
+    participant_eligible: true,
+    participant_reason: 'eligible',
+    participant_targeted: true,
     enabled_requested: true,
     champion: 'Baseline',
     variants: ['Baseline', 'Poet'],
@@ -102,6 +108,7 @@ export const mockData = {
       { label: 'Poet', agent_spec: 'poet-ab.md', provider: 'openrouter', model: 'anthropic/claude-3.5-sonnet' },
     ],
     sample_rate: 1,
+    default_sample_rate: 1,
     disclosure_mode: 'post_vote_reveal',
     default_trace_mode: 'minimal',
     max_pending_per_conversation: 1,
@@ -110,8 +117,7 @@ export const mockData = {
       model: 'openai/gpt-4o',
       recursion_limit: 50,
       num_documents_to_retrieve: 5,
-      ab_agents_dir: '/root/archi/ab_agents',
-      ab_agents_dir_configured: true,
+      ab_catalog_source: 'database',
     },
     warnings: [],
   },
@@ -119,12 +125,19 @@ export const mockData = {
   abPoolAdminInactive: {
     enabled: false,
     is_admin: true,
+    can_view: true,
     can_manage: true,
+    can_view_metrics: true,
+    can_participate: true,
+    participant_eligible: false,
+    participant_reason: 'disabled',
+    participant_targeted: false,
     enabled_requested: false,
     champion: '',
     variants: [],
     variant_details: [],
     sample_rate: 1,
+    default_sample_rate: 1,
     disclosure_mode: 'post_vote_reveal',
     default_trace_mode: 'minimal',
     max_pending_per_conversation: 1,
@@ -133,8 +146,7 @@ export const mockData = {
       model: 'openai/gpt-4o',
       recursion_limit: 50,
       num_documents_to_retrieve: 5,
-      ab_agents_dir: '/root/archi/ab_agents',
-      ab_agents_dir_configured: true,
+      ab_catalog_source: 'database',
     },
     warnings: ['A/B testing is inactive until at least two variants are configured.'],
   },
@@ -142,7 +154,28 @@ export const mockData = {
   abPoolNonAdmin: {
     enabled: true,
     is_admin: false,
+    can_view: false,
     can_manage: false,
+    can_view_metrics: false,
+    can_participate: false,
+    participant_eligible: false,
+    participant_reason: 'not_participant',
+    participant_targeted: false,
+    default_sample_rate: 1,
+  },
+
+  currentUser: {
+    id: 'user-123',
+    display_name: 'Test User',
+    email: 'test@example.com',
+    auth_provider: 'basic',
+    theme: 'light',
+    preferred_model: null,
+    preferred_temperature: null,
+    ab_participation_rate: null,
+    has_openrouter_key: false,
+    has_openai_key: false,
+    has_anthropic_key: false,
   },
 
   abMetrics: {
@@ -183,7 +216,7 @@ function abAdminPageHtml() {
   <link rel="stylesheet" href="/static/chat.css">
   <link rel="stylesheet" href="/static/data.css">
 </head>
-<body>
+<body data-can-manage-ab-testing="true" data-can-view-ab-metrics="true">
   <div class="data-app">
     <header class="data-header">
       <div class="header-left"><a href="/data" class="back-link"><span>Data</span></a></div>
@@ -217,7 +250,7 @@ function abAdminPageHtml() {
         <div class="ab-admin-panel-header">
           <div>
             <h2>Variants</h2>
-            <p>Each variant must have a unique label and a concrete agent markdown file in the isolated A/B agent pool.</p>
+            <p>Each variant must have a unique label and a concrete A/B agent spec from the database-backed experiment catalog.</p>
           </div>
           <div class="ab-admin-panel-actions">
             <button class="ab-pool-btn ab-pool-btn-save" id="ab-admin-variant-save" type="button">Save Variants</button>
@@ -263,7 +296,7 @@ function adminDataPageHtml() {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>archi - Data Viewer</title>
+  <title>archi - Data Sources</title>
   <link rel="stylesheet" href="/static/chat.css">
   <link rel="stylesheet" href="/static/data.css">
 </head>
@@ -271,7 +304,7 @@ function adminDataPageHtml() {
   <div class="data-app">
     <header class="data-header">
       <div class="header-left"><a href="/chat" class="back-link"><span>Chat</span></a></div>
-      <div class="header-center"><h1>Data Viewer</h1></div>
+      <div class="header-center"><h1>Data Sources</h1></div>
       <div class="header-right">
         <a href="/admin/ab-testing" class="icon-btn header-action-btn ab-admin-nav-btn" title="A/B Testing"><span>A/B Testing</span></a>
         <a href="/upload" class="icon-btn header-action-btn" title="Uploader"><span>Uploader</span></a>
@@ -343,6 +376,8 @@ export function createToolCallEvents(toolName: string, args: object, output: str
 // =============================================================================
 
 export async function setupBasicMocks(page: Page) {
+  let currentUser = cloneJson(mockData.currentUser);
+
   await page.route('**/api/get_configs', async (route) => {
     await route.fulfill({ status: 200, json: mockData.configs });
   });
@@ -367,28 +402,62 @@ export async function setupBasicMocks(page: Page) {
     await route.fulfill({ status: 200, json: mockData.providerKeys });
   });
 
+  await page.route('**/api/users/me/preferences', async (route) => {
+    if (route.request().method() !== 'PATCH') {
+      await route.fallback();
+      return;
+    }
+    const body = route.request().postDataJSON();
+    currentUser = {
+      ...currentUser,
+      ...body,
+    };
+    await route.fulfill({ status: 200, json: currentUser });
+  });
+
+  await page.route('**/api/users/me', async (route) => {
+    await route.fulfill({ status: 200, json: currentUser });
+  });
+
   await page.route('**/api/new_conversation', async (route) => {
     await route.fulfill({ status: 200, json: { conversation_id: null } });
   });
 
-  // Default agent lists
+  // Default agent list
   await page.route('**/api/agents/list*', async (route) => {
-    const url = route.request().url();
-    const isABScope = url.includes('scope=ab');
-    await route.fulfill({ status: 200, json: isABScope ? mockData.abAgentsList : mockData.agentsList });
+    await route.fulfill({ status: 200, json: mockData.agentsList });
   });
 
-  await page.route('**/api/agents/template*', async (route) => {
+  await page.route('**/api/ab/agents/list*', async (route) => {
+    await route.fulfill({ status: 200, json: mockData.abAgentsList });
+  });
+
+  await page.route('**/api/ab/agents/template*', async (route) => {
     await route.fulfill({
       status: 200,
       json: {
         name: 'New A/B Agent',
+        prompt: 'You are an A/B-only agent.',
         tools: [
           { name: 'search_docs', description: 'Search indexed documents' },
           { name: 'fetch_ticket', description: 'Fetch ticket details' },
         ],
         template: '---\nname: New A/B Agent\nab_only: true\ntools:\n  - search_docs\n  - fetch_ticket\n---\n\nYou are an A/B-only agent.',
       },
+    });
+  });
+
+  await page.route('**/api/ab/agents', async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.fallback();
+      return;
+    }
+    const body = route.request().postDataJSON();
+    const name = String(body.name || 'New A/B Agent').trim() || 'New A/B Agent';
+    const filename = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'new-ab-agent'}.md`;
+    await route.fulfill({
+      status: 200,
+      json: { success: true, name, filename, scope: 'ab' },
     });
   });
 
@@ -411,15 +480,34 @@ export async function setupBasicMocks(page: Page) {
   // Default A/B pool: non-admin, disabled.
   // Tests that need admin behavior should call setupABAdminMocks AFTER this.
   await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
-    await route.fulfill({ status: 200, json: { enabled: false, is_admin: false, can_manage: false } });
+    await route.fulfill({
+      status: 200,
+      json: {
+        success: true,
+        enabled: false,
+        enabled_requested: false,
+        is_admin: false,
+        can_view: false,
+        can_manage: false,
+        can_view_metrics: false,
+        can_participate: false,
+        participant_eligible: false,
+        participant_reason: 'not_participant',
+        participant_targeted: false,
+        sample_rate: 1,
+        default_sample_rate: 1,
+      },
+    });
   });
 
   await page.route('**/api/ab/decision*', async (route) => {
     await route.fulfill({
       status: 200,
       json: {
+        success: true,
+        enabled: false,
         use_ab: false,
-        reason: 'pool_disabled',
+        reason: 'disabled',
         pending_count: 0,
         max_pending_per_conversation: 1,
       },
@@ -432,8 +520,10 @@ export async function setupABDecisionMock(page: Page, overrides: Record<string, 
     await route.fulfill({
       status: 200,
       json: {
+        success: true,
+        enabled: false,
         use_ab: false,
-        reason: 'pool_disabled',
+        reason: 'disabled',
         pending_count: 0,
         max_pending_per_conversation: 1,
         ...overrides,
@@ -457,30 +547,38 @@ export async function setupABAdminPageBootstrap(page: Page, options: {
   });
 
   await page.route('**/api/agents/list*', async (route) => {
-    const url = route.request().url();
-    const isABScope = url.includes('scope=ab');
+    await route.fulfill({ status: 200, json: mockData.agentsList });
+  });
+
+  await page.route('**/api/ab/agents/list*', async (route) => {
     await route.fulfill({
       status: 200,
-      json: isABScope
-        ? { agents: abAgents, active_name: null }
-        : mockData.agentsList,
+      json: { agents: abAgents, active_name: null, scope: 'ab' },
     });
   });
 
-  await page.route('**/api/agents', async (route) => {
+  await page.route('**/api/ab/agents/template*', async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: {
+        name: 'New A/B Agent',
+        prompt: 'You are an A/B-only agent.',
+        tools: [
+          { name: 'search_docs', description: 'Search indexed documents' },
+          { name: 'fetch_ticket', description: 'Fetch ticket details' },
+        ],
+        scope: 'ab',
+      },
+    });
+  });
+
+  await page.route('**/api/ab/agents', async (route) => {
     if (route.request().method() !== 'POST') {
       await route.fallback();
       return;
     }
     const body = route.request().postDataJSON();
-    if (body.scope !== 'ab') {
-      await route.fallback();
-      return;
-    }
-
-    const content = String(body.content || '');
-    const match = content.match(/^name:\s*(.+)$/m);
-    const name = match ? match[1].trim() : 'New A/B Agent';
+    const name = String(body.name || '').trim() || 'New A/B Agent';
     const filename = `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'new-ab-agent'}.md`;
 
     abAgents = abAgents.filter((agent) => agent.filename !== filename);
@@ -533,7 +631,7 @@ export async function setupABAdminInactiveMocks(page: Page) {
 
   await setupABDecisionMock(page, {
     use_ab: false,
-    reason: 'pool_disabled',
+    reason: 'disabled',
     pending_count: 0,
     max_pending_per_conversation: mockData.abPoolAdminInactive.max_pending_per_conversation,
   });

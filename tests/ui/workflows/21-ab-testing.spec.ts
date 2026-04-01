@@ -68,6 +68,72 @@ test.describe('A/B Management Entry Point -- Admin Gating', () => {
     await expect(page.locator('#ab-settings-section .settings-link-btn')).toHaveAttribute('href', '/admin/ab-testing');
   });
 
+  test('participant-only users see sampling controls without admin link', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          success: true,
+          enabled: true,
+          enabled_requested: true,
+          is_admin: false,
+          can_view: false,
+          can_manage: false,
+          can_view_metrics: false,
+          can_participate: true,
+          participant_eligible: true,
+          participant_reason: 'eligible',
+          participant_targeted: true,
+          sample_rate: 0.7,
+          default_sample_rate: 0.5,
+          disclosure_mode: 'post_vote_reveal',
+          default_trace_mode: 'minimal',
+          max_pending_per_conversation: 1,
+        },
+      });
+    });
+
+    await page.goto('/chat');
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'A/B Testing' }).click();
+
+    await expect(page.locator('#ab-participation-group')).toBeVisible();
+    await expect(page.locator('#ab-settings-section')).toBeHidden();
+  });
+
+  test('untargeted participants see an explanatory settings note', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
+      await route.fulfill({
+        status: 200,
+        json: {
+          success: true,
+          enabled: false,
+          enabled_requested: true,
+          is_admin: false,
+          can_view: false,
+          can_manage: false,
+          can_view_metrics: false,
+          can_participate: true,
+          participant_eligible: false,
+          participant_reason: 'not_targeted',
+          participant_targeted: false,
+          sample_rate: 0.5,
+          default_sample_rate: 0.5,
+        },
+      });
+    });
+
+    await page.goto('/chat');
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'A/B Testing' }).click();
+
+    await expect(page.locator('#ab-participation-inactive')).toContainText('does not target your role or permissions');
+  });
+
   test('dedicated admin page loads for admin users', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
@@ -80,6 +146,29 @@ test.describe('A/B Management Entry Point -- Admin Gating', () => {
     await setupABAdminInactiveMocks(page);
     await openABAdminPage(page);
     await expect(page.locator('#ab-admin-status')).toHaveText('Inactive');
+  });
+
+  test('data viewer A/B link is visible for read-only viewers and opens the same page', async ({ page }) => {
+    await setupBasicMocks(page);
+
+    await page.route('**/data', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: `<!DOCTYPE html><html><body><a href="/admin/ab-testing" class="ab-admin-nav-btn">A/B Testing</a></body></html>`,
+      });
+    });
+    await page.route('**/admin/ab-testing', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: `<!DOCTYPE html><html><body data-can-manage-ab-testing="false" data-can-view-ab-metrics="true"><h1>A/B Testing</h1></body></html>`,
+      });
+    });
+
+    await page.goto('/data');
+    await page.getByRole('link', { name: 'A/B Testing' }).click();
+    await expect(page.getByRole('heading', { name: 'A/B Testing' })).toBeVisible();
   });
 });
 
@@ -107,7 +196,7 @@ test.describe('A/B Admin Page -- Variant List', () => {
     await expect(page.locator('#ab-admin-champion')).toHaveValue(mockData.abPoolAdmin.champion!);
   });
 
-  test('agent markdown selector exposes available files', async ({ page }) => {
+  test('agent spec selector exposes available A/B catalog entries', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
     await openABAdminPage(page);
@@ -115,21 +204,36 @@ test.describe('A/B Admin Page -- Variant List', () => {
     await expect(options).toHaveCount(mockData.abAgentsList.agents.length + 2);
   });
 
-  test('agent markdown selector can create a new A/B-only agent inline', async ({ page }) => {
+  test('agent spec selector can create a new database-backed A/B agent inline', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
+    let createdPayload: any = null;
+    await page.route('**/api/ab/agents', async (route) => {
+      createdPayload = route.request().postDataJSON();
+      await route.fulfill({
+        status: 200,
+        json: { success: true, name: 'Fresh AB Agent', filename: 'fresh-ab-agent.md', scope: 'ab' },
+      });
+    });
     await openABAdminPage(page);
 
     const secondCard = page.locator('.ab-variant-card').nth(1);
     await secondCard.locator('[data-field="agent_spec"]').selectOption('__create_new__');
 
     await expect(page.locator('#ab-agent-modal')).toBeVisible();
+    await expect(page.locator('#ab-agent-tools-list')).toContainText('search_docs');
+    await expect(page.locator('#ab-agent-tools-list')).toContainText('fetch_ticket');
     await page.locator('#ab-agent-name').fill('Fresh AB Agent');
     await page.locator('#ab-agent-prompt').fill('You are a freshly created A/B-only agent.');
     await page.locator('#ab-agent-save').click();
 
     await expect(page.locator('#ab-agent-modal')).toBeHidden();
     await expect(secondCard.locator('[data-field="agent_spec"]')).toHaveValue('fresh-ab-agent.md');
+    expect(createdPayload).toMatchObject({
+      name: 'Fresh AB Agent',
+      prompt: 'You are a freshly created A/B-only agent.',
+      tools: ['search_docs', 'fetch_ticket'],
+    });
   });
 
   test('provider selector uses provider dropdown options', async ({ page }) => {

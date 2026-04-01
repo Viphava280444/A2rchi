@@ -4,7 +4,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from src.interfaces.chat_app.app import ChatWrapper, FlaskAppWrapper
+from src.archi.pipelines.agents.agent_spec import load_agent_spec_from_text
 from src.utils.config_service import StaticConfig
+from src.utils.rbac import Permission
 
 
 def _static_config_with_ab(sample_rate=1.0):
@@ -38,18 +40,18 @@ def _static_config_with_ab(sample_rate=1.0):
     )
 
 
-def test_data_viewer_page_passes_ab_manage_flag_to_template():
+def test_data_viewer_page_passes_ab_view_flag_to_template():
     app = Flask(__name__)
     wrapper = object.__new__(FlaskAppWrapper)
     wrapper.app = app
 
     with app.test_request_context("/data"):
-        with patch.object(wrapper, "_can_manage_ab_testing", return_value=True):
+        with patch.object(wrapper, "_can_view_ab_testing", return_value=True):
             with patch("src.interfaces.chat_app.app.render_template", return_value="ok") as render_template_mock:
                 result = FlaskAppWrapper.data_viewer_page(wrapper)
 
     assert result == "ok"
-    render_template_mock.assert_called_once_with("data.html", can_manage_ab_testing=True)
+    render_template_mock.assert_called_once_with("data.html", can_view_ab_testing=True)
 
 
 def test_ab_testing_admin_page_requires_view_permission():
@@ -102,6 +104,14 @@ def test_ab_testing_admin_page_renders_template_for_admin():
         can_manage_ab_testing=True,
         can_view_ab_metrics=True,
     )
+
+
+def test_can_view_ab_testing_allows_metrics_only_users():
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper._can_manage_ab_testing = Mock(return_value=False)
+
+    with patch("src.interfaces.chat_app.app.has_permission", side_effect=lambda permission: permission == Permission.AB.METRICS):
+        assert FlaskAppWrapper._can_view_ab_testing(wrapper) is True
 
 
 def test_ab_testing_template_includes_theme_init_and_inline_agent_creation():
@@ -186,6 +196,12 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
     wrapper._can_view_ab_testing = Mock(return_value=True)
     wrapper._can_manage_ab_testing = Mock(return_value=True)
     wrapper._can_view_ab_metrics = Mock(return_value=True)
+    wrapper._get_ab_participation_state = Mock(return_value={
+        "can_participate": False,
+        "eligible": False,
+        "reason": "not_participant",
+        "targeted": False,
+    })
     wrapper.chat = SimpleNamespace(
         ab_pool=SimpleNamespace(
             enabled=True,
@@ -211,18 +227,151 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
     assert payload["variants"] == ["Baseline", "Poet"]
     assert payload["defaults"]["ab_catalog_source"] == "database"
     assert payload["defaults"]["provider"] == "openrouter"
+    assert payload["can_participate"] is False
+    assert payload["participant_reason"] == "not_participant"
     assert payload["warnings"] == ["A/B testing is active."]
     assert payload["import_diagnostics"]["imported"] == 2
 
 
-def test_save_agent_spec_ab_edit_creates_immutable_copy():
+def test_list_ab_agents_returns_database_catalog_payload():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+    wrapper._can_view_ab_testing = Mock(return_value=True)
+    wrapper._get_ab_agent_spec_service = Mock(return_value=Mock(
+        list_specs=Mock(return_value=[
+            SimpleNamespace(name="Baseline", filename="baseline.md"),
+            SimpleNamespace(name="Challenger", filename="challenger.md"),
+        ])
+    ))
+
+    with app.test_request_context("/api/ab/agents/list"):
+        response, status = FlaskAppWrapper.list_ab_agents(wrapper)
+
+    payload = response.get_json()
+    assert status == 200
+    assert payload["scope"] == "ab"
+    assert payload["agents"] == [
+        {"name": "Baseline", "filename": "baseline.md", "ab_only": True},
+        {"name": "Challenger", "filename": "challenger.md", "ab_only": True},
+    ]
+
+
+def test_get_ab_agent_template_returns_structured_tool_catalog():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+    wrapper._can_manage_ab_testing = Mock(return_value=True)
+    wrapper._get_agent_tools = Mock(return_value=[
+        {"name": "search_docs", "description": "Search indexed documents."},
+        {"name": "lookup_ticket", "description": ""},
+    ])
+
+    with app.test_request_context("/api/ab/agents/template?name=Candidate"):
+        response, status = FlaskAppWrapper.get_ab_agent_template(wrapper)
+
+    payload = response.get_json()
+    assert status == 200
+    assert payload["scope"] == "ab"
+    assert payload["name"] == "Candidate"
+    assert payload["prompt"] == "Write your system prompt here."
+    assert payload["tools"] == [
+        {"name": "search_docs", "description": "Search indexed documents."},
+        {"name": "lookup_ticket", "description": ""},
+    ]
+
+
+def test_save_ab_agent_spec_uses_structured_payload_and_server_side_serialization():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+    wrapper._can_manage_ab_testing = Mock(return_value=True)
+    ab_service = Mock()
+    ab_service.save_spec.return_value = SimpleNamespace(name="A/B: Candidate", filename="a-b-candidate.md")
+    wrapper._get_ab_agent_spec_service = Mock(return_value=ab_service)
+
+    with app.test_request_context(
+        "/api/ab/agents",
+        method="POST",
+        json={
+            "name": "A/B: Candidate",
+            "tools": ["search_docs", "lookup_ticket"],
+            "prompt": "Answer precisely.",
+        },
+    ):
+        response, status = FlaskAppWrapper.save_ab_agent_spec(wrapper)
+
+    payload = response.get_json()
+    assert status == 200
+    assert payload["filename"] == "a-b-candidate.md"
+    saved_content = ab_service.save_spec.call_args.args[0]
+    parsed = load_agent_spec_from_text(saved_content)
+    assert parsed.name == "A/B: Candidate"
+    assert parsed.tools == ["search_docs", "lookup_ticket"]
+    assert parsed.prompt == "Answer precisely."
+
+
+def test_ab_get_pool_reports_untargeted_participant_state():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+    wrapper.services_config = {"chat_app": {"ab_testing": {"enabled": True, "sample_rate": 0.5}}}
+    wrapper.chat = SimpleNamespace(
+        ab_pool=SimpleNamespace(
+            enabled=True,
+            sample_rate=0.5,
+            is_targeted_user=Mock(return_value=False),
+        )
+    )
+    wrapper._can_view_ab_testing = Mock(return_value=False)
+    wrapper._can_manage_ab_testing = Mock(return_value=False)
+    wrapper._can_view_ab_metrics = Mock(return_value=False)
+    wrapper._is_admin_request = Mock(return_value=False)
+    wrapper._get_effective_ab_sample_rate = Mock(return_value=0.5)
+    wrapper._current_request_roles = Mock(return_value=["base-user"])
+    wrapper._current_request_permissions = Mock(return_value=["ab:participate"])
+
+    with app.test_request_context("/api/ab/pool"):
+        with patch("src.interfaces.chat_app.app.has_permission", side_effect=lambda permission: permission == Permission.AB.PARTICIPATE):
+            response, status = FlaskAppWrapper.ab_get_pool(wrapper)
+
+    payload = response.get_json()
+    assert status == 200
+    assert payload["can_participate"] is True
+    assert payload["participant_eligible"] is False
+    assert payload["participant_reason"] == "not_targeted"
+    assert payload["participant_targeted"] is False
+    assert payload["enabled"] is False
+
+
+def test_ab_get_decision_distinguishes_non_participants():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+    wrapper.chat = SimpleNamespace(ab_pool=SimpleNamespace(enabled=True))
+
+    with app.test_request_context("/api/ab/decision?client_id=tester"):
+        with patch.object(wrapper, "_get_ab_participation_state", return_value={
+            "can_participate": False,
+            "eligible": False,
+            "reason": "not_participant",
+            "targeted": False,
+        }):
+            response, status = FlaskAppWrapper.ab_get_decision(wrapper)
+
+    payload = response.get_json()
+    assert status == 200
+    assert payload["reason"] == "not_participant"
+    assert payload["use_ab"] is False
+
+
+def test_save_agent_spec_ab_edit_is_rejected():
     app = Flask(__name__)
     wrapper = object.__new__(FlaskAppWrapper)
     wrapper.app = app
     wrapper._get_agent_scope = Mock(return_value="ab")
     wrapper._can_manage_ab_testing = Mock(return_value=True)
     ab_service = Mock()
-    ab_service.save_edited_copy.return_value = SimpleNamespace(name="Baseline_v2", filename="baseline-v2.md")
     wrapper._get_ab_agent_spec_service = Mock(return_value=ab_service)
 
     with app.test_request_context(
@@ -238,11 +387,56 @@ def test_save_agent_spec_ab_edit_creates_immutable_copy():
         response, status = FlaskAppWrapper.save_agent_spec(wrapper)
 
     payload = response.get_json()
+    assert status == 400
+    assert "not supported" in payload["error"].lower()
+    ab_service.save_spec.assert_not_called()
+
+
+def test_save_agent_spec_ab_create_still_uses_database_catalog():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+    wrapper._get_agent_scope = Mock(return_value="ab")
+    wrapper._can_manage_ab_testing = Mock(return_value=True)
+    ab_service = Mock()
+    ab_service.save_spec.return_value = SimpleNamespace(name="Baseline Candidate", filename="baseline-candidate.md")
+    wrapper._get_ab_agent_spec_service = Mock(return_value=ab_service)
+
+    with app.test_request_context(
+        "/api/agents",
+        method="POST",
+        json={
+            "scope": "ab",
+            "mode": "create",
+            "content": "---\nname: Baseline Candidate\nab_only: true\n---\nPrompt\n",
+        },
+    ):
+        response, status = FlaskAppWrapper.save_agent_spec(wrapper)
+
+    payload = response.get_json()
     assert status == 200
-    assert payload["name"] == "Baseline_v2"
-    assert payload["filename"] == "baseline-v2.md"
-    ab_service.save_edited_copy.assert_called_once()
-    assert ab_service.save_edited_copy.call_args.kwargs["existing_name"] == "Baseline"
+    assert payload["name"] == "Baseline Candidate"
+    assert payload["filename"] == "baseline-candidate.md"
+    ab_service.save_spec.assert_called_once()
+
+
+def test_ab_admin_script_does_not_include_edit_agent_workflow():
+    script_path = Path(__file__).resolve().parents[2] / "src/interfaces/chat_app/static/modules/ab-admin.js"
+    script = script_path.read_text()
+
+    assert "data-edit-agent" not in script
+    assert "Save Edited Copy" not in script
+    assert "openEditAgentModal" not in script
+
+
+def test_ab_admin_script_uses_dedicated_ab_agent_endpoints():
+    script_path = Path(__file__).resolve().parents[2] / "src/interfaces/chat_app/static/modules/ab-admin.js"
+    script = script_path.read_text()
+
+    assert "/api/ab/agents/list" in script
+    assert "/api/ab/agents/template" in script
+    assert "/api/ab/agents" in script
+    assert "/api/agents/template?scope=ab" not in script
 
 
 def test_ab_disable_pool_persists_disable_and_returns_admin_payload():

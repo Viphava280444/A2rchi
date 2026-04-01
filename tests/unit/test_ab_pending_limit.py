@@ -24,7 +24,13 @@ def _build_wrapper(*, sample_rate=1.0, max_pending=1, pending_count=0):
     wrapper.chat.conv_service.count_pending_ab_comparisons.return_value = pending_count
     wrapper.chat.conv_service.get_pending_ab_comparison.return_value = ABComparison(comparison_id=91)
     wrapper.chat.query_conversation_history = Mock()
-    wrapper._can_use_ab_testing = Mock(return_value=True)
+    wrapper._get_ab_participation_state = Mock(return_value={
+        "can_participate": True,
+        "eligible": True,
+        "reason": "eligible",
+        "targeted": True,
+    })
+    wrapper._get_effective_ab_sample_rate = Mock(return_value=sample_rate)
     return app, wrapper
 
 

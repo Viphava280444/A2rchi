@@ -176,6 +176,62 @@ def test_load_ab_pool_state_accepts_database_spec_lookup_callback():
     assert state.pool.champion_name == "Baseline"
 
 
+def test_ab_pool_targeting_requires_role_and_permission_groups_when_both_are_set():
+    pool = ABPool.from_config(
+        {
+            "enabled": True,
+            "target_roles": ["archi-expert"],
+            "target_permissions": ["ab:metrics"],
+            "pool": {
+                "champion": "Baseline",
+                "variants": [
+                    {"label": "Baseline", "agent_spec": "baseline.md"},
+                    {"label": "Challenger", "agent_spec": "challenger.md"},
+                ],
+            },
+        }
+    )
+
+    assert pool.is_targeted_user(
+        roles=["archi-expert"],
+        permissions=["ab:metrics"],
+    ) is True
+    assert pool.is_targeted_user(
+        roles=["archi-expert"],
+        permissions=["chat:query"],
+    ) is False
+    assert pool.is_targeted_user(
+        roles=["base-user"],
+        permissions=["ab:metrics"],
+    ) is False
+
+
+def test_ab_pool_targeting_matches_any_role_or_permission_within_each_group():
+    pool = ABPool.from_config(
+        {
+            "enabled": True,
+            "target_roles": ["archi-expert", "reviewer"],
+            "target_permissions": ["ab:view", "ab:metrics"],
+            "pool": {
+                "champion": "Baseline",
+                "variants": [
+                    {"label": "Baseline", "agent_spec": "baseline.md"},
+                    {"label": "Challenger", "agent_spec": "challenger.md"},
+                ],
+            },
+        }
+    )
+
+    assert pool.is_targeted_user(
+        roles=["reviewer"],
+        permissions=["ab:view"],
+    ) is True
+    assert pool.is_targeted_user(
+        roles=["archi-expert"],
+        permissions=["ab:metrics"],
+    ) is True
+
+
 def test_validate_ab_testing_config_allows_incomplete_ui_bootstrap():
     manager = object.__new__(ConfigurationManager)
 
