@@ -162,7 +162,10 @@ def test_data_template_uses_labeled_header_actions_without_expand_collapse_butto
 
 
 def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults():
+    app = Flask(__name__)
+    app.secret_key = "test-secret"
     wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
     wrapper.services_config = {
         "chat_app": {
             "default_provider": "openrouter",
@@ -219,7 +222,8 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
         ab_agent_import_diagnostics={"imported": 2, "conflicts": []},
     )
 
-    payload = FlaskAppWrapper._build_admin_ab_pool_payload(wrapper)
+    with app.test_request_context("/api/ab/pool"):
+        payload = FlaskAppWrapper._build_admin_ab_pool_payload(wrapper)
 
     assert payload["enabled"] is True
     assert payload["enabled_requested"] is True

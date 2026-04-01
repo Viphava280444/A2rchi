@@ -60,11 +60,11 @@ test.describe('A/B Management Entry Point -- Admin Gating', () => {
   test('chat settings shows admin link for admin users', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
-    await page.goto('/chat');
-    const display = await page.locator('#ab-settings-section').evaluate(
-      (el: HTMLElement) => el.style.display,
-    );
-    expect(display).toBe('');
+    await openChatPage(page);
+    await page.getByRole('button', { name: 'Settings' }).click();
+    await expect(page.getByRole('button', { name: 'A/B Testing' })).toBeVisible();
+    await page.getByRole('button', { name: 'A/B Testing' }).click();
+    await expect(page.locator('#ab-settings-section')).toBeVisible();
     await expect(page.locator('#ab-settings-section .settings-link-btn')).toHaveAttribute('href', '/admin/ab-testing');
   });
 
