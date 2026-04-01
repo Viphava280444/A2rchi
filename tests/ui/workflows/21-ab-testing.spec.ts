@@ -226,10 +226,7 @@ test.describe('A/B Admin Page -- Variant List', () => {
     let createdPayload: any = null;
     await page.route('**/api/ab/agents', async (route) => {
       createdPayload = route.request().postDataJSON();
-      await route.fulfill({
-        status: 200,
-        json: { success: true, name: 'Fresh AB Agent', filename: 'fresh-ab-agent.md', scope: 'ab' },
-      });
+      await route.fallback();
     });
     await openABAdminPage(page);
 
@@ -244,7 +241,7 @@ test.describe('A/B Admin Page -- Variant List', () => {
     await page.locator('#ab-agent-save').click();
 
     await expect(page.locator('#ab-agent-modal')).toBeHidden();
-    await expect(secondCard.locator('[data-field="agent_spec"]')).toHaveValue('fresh-ab-agent.md');
+    await expect(page.locator('.ab-variant-card').nth(1).locator('[data-field="agent_spec"]')).toHaveValue('fresh-ab-agent.md');
     expect(createdPayload).toMatchObject({
       name: 'Fresh AB Agent',
       prompt: 'You are a freshly created A/B-only agent.',
