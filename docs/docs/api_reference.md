@@ -50,15 +50,23 @@ Create an A/B comparison between two model responses (legacy manual mode).
 
 ### `GET /api/ab/pool`
 
-Get the server-side A/B testing pool configuration. Returns `enabled: true` with champion name and variant list when a pool is configured, or `enabled: false` otherwise.
+Get the server-side A/B testing pool configuration. The response shape depends on RBAC:
+
+- `ab:view` or `ab:manage`: full read-only experiment configuration
+- `ab:participate`: participant-focused payload including the effective per-user sample rate
+- otherwise: `enabled: false`
 
 **Response (pool active):**
 ```json
 {
   "success": true,
   "enabled": true,
+  "can_view": true,
+  "can_manage": false,
   "champion": "default",
-  "variants": ["default", "creative", "concise"]
+  "variants": ["default", "creative", "concise"],
+  "sample_rate": 0.25,
+  "default_sample_rate": 0.25
 }
 ```
 
@@ -133,14 +141,15 @@ Get or create the current user.
 
 ### `PATCH /api/users/me/preferences`
 
-Update user preferences (model, temperature, prompts, theme).
+Update user preferences (model, temperature, prompts, theme, and A/B participation override).
 
 **Request:**
 ```json
 {
   "theme": "light",
   "preferred_model": "claude-3-opus",
-  "preferred_temperature": 0.5
+  "preferred_temperature": 0.5,
+  "ab_participation_rate": 0.75
 }
 ```
 

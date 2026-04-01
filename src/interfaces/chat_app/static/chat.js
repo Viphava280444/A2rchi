@@ -50,6 +50,8 @@ const CONFIG = {
     AGENTS_LIST: '/api/agents/list',
     AGENT_SPEC: '/api/agents/spec',
     AGENT_ACTIVE: '/api/agents/active',
+    USER_ME: '/api/users/me',
+    USER_PREFERENCES: '/api/users/me/preferences',
     LIKE: '/api/like',
     DISLIKE: '/api/dislike',
     TEXT_FEEDBACK: '/api/text_feedback',
@@ -448,6 +450,18 @@ const API = {
     return this.fetchJson(url);
   },
 
+  async getCurrentUser() {
+    return this.fetchJson(CONFIG.ENDPOINTS.USER_ME);
+  },
+
+  async updateUserPreferences(payload) {
+    return this.fetchJson(CONFIG.ENDPOINTS.USER_PREFERENCES, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  },
+
   async setActiveAgent(name) {
     return this.fetchJson(CONFIG.ENDPOINTS.AGENT_ACTIVE, {
       method: 'POST',
@@ -718,6 +732,15 @@ const UI = {
       customModelRow: document.getElementById('custom-model-row'),
       activeModelLabel: document.getElementById('active-model-label'),
       darkModeToggle: document.getElementById('dark-mode-toggle'),
+      abSettingsNav: document.getElementById('ab-settings-nav'),
+      abSettingsSection: document.getElementById('settings-ab-testing'),
+      abParticipationGroup: document.getElementById('ab-participation-group'),
+      abParticipationSlider: document.getElementById('ab-participation-slider'),
+      abParticipationValue: document.getElementById('ab-participation-value'),
+      abParticipationDefault: document.getElementById('ab-participation-default'),
+      abParticipationNote: document.getElementById('ab-participation-note'),
+      abParticipationInactive: document.getElementById('ab-participation-inactive'),
+      abAdminLinkSection: document.getElementById('ab-settings-section'),
     };
 
     this.sendBtnDefaultHtml = this.elements.sendBtn?.innerHTML || '';
@@ -931,6 +954,14 @@ const UI = {
       const isDark = e.target.checked;
       document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
       localStorage.setItem('archi_theme', isDark ? 'dark' : 'light');
+    });
+
+    this.elements.abParticipationSlider?.addEventListener('input', (e) => {
+      this.updateABParticipationPreview(Number(e.target.value));
+    });
+
+    this.elements.abParticipationSlider?.addEventListener('change', async (e) => {
+      await Chat.saveABParticipationPreference(Number(e.target.value) / 100);
     });
 
     // Provider selection
@@ -2062,9 +2093,74 @@ const UI = {
   // =========================================================================
 
   setABSectionVisible(visible) {
-    const section = document.getElementById('ab-settings-section');
-    if (section) {
-      section.style.display = visible ? '' : 'none';
+    if (this.elements.abAdminLinkSection) {
+      this.elements.abAdminLinkSection.style.display = visible ? '' : 'none';
+    }
+  },
+
+  setABSettingsVisible(visible) {
+    if (this.elements.abSettingsNav) {
+      this.elements.abSettingsNav.style.display = visible ? '' : 'none';
+    }
+    if (this.elements.abSettingsSection && !visible) {
+      this.elements.abSettingsSection.hidden = true;
+      this.elements.abSettingsSection.classList.remove('active');
+    }
+  },
+
+  updateABParticipationPreview(value) {
+    if (this.elements.abParticipationValue) {
+      this.elements.abParticipationValue.textContent = `${Math.round(value)}%`;
+    }
+  },
+
+  updateABSettingsSection() {
+    const abState = Chat.state.abPool || {};
+    const capabilities = Chat.state.abCapabilities || {};
+    const currentUser = Chat.state.currentUser || {};
+    const preferenceSaveState = Chat.state.abPreferenceSaveState || null;
+    const canParticipate = capabilities.canParticipate === true;
+    const canViewAdmin = capabilities.canView === true;
+    const shouldShow = canParticipate || canViewAdmin;
+
+    this.setABSettingsVisible(shouldShow);
+    this.setABSectionVisible(canViewAdmin);
+
+    if (this.elements.abParticipationGroup) {
+      this.elements.abParticipationGroup.style.display = canParticipate ? '' : 'none';
+    }
+    if (!canParticipate) {
+      return;
+    }
+
+    const defaultRate = Number(abState.default_sample_rate ?? abState.sample_rate ?? 1);
+    const usingDefault = currentUser.ab_participation_rate == null || Number.isNaN(Number(currentUser.ab_participation_rate));
+    const effectiveRate = usingDefault ? defaultRate : Number(currentUser.ab_participation_rate);
+    const percent = Math.max(0, Math.min(100, Math.round(effectiveRate * 100)));
+
+    if (this.elements.abParticipationSlider) {
+      this.elements.abParticipationSlider.value = String(percent);
+    }
+    this.updateABParticipationPreview(percent);
+
+    if (this.elements.abParticipationDefault) {
+      this.elements.abParticipationDefault.textContent = `Default: ${Math.round(defaultRate * 100)}%`;
+    }
+    if (this.elements.abParticipationNote) {
+      if (preferenceSaveState?.type === 'error') {
+        this.elements.abParticipationNote.textContent = preferenceSaveState.message || 'Your last change was not saved.';
+        this.elements.abParticipationNote.classList.add('settings-inline-error');
+      } else {
+        this.elements.abParticipationNote.textContent = preferenceSaveState?.type === 'success'
+          ? (preferenceSaveState.message || 'Saved for your account.')
+          : (usingDefault
+            ? 'Currently using the deployment default until you choose your own rate.'
+            : 'Your saved setting applies only to your account.');
+        this.elements.abParticipationNote.classList.remove('settings-inline-error');
+      }
+    }
+    if (this.elements.abParticipationInactive) {
+      this.elements.abParticipationInactive.style.display = abState.enabled === false ? '' : 'none';
     }
   },
 
@@ -3495,6 +3591,13 @@ const Chat = {
     pendingABComparisons: [],  // unresolved comparisons in creation order
     abVotePending: false,      // true when waiting for user vote
     abPool: null,              // null or { enabled, champion, variants: [...] } from /api/ab/pool
+    abCapabilities: {
+      canView: false,
+      canManage: false,
+      canViewMetrics: false,
+      canParticipate: false,
+    },
+    abPreferenceSaveState: null,
     // Trace state
     activeTrace: null,         // { traceId, events: [], toolCalls: Map<toolCallId, toolData> }
     traceVerboseMode: localStorage.getItem(CONFIG.STORAGE_KEYS.TRACE_VERBOSE_MODE) || 'normal', // 'minimal' | 'normal' | 'verbose'
@@ -3509,6 +3612,7 @@ const Chat = {
     agents: [],
     allAgents: [],  // full list including ab_only variants, for pool editor
     activeAgentName: null,
+    currentUser: null,
   },
 
   getABPendingLimit() {
@@ -3568,6 +3672,7 @@ const Chat = {
       this.loadPipelineDefaultModel(),
       this.loadApiKeyStatus(),
       UI.loadUserProfile(),
+      this.loadCurrentUser(),
       this.loadAgents(),
       this.loadABPool(),
     ]);
@@ -3615,17 +3720,65 @@ const Chat = {
   async loadABPool() {
     try {
       const data = await API.getABPool();
-      const canManage = data?.can_manage === true;
-      UI.setABSectionVisible(canManage);
+      this.state.abCapabilities = {
+        canView: data?.can_view === true,
+        canManage: data?.can_manage === true,
+        canViewMetrics: data?.can_view_metrics === true,
+        canParticipate: data?.can_participate === true,
+      };
 
-      this.state.abPool = data?.enabled ? data : null;
-      if (canManage) {
+      this.state.abPool = data || null;
+      UI.updateABSettingsSection();
+      if (this.state.abCapabilities.canManage) {
         UI.updateABPoolUI(data?.enabled ? data : { enabled: false });
       }
     } catch (e) {
       console.warn('Failed to load A/B pool (pool mode disabled):', e);
       this.state.abPool = null;
-      UI.setABSectionVisible(false);
+      this.state.abCapabilities = {
+        canView: false,
+        canManage: false,
+        canViewMetrics: false,
+        canParticipate: false,
+      };
+      UI.updateABSettingsSection();
+    }
+  },
+
+  async loadCurrentUser() {
+    try {
+      const data = await API.getCurrentUser();
+      this.state.currentUser = data || null;
+      this.state.abPreferenceSaveState = null;
+      UI.updateABSettingsSection();
+    } catch (e) {
+      console.warn('Failed to load current user preferences:', e);
+      this.state.currentUser = null;
+      UI.updateABSettingsSection();
+    }
+  },
+
+  async saveABParticipationPreference(rate) {
+    const bounded = Math.max(0, Math.min(1, Number(rate)));
+    try {
+      const updated = await API.updateUserPreferences({ ab_participation_rate: bounded });
+      this.state.currentUser = {
+        ...(this.state.currentUser || {}),
+        ...updated,
+      };
+      this.state.abPreferenceSaveState = {
+        type: 'success',
+        message: 'Saved for your account.',
+      };
+      UI.updateABSettingsSection();
+    } catch (e) {
+      console.error('Failed to save A/B participation preference:', e);
+      this.state.abPreferenceSaveState = {
+        type: 'error',
+        message: e.message || 'Unable to save A/B participation preference.',
+      };
+      UI.showToast(e.message || 'Unable to save A/B participation preference.');
+      UI.updateABSettingsSection();
     }
   },
 

@@ -13,7 +13,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='data.css') }}">
   <link rel="icon" type="image/png" href="{{ url_for('static', filename='images/archi_notext.png') }}">
 </head>
-<body>
+<body data-can-manage-ab-testing="{{ 'true' if can_manage_ab_testing else 'false' }}" data-can-view-ab-metrics="{{ 'true' if can_view_ab_metrics else 'false' }}">
 {% include '_alert_banner.html' %}
   <div class="data-app">
     <header class="data-header">
@@ -52,6 +52,7 @@
           </div>
           <span class="ab-pool-status" id="ab-admin-status">Inactive</span>
         </div>
+        <div class="ab-pool-message" id="ab-admin-readonly" style="display: none;">Read-only access. You can inspect the current experiment but only users with the A/B manage permission can change it.</div>
 
         <div class="ab-admin-settings-grid">
           <label class="ab-admin-field">
@@ -96,7 +97,7 @@
         <div class="ab-admin-panel-header">
           <div>
             <h2>Variants</h2>
-            <p>Each variant must have a unique label and a concrete agent markdown file in the isolated A/B agent pool.</p>
+            <p>Each variant must have a unique label and a concrete A/B agent spec from the database-backed experiment catalog.</p>
           </div>
           <div class="ab-admin-panel-actions">
             <button class="ab-pool-btn ab-pool-btn-save" id="ab-admin-variant-save" type="button">Save Variants</button>
@@ -105,6 +106,17 @@
         </div>
         <div class="ab-pool-message" id="ab-admin-variant-message"></div>
         <div class="ab-admin-variant-list" id="ab-admin-variant-list"></div>
+      </section>
+
+      <section class="ab-admin-panel" id="ab-metrics-panel" style="display: none;">
+        <div class="ab-admin-panel-header">
+          <div>
+            <h2>Metrics</h2>
+            <p>Read-only comparison totals for the current experiment variants.</p>
+          </div>
+        </div>
+        <div class="ab-pool-message" id="ab-admin-metrics-message"></div>
+        <div class="ab-admin-variant-list" id="ab-admin-metrics-list"></div>
       </section>
     </main>
   </div>
@@ -115,12 +127,12 @@
       <div class="ab-agent-modal-header">
         <div>
           <h2 id="ab-agent-modal-title">New A/B Agent</h2>
-          <p>Create an agent spec that is only available to A/B experiments.</p>
+          <p id="ab-agent-modal-description">Create an agent spec that is only available to A/B experiments.</p>
         </div>
         <button class="ab-agent-modal-close" id="ab-agent-modal-close" type="button" aria-label="Close">&times;</button>
       </div>
       <label class="ab-admin-field">
-        <span>Agent Name</span>
+        <span id="ab-agent-name-label">Agent Name</span>
         <input type="text" id="ab-agent-name" placeholder="A/B Candidate">
       </label>
       <div class="ab-agent-tools-section">

@@ -32,6 +32,7 @@ from pygments.lexers import (BashLexer, CLexer, CppLexer, FortranLexer,
 
 from src.archi.archi import archi
 from src.archi.pipelines.agents.agent_spec import (
+    AgentSpec,
     AgentSpecError,
     list_agent_files,
     load_agent_spec,
@@ -66,6 +67,7 @@ from src.interfaces.chat_app.service_alerts import (
 from src.interfaces.chat_app.utils import collapse_assistant_sequences
 from src.utils.ab_testing import (
     ABPool,
+    ABPoolLoadState,
     ABVariant,
     ABPoolError,
     load_ab_pool_state,
@@ -74,6 +76,7 @@ from src.utils.ab_testing import (
 from src.interfaces.chat_app.event_formatter import PipelineEventFormatter
 from src.utils.conversation_service import ConversationService
 from src.utils.user_service import UserService
+from src.utils.ab_agent_spec_service import ABAgentSpecService, ABAgentSpecRecord
 
 # RBAC imports for role-based access control
 from src.utils.rbac import (
@@ -81,6 +84,7 @@ from src.utils.rbac import (
     get_registry,
     get_user_roles,
     has_permission,
+    get_user_permissions,
     require_permission,
     require_any_permission,
     require_authenticated,
@@ -305,6 +309,8 @@ class ChatWrapper:
 
         # shared conversation service for A/B comparisons & metrics
         self.conv_service = ConversationService(connection_params=self.pg_config)
+        self.user_service = UserService(pg_config=self.pg_config)
+        self.ab_agent_spec_service = ABAgentSpecService(pg_config=self.pg_config)
 
         self.conn = None
         self.cursor = None
@@ -385,7 +391,21 @@ class ChatWrapper:
         self.refresh_ab_pool()
 
     def refresh_ab_pool(self) -> None:
-        self.ab_pool_state = load_ab_pool_state(self.config)
+        import_diagnostics = self._sync_ab_agent_specs_from_filesystem()
+        state = load_ab_pool_state(
+            self.config,
+            agent_spec_exists=self.ab_agent_spec_service.spec_exists,
+        )
+        warnings = list(import_diagnostics.get("warnings", []))
+        warnings.extend(list(getattr(state, "warnings", []) or []))
+        self.ab_agent_import_diagnostics = import_diagnostics
+        self.ab_pool_state = ABPoolLoadState(
+            pool=state.pool,
+            warnings=warnings,
+            enabled_requested=state.enabled_requested,
+            agent_dir=state.agent_dir,
+            agent_dir_configured=state.agent_dir_configured,
+        )
         self.ab_pool = self.ab_pool_state.pool
         for warning in self.ab_pool_state.warnings:
             logger.warning("%s", warning)
@@ -399,6 +419,97 @@ class ChatWrapper:
         chat_cfg = self.services_config.get("chat_app", {}) or {}
         path, _ = resolve_ab_agents_dir(chat_cfg)
         return path
+
+    def _sync_ab_agent_specs_from_filesystem(self) -> Dict[str, Any]:
+        """
+        Import legacy A/B markdown specs into the DB-backed catalog.
+
+        The database remains the runtime source of truth after import.
+        """
+        directory = self._get_ab_agents_dir()
+        diagnostics: Dict[str, Any] = {
+            "directory": str(directory),
+            "source_exists": directory.exists() and directory.is_dir(),
+            "imported": 0,
+            "updated": 0,
+            "skipped": 0,
+            "conflicts": [],
+            "staged_unresolved": [],
+            "warnings": [],
+        }
+        try:
+            result = self.ab_agent_spec_service.import_directory(
+                directory,
+                created_by="system",
+            )
+            diagnostics.update({
+                "imported": int(result.get("imported", 0)),
+                "updated": int(result.get("updated", 0)),
+                "skipped": int(result.get("skipped", 0)),
+                "conflicts": list(result.get("conflicts", []) or []),
+            })
+            if result["imported"] or result["updated"]:
+                logger.info(
+                    "Imported A/B agent specs into DB: imported=%d updated=%d skipped=%d",
+                    result["imported"],
+                    result["updated"],
+                    result["skipped"],
+                )
+            for conflict in result["conflicts"]:
+                logger.warning("A/B agent import conflict: %s", conflict)
+        except Exception as exc:
+            logger.warning("Failed to sync A/B agent specs from filesystem: %s", exc)
+            diagnostics["conflicts"].append(str(exc))
+
+        for conflict in diagnostics["conflicts"]:
+            diagnostics["warnings"].append(f"A/B agent import conflict: {conflict}")
+
+        chat_cfg = self.services_config.get("chat_app", {}) or {}
+        ab_cfg = (chat_cfg.get("ab_testing") or {}) if isinstance(chat_cfg.get("ab_testing"), dict) else {}
+        try:
+            configured_pool = ABPool.from_config(ab_cfg) if ab_cfg.get("enabled") else None
+        except ABPoolError:
+            configured_pool = None
+
+        if configured_pool:
+            for variant in configured_pool.variants:
+                if self.ab_agent_spec_service.spec_exists(variant.agent_spec):
+                    continue
+                disk_path = directory / variant.agent_spec
+                if disk_path.exists():
+                    diagnostics["staged_unresolved"].append(variant.agent_spec)
+
+        if diagnostics["staged_unresolved"]:
+            unresolved = sorted(set(diagnostics["staged_unresolved"]))
+            diagnostics["warnings"].append(
+                "A/B agent specs are present in the staged import directory but unresolved in PostgreSQL after import: "
+                f"{unresolved}."
+            )
+
+        return diagnostics
+
+    @staticmethod
+    def _variant_with_spec_record(variant: "ABVariant", record: ABAgentSpecRecord) -> ABVariant:
+        return ABVariant(
+            label=variant.label,
+            agent_spec=record.filename,
+            provider=variant.provider,
+            model=variant.model,
+            num_documents_to_retrieve=variant.num_documents_to_retrieve,
+            recursion_limit=variant.recursion_limit,
+            agent_spec_id=record.spec_id,
+            agent_spec_name=record.name,
+            agent_spec_version_id=record.version_id,
+            agent_spec_version_number=record.version_number,
+            agent_spec_content_hash=record.content_hash,
+            agent_spec_tools=list(record.tools),
+            agent_spec_prompt_hash=record.prompt_hash,
+        )
+
+    def _resolve_runtime_ab_variant(self, variant: "ABVariant") -> tuple["ABVariant", AgentSpec]:
+        record = self.ab_agent_spec_service.load_agent_spec(variant.agent_spec)
+        resolved = self._variant_with_spec_record(variant, record)
+        return resolved, record.to_agent_spec()
 
     def update_config(self, config_name=None):
         """
@@ -1188,6 +1299,7 @@ class ChatWrapper:
         self,
         variant: "ABVariant",
         *,
+        variant_agent_spec: Optional[AgentSpec] = None,
         request_provider: Optional[str] = None,
         request_model: Optional[str] = None,
         request_provider_api_key: Optional[str] = None,
@@ -1199,23 +1311,17 @@ class ChatWrapper:
         them, but always requires an explicit variant agent spec.
         """
         chat_cfg = self.services_config.get("chat_app", {})
-        agents_dir = self._get_ab_agents_dir()
 
-        # Resolve variant agent spec from the A/B-only agent pool; do not silently fall back.
         spec_name = (variant.agent_spec or "").strip()
         if not spec_name:
             raise ABPoolError(f"Variant '{variant.label}' is missing required agent_spec.")
         if Path(spec_name).name != spec_name:
             raise ABPoolError(
-                f"Variant '{variant.label}' must use an agent_spec filename under ab_agents_dir, got '{spec_name}'."
+                f"Variant '{variant.label}' must use an agent_spec filename in the A/B catalog, got '{spec_name}'."
             )
-
-        spec_path = agents_dir / spec_name
-        if not spec_path.exists():
-            raise ABPoolError(
-                f"Variant '{variant.label}' references missing agent spec '{spec_name}' in '{agents_dir}'."
-            )
-        variant_agent_spec = load_agent_spec(spec_path)
+        if variant_agent_spec is None:
+            record = self.ab_agent_spec_service.load_agent_spec(spec_name)
+            variant_agent_spec = record.to_agent_spec()
 
         agent_class = self._get_agent_class_from_cfg(chat_cfg)
         default_provider = variant.provider or request_provider or chat_cfg.get("default_provider")
@@ -1474,14 +1580,18 @@ class ChatWrapper:
 
         # Build variant archis
         try:
+            arm_a_variant, arm_a_agent_spec = self._resolve_runtime_ab_variant(arm_a_variant)
+            arm_b_variant, arm_b_agent_spec = self._resolve_runtime_ab_variant(arm_b_variant)
             archi_a = self._create_variant_archi(
                 arm_a_variant,
+                variant_agent_spec=arm_a_agent_spec,
                 request_provider=provider,
                 request_model=model,
                 request_provider_api_key=provider_api_key,
             )
             archi_b = self._create_variant_archi(
                 arm_b_variant,
+                variant_agent_spec=arm_b_agent_spec,
                 request_provider=provider,
                 request_model=model,
                 request_provider_api_key=provider_api_key,
@@ -2901,14 +3011,18 @@ class FlaskAppWrapper(object):
 
     def _get_agent_dir_for_scope(self, scope: str, *, create: bool = False) -> Path:
         if scope == "ab":
-            if not self._can_manage_ab_testing():
-                raise PermissionError("A/B agent management requires admin access")
-            directory = self._get_ab_agents_dir()
-        else:
-            directory = self._get_agents_dir()
+            raise PermissionError("A/B agent specs are stored in the database")
+        directory = self._get_agents_dir()
         if create:
             directory.mkdir(parents=True, exist_ok=True)
         return directory
+
+    def _get_ab_agent_spec_service(self) -> ABAgentSpecService:
+        if hasattr(self, "chat") and getattr(self.chat, "ab_agent_spec_service", None) is not None:
+            return self.chat.ab_agent_spec_service
+        if not hasattr(self, "_ab_agent_spec_service"):
+            self._ab_agent_spec_service = ABAgentSpecService(pg_config=self.pg_config)
+        return self._ab_agent_spec_service
 
     def _get_ab_runtime_defaults(self) -> Dict[str, Any]:
         chat_cfg = self.services_config.get("chat_app", {}) or {}
@@ -2920,10 +3034,7 @@ class FlaskAppWrapper(object):
             "model": chat_cfg.get("default_model"),
             "recursion_limit": int(chat_cfg.get("recursion_limit", 50) or 50),
             "num_documents_to_retrieve": int(hybrid_cfg.get("num_documents_to_retrieve", 5) or 5),
-            "ab_agents_dir": str(self._get_ab_agents_dir()),
-            "ab_agents_dir_configured": bool(
-                ((chat_cfg.get("ab_testing") or {}).get("ab_agents_dir"))
-            ),
+            "ab_catalog_source": "database",
         }
 
     @staticmethod
@@ -2945,6 +3056,13 @@ class FlaskAppWrapper(object):
                 "model": entry.get("model") or None,
                 "num_documents_to_retrieve": entry.get("num_documents_to_retrieve"),
                 "recursion_limit": entry.get("recursion_limit"),
+                "agent_spec_id": entry.get("agent_spec_id"),
+                "agent_spec_name": entry.get("agent_spec_name"),
+                "agent_spec_version_id": entry.get("agent_spec_version_id"),
+                "agent_spec_version_number": entry.get("agent_spec_version_number"),
+                "agent_spec_content_hash": entry.get("agent_spec_content_hash"),
+                "agent_spec_tools": entry.get("agent_spec_tools"),
+                "agent_spec_prompt_hash": entry.get("agent_spec_prompt_hash"),
             })
         return details
 
@@ -2974,7 +3092,10 @@ class FlaskAppWrapper(object):
         return {
             "success": True,
             "is_admin": self._is_admin_request(),
-            "can_manage": True,
+            "can_view": self._can_view_ab_testing(),
+            "can_manage": self._can_manage_ab_testing(),
+            "can_view_metrics": self._can_view_ab_metrics(),
+            "can_participate": has_permission(Permission.AB.PARTICIPATE),
             "enabled": bool(active_pool and active_pool.enabled),
             "enabled_requested": bool(raw_ab_cfg.get("enabled", False)),
             "champion": champion,
@@ -2982,6 +3103,7 @@ class FlaskAppWrapper(object):
             "variant_details": variant_details,
             "variant_count": len(variant_details),
             "sample_rate": sample_rate,
+            "default_sample_rate": float(raw_ab_cfg.get("sample_rate", sample_rate or 1.0)),
             "target_roles": list(raw_ab_cfg.get("target_roles") or []),
             "target_permissions": list(raw_ab_cfg.get("target_permissions") or []),
             "max_pending_per_conversation": max_pending,
@@ -2989,6 +3111,7 @@ class FlaskAppWrapper(object):
             "default_trace_mode": default_trace_mode,
             "defaults": defaults,
             "warnings": list(getattr(state, "warnings", []) or []),
+            "import_diagnostics": dict(getattr(self.chat, "ab_agent_import_diagnostics", {}) or {}),
         }
 
     def _resolve_ab_variants(
@@ -2996,7 +3119,7 @@ class FlaskAppWrapper(object):
         variant_items: Any,
         *,
         existing_variants: Optional[Dict[str, ABVariant]] = None,
-    ) -> tuple[list[ABVariant], list[str], Path]:
+    ) -> tuple[list[ABVariant], list[str]]:
         if not isinstance(variant_items, list) or len(variant_items) < 2:
             raise ABPoolError("At least 2 variants are required")
 
@@ -3015,17 +3138,11 @@ class FlaskAppWrapper(object):
         if len(set(parsed_labels)) != len(parsed_labels):
             raise ABPoolError("Variant labels must be unique")
 
-        agents_dir = self._get_ab_agents_dir()
-        agents_dir.mkdir(parents=True, exist_ok=True)
-        spec_map: Dict[str, Path] = {}
-        for p in list_agent_files(agents_dir):
-            try:
-                spec = load_agent_spec(p)
-                spec_map[spec.name] = p
-            except Exception:
-                continue
+        ab_specs = self._get_ab_agent_spec_service()
+        spec_records = ab_specs.list_specs()
+        spec_map: Dict[str, ABAgentSpecRecord] = {record.name: record for record in spec_records}
 
-        chat_cfg = self.chat.services_config.get("chat_app", {})
+        chat_cfg = self.chat.services_config.get("chat_app", {}) if hasattr(self, "chat") else self.services_config.get("chat_app", {})
         default_provider = chat_cfg.get("default_provider", "")
         default_model = chat_cfg.get("default_model", "")
         existing_variants = existing_variants or {}
@@ -3037,24 +3154,18 @@ class FlaskAppWrapper(object):
             if explicit_agent_spec:
                 if Path(explicit_agent_spec).name != explicit_agent_spec:
                     raise ABPoolError(
-                        f"Variant '{label}' must use an agent_spec filename under ab_agents_dir"
+                        f"Variant '{label}' must use an A/B catalog filename"
                     )
-                path = agents_dir / explicit_agent_spec
-                if not path.exists():
+                record = ab_specs.get_spec_by_filename(explicit_agent_spec)
+                if record is None:
                     raise ABPoolError(
                         f"Variant '{label}' references missing agent_spec '{explicit_agent_spec}'"
                     )
-                try:
-                    load_agent_spec(path)
-                except Exception as exc:
-                    raise ABPoolError(
-                        f"Variant '{label}' has invalid agent_spec '{explicit_agent_spec}': {exc}"
-                    )
             else:
-                path = spec_map.get(label)
-                if not path:
+                record = spec_map.get(label)
+                if not record:
                     raise ABPoolError(
-                        f"Agent '{label}' not found in ab_agents_dir; provide agent_spec explicitly"
+                        f"Agent '{label}' not found in the A/B catalog; provide agent_spec explicitly"
                     )
 
             existing = existing_variants.get(label)
@@ -3067,7 +3178,7 @@ class FlaskAppWrapper(object):
 
             variants.append(ABVariant(
                 label=label,
-                agent_spec=path.name,
+                agent_spec=record.filename,
                 provider=provider_override or None,
                 model=model_override or None,
                 num_documents_to_retrieve=item_cfg.get('num_documents_to_retrieve') or (
@@ -3076,9 +3187,16 @@ class FlaskAppWrapper(object):
                 recursion_limit=item_cfg.get('recursion_limit') or (
                     existing.recursion_limit if existing else None
                 ),
+                agent_spec_id=record.spec_id,
+                agent_spec_name=record.name,
+                agent_spec_version_id=record.version_id,
+                agent_spec_version_number=record.version_number,
+                agent_spec_content_hash=record.content_hash,
+                agent_spec_tools=list(record.tools),
+                agent_spec_prompt_hash=record.prompt_hash,
             ))
 
-        return variants, parsed_labels, agents_dir
+        return variants, parsed_labels
 
     def _persist_ab_pool_config(
         self,
@@ -3090,13 +3208,11 @@ class FlaskAppWrapper(object):
         disclosure_mode: str,
         default_trace_mode: str,
         max_pending_per_conversation: int,
-        agents_dir: Path,
     ) -> None:
         self.config_service.update_services_config({
             "chat_app": {
                 "ab_testing": {
                     "enabled": enabled,
-                    "ab_agents_dir": str(agents_dir),
                     "sample_rate": sample_rate,
                     "disclosure_mode": disclosure_mode,
                     "default_trace_mode": default_trace_mode,
@@ -3199,6 +3315,18 @@ class FlaskAppWrapper(object):
         """
         try:
             scope = self._get_agent_scope()
+            if scope == "ab":
+                if not self._can_view_ab_testing():
+                    return jsonify({"error": "A/B agent visibility requires A/B view access"}), 403
+                agents = []
+                for record in self._get_ab_agent_spec_service().list_specs():
+                    agents.append({"name": record.name, "filename": record.filename, "ab_only": True})
+                return jsonify({
+                    "agents": agents,
+                    "active_name": None,
+                    "scope": scope,
+                    "directory": None,
+                }), 200
             agents_dir = self._get_agent_dir_for_scope(scope, create=(scope == "ab"))
             agent_files = list_agent_files(agents_dir)
             agents = []
@@ -3237,8 +3365,27 @@ class FlaskAppWrapper(object):
         try:
             scope = self._get_agent_scope()
             name = request.args.get("name")
-            if not name:
-                return jsonify({"error": "name parameter required"}), 400
+            filename = request.args.get("filename")
+            if not name and not filename:
+                return jsonify({"error": "name or filename parameter required"}), 400
+            if scope == "ab":
+                if not self._can_view_ab_testing():
+                    return jsonify({"error": "A/B agent visibility requires A/B view access"}), 403
+                if filename:
+                    record = self._get_ab_agent_spec_service().get_spec_by_filename(filename)
+                else:
+                    record = self._get_ab_agent_spec_service().get_spec_by_name(name)
+                if record is None:
+                    lookup = filename or name
+                    return jsonify({"error": f"Agent '{lookup}' not found"}), 404
+                return jsonify({
+                    "name": record.name,
+                    "filename": record.filename,
+                    "content": record.content,
+                    "tools": list(record.tools),
+                    "prompt": record.prompt,
+                    "scope": scope,
+                }), 200
             agents_dir = self._get_agent_dir_for_scope(scope, create=(scope == "ab"))
             for path in list_agent_files(agents_dir):
                 try:
@@ -3250,6 +3397,8 @@ class FlaskAppWrapper(object):
                         "name": spec.name,
                         "filename": path.name,
                         "content": path.read_text(),
+                        "tools": list(getattr(spec, "tools", []) or []),
+                        "prompt": getattr(spec, "prompt", ""),
                         "scope": scope,
                     }), 200
             return jsonify({"error": f"Agent '{name}' not found"}), 404
@@ -3327,6 +3476,32 @@ class FlaskAppWrapper(object):
             existing_name = data.get("existing_name")
             if not content or not isinstance(content, str):
                 return jsonify({'error': 'Content is required'}), 400
+
+            if scope == "ab":
+                if not self._can_manage_ab_testing():
+                    return jsonify({"error": "A/B agent management requires admin access"}), 403
+                created_by = session.get("user", {}).get("email") or session.get("user", {}).get("id") or data.get("client_id") or "system"
+                ab_service = self._get_ab_agent_spec_service()
+                if mode == "edit":
+                    if not existing_name:
+                        return jsonify({'error': 'existing_name required for edit'}), 400
+                    record = ab_service.save_edited_copy(
+                        content,
+                        existing_name=existing_name,
+                        created_by=created_by,
+                    )
+                else:
+                    record = ab_service.save_spec(
+                        content,
+                        created_by=created_by,
+                    )
+                return jsonify({
+                    'success': True,
+                    'name': record.name,
+                    'filename': record.filename,
+                    'path': None,
+                    'scope': scope,
+                }), 200
 
             agents_dir = self._get_agent_dir_for_scope(scope, create=True)
 
@@ -3421,6 +3596,14 @@ class FlaskAppWrapper(object):
             name = name.strip()
             if name.lower().startswith("name:"):
                 name = name.split(":", 1)[1].strip()
+
+            if scope == "ab":
+                if not self._can_manage_ab_testing():
+                    return jsonify({"error": "A/B agent management requires admin access"}), 403
+                deleted = self._get_ab_agent_spec_service().delete_spec_by_name(name)
+                if not deleted:
+                    return jsonify({"error": f"Agent '{name}' not found"}), 404
+                return jsonify({"success": True, "deleted": name}), 200
 
             agents_dir = self._get_agent_dir_for_scope(scope, create=(scope == "ab"))
             target_path = None
@@ -3805,29 +3988,50 @@ class FlaskAppWrapper(object):
         except Exception:
             return False
 
+    def _can_view_ab_testing(self) -> bool:
+        return self._can_manage_ab_testing() or has_permission(Permission.AB.VIEW)
+
     def _can_manage_ab_testing(self) -> bool:
-        return self._is_admin_request() or has_permission(Permission.Config.MODIFY)
+        return self._is_admin_request() or has_permission(Permission.AB.MANAGE)
 
     def _can_view_ab_metrics(self) -> bool:
-        return self._can_manage_ab_testing() or has_permission(Permission.Metrics.VIEW)
+        return self._can_manage_ab_testing() or has_permission(Permission.AB.METRICS)
 
     def _current_request_roles(self) -> List[str]:
         return list(session.get('roles', []) or [])
 
     def _current_request_permissions(self) -> List[str]:
-        ctx = get_permission_context()
-        permissions: List[str] = []
-        if ctx.get('can_modify_config'):
-            permissions.append(Permission.Config.MODIFY.value)
-        if ctx.get('can_view_metrics'):
-            permissions.append(Permission.Metrics.VIEW.value)
-        if ctx.get('can_chat'):
-            permissions.append(Permission.Chat.QUERY.value)
-        return permissions
+        return sorted(get_user_permissions(self._current_request_roles()))
+
+    @staticmethod
+    def _current_user_id() -> Optional[str]:
+        user = session.get('user') or {}
+        return user.get('id') or session.get('client_id') or None
+
+    def _get_effective_ab_sample_rate(self, default_rate: float) -> float:
+        effective_rate = float(default_rate)
+        user_id = self._current_user_id()
+        if not user_id:
+            return effective_rate
+        session_user = session.get('user') or {}
+        try:
+            user = self.chat.user_service.get_or_create_user(
+                user_id=user_id,
+                auth_provider=session_user.get('auth_method', 'anonymous') if session.get('logged_in') else 'anonymous',
+                display_name=session_user.get('name'),
+                email=session_user.get('email'),
+            )
+        except Exception:
+            user = None
+        if user is not None and user.ab_participation_rate is not None:
+            effective_rate = float(user.ab_participation_rate)
+        return min(max(effective_rate, 0.0), 1.0)
 
     def _can_use_ab_testing(self) -> bool:
         pool = self.chat.ab_pool
         if not pool or not pool.enabled:
+            return False
+        if not has_permission(Permission.AB.PARTICIPATE):
             return False
         return pool.is_targeted_user(
             roles=self._current_request_roles(),
@@ -4507,22 +4711,38 @@ class FlaskAppWrapper(object):
         """
         try:
             pool = self.chat.ab_pool
+            can_view = self._can_view_ab_testing()
             can_manage = self._can_manage_ab_testing()
             can_use = self._can_use_ab_testing()
-            if can_manage:
+            can_participate = has_permission(Permission.AB.PARTICIPATE)
+            raw_ab_cfg = ((self.services_config.get("chat_app", {}) or {}).get("ab_testing") or {})
+            default_sample_rate = float(raw_ab_cfg.get("sample_rate", getattr(pool, "sample_rate", 1.0) or 1.0))
+            if can_view:
                 return jsonify(self._build_admin_ab_pool_payload()), 200
             if pool and can_use:
+                effective_rate = self._get_effective_ab_sample_rate(pool.sample_rate)
                 return jsonify({
                     'success': True,
                     'is_admin': self._is_admin_request(),
+                    'can_view': False,
                     'can_manage': False,
+                    'can_view_metrics': False,
+                    'can_participate': can_participate,
                     **pool.participant_info(),
+                    'sample_rate': effective_rate,
+                    'default_sample_rate': default_sample_rate,
                 }), 200
             return jsonify({
                 'success': True,
                 'enabled': False,
+                'enabled_requested': bool(raw_ab_cfg.get('enabled', False)),
                 'is_admin': self._is_admin_request(),
+                'can_view': can_view,
                 'can_manage': can_manage,
+                'can_view_metrics': self._can_view_ab_metrics(),
+                'can_participate': can_participate,
+                'sample_rate': self._get_effective_ab_sample_rate(default_sample_rate) if can_participate else default_sample_rate,
+                'default_sample_rate': default_sample_rate,
             }), 200
         except Exception as e:
             logger.error(f"Error getting A/B pool: {str(e)}")
@@ -4565,7 +4785,7 @@ class FlaskAppWrapper(object):
                         'max_pending_per_conversation': pool.max_pending_per_conversation,
                     }), 200
 
-            sample_rate = float(pool.sample_rate)
+            sample_rate = self._get_effective_ab_sample_rate(pool.sample_rate)
             if sample_rate <= 0:
                 use_ab = False
                 roll = None
@@ -4591,6 +4811,7 @@ class FlaskAppWrapper(object):
                 'use_ab': use_ab,
                 'reason': 'sampled' if use_ab else 'not_sampled',
                 'sample_rate': sample_rate,
+                'default_sample_rate': float(pool.sample_rate),
                 'disclosure_mode': pool.disclosure_mode,
                 'default_trace_mode': pool.default_trace_mode,
                 'max_pending_per_conversation': pool.max_pending_per_conversation,
@@ -4619,7 +4840,7 @@ class FlaskAppWrapper(object):
             existing_variants = {
                 variant.label: variant for variant in (self.chat.ab_pool.variants if self.chat.ab_pool else [])
             }
-            variants, parsed_labels, agents_dir = self._resolve_ab_variants(
+            variants, parsed_labels = self._resolve_ab_variants(
                 variant_items,
                 existing_variants=existing_variants,
             )
@@ -4643,7 +4864,6 @@ class FlaskAppWrapper(object):
                 disclosure_mode=pool.disclosure_mode,
                 default_trace_mode=pool.default_trace_mode,
                 max_pending_per_conversation=pool.max_pending_per_conversation,
-                agents_dir=agents_dir,
             )
             logger.info("Persisted A/B pool update: champion='%s', variants=%s", champion_name, parsed_labels)
             return jsonify(self._build_admin_ab_pool_payload()), 200
@@ -4670,7 +4890,7 @@ class FlaskAppWrapper(object):
                 variant.label: variant for variant in (self.chat.ab_pool.variants if self.chat.ab_pool else [])
             }
             variant_items = self._normalize_ab_variant_details(raw_pool.get("variants"))
-            variants, parsed_labels, agents_dir = self._resolve_ab_variants(
+            variants, parsed_labels = self._resolve_ab_variants(
                 variant_items,
                 existing_variants=existing_variants,
             )
@@ -4694,7 +4914,6 @@ class FlaskAppWrapper(object):
                 disclosure_mode=pool.disclosure_mode,
                 default_trace_mode=pool.default_trace_mode,
                 max_pending_per_conversation=pool.max_pending_per_conversation,
-                agents_dir=agents_dir,
             )
             logger.info("Persisted A/B settings update: champion='%s'", champion_name)
             return jsonify(self._build_admin_ab_pool_payload()), 200
@@ -4717,7 +4936,7 @@ class FlaskAppWrapper(object):
             existing_variants = {
                 variant.label: variant for variant in (self.chat.ab_pool.variants if self.chat.ab_pool else [])
             }
-            variants, parsed_labels, agents_dir = self._resolve_ab_variants(
+            variants, parsed_labels = self._resolve_ab_variants(
                 variant_items,
                 existing_variants=existing_variants,
             )
@@ -4750,7 +4969,6 @@ class FlaskAppWrapper(object):
                 disclosure_mode=disclosure_mode,
                 default_trace_mode=default_trace_mode,
                 max_pending_per_conversation=max_pending,
-                agents_dir=agents_dir,
             )
             logger.info("Persisted A/B variants update: champion='%s', variants=%s", champion_name, parsed_labels)
             return jsonify(self._build_admin_ab_pool_payload()), 200
@@ -4965,9 +5183,14 @@ class FlaskAppWrapper(object):
 
     def ab_testing_admin_page(self):
         """Render the dedicated admin A/B testing management page."""
-        if not self._can_manage_ab_testing():
+        can_view = self._can_view_ab_testing()
+        if not can_view:
             return "Forbidden", 403
-        return render_template('ab_testing.html')
+        return render_template(
+            'ab_testing.html',
+            can_manage_ab_testing=self._can_manage_ab_testing(),
+            can_view_ab_metrics=self._can_view_ab_metrics(),
+        )
 
     def list_data_documents(self):
         """

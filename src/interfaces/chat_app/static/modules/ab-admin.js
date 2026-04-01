@@ -5,6 +5,7 @@
     saveSettings: '/api/ab/pool/settings/set',
     saveVariants: '/api/ab/pool/variants/set',
     disable: '/api/ab/pool/disable',
+    metrics: '/api/ab/metrics',
     providers: '/api/providers',
     agentTemplate: '/api/agents/template?scope=ab',
     saveAgent: '/api/agents',
@@ -14,6 +15,8 @@
   const VARIANTS_DRAFT_STORAGE_KEY = 'archi_ab_admin_variants_draft_v1';
 
   const state = {
+    canManage: document.body.dataset.canManageAbTesting === 'true',
+    canViewMetrics: document.body.dataset.canViewAbMetrics === 'true',
     agents: [],
     providers: [],
     defaults: {
@@ -21,8 +24,6 @@
       model: '',
       recursion_limit: 50,
       num_documents_to_retrieve: 5,
-      ab_agents_dir: '',
-      ab_agents_dir_configured: false,
     },
     warnings: [],
     enabledRequested: false,
@@ -48,10 +49,14 @@
     },
     variantForm: [],
     modal: {
+      mode: 'create',
       targetIndex: null,
+      sourceName: '',
+      sourceFilename: '',
       tools: [],
       sourceTemplate: '',
     },
+    metrics: [],
   };
 
   const els = {
@@ -69,14 +74,21 @@
     message: document.getElementById('ab-admin-message'),
     variantMessage: document.getElementById('ab-admin-variant-message'),
     warnings: document.getElementById('ab-admin-warnings'),
+    readOnly: document.getElementById('ab-admin-readonly'),
     modal: document.getElementById('ab-agent-modal'),
     modalClose: document.getElementById('ab-agent-modal-close'),
     modalCancel: document.getElementById('ab-agent-cancel'),
     modalSave: document.getElementById('ab-agent-save'),
+    modalTitle: document.getElementById('ab-agent-modal-title'),
+    modalDescription: document.getElementById('ab-agent-modal-description'),
+    modalNameLabel: document.getElementById('ab-agent-name-label'),
     modalName: document.getElementById('ab-agent-name'),
     modalPrompt: document.getElementById('ab-agent-prompt'),
     modalTools: document.getElementById('ab-agent-tools-list'),
     modalMessage: document.getElementById('ab-agent-message'),
+    metricsPanel: document.getElementById('ab-metrics-panel'),
+    metricsList: document.getElementById('ab-admin-metrics-list'),
+    metricsMessage: document.getElementById('ab-admin-metrics-message'),
   };
 
   function escapeHtml(value) {
@@ -124,6 +136,11 @@
     return state.providers.filter((provider) => provider);
   }
 
+  function getAgentByFilename(filename) {
+    const target = String(filename || '').trim();
+    return state.agents.find((agent) => String(agent.filename || '').trim() === target) || null;
+  }
+
   function getProviderConfig(providerType) {
     return providerCatalog().find((provider) => provider.type === providerType) || null;
   }
@@ -151,8 +168,6 @@
       model: String(defaults.model || '').trim(),
       recursion_limit: Number(defaults.recursion_limit ?? 50),
       num_documents_to_retrieve: Number(defaults.num_documents_to_retrieve ?? 5),
-      ab_agents_dir: String(defaults.ab_agents_dir || '').trim(),
-      ab_agents_dir_configured: defaults.ab_agents_dir_configured === true,
     };
   }
 
@@ -312,7 +327,7 @@
     els.champion.innerHTML = labels.map((label) => (
       `<option value="${escapeHtml(label)}"${label === champion ? ' selected' : ''}>${escapeHtml(label)}</option>`
     )).join('');
-    els.champion.disabled = labels.length === 0;
+    els.champion.disabled = !state.canManage || labels.length === 0;
   }
 
   function validateSettingsForm() {
@@ -344,7 +359,7 @@
       return { valid: false, message: 'Variant labels must be unique.' };
     }
     if (state.variantForm.some((variant) => !String(variant.agent_spec || '').trim())) {
-      return { valid: false, message: 'Every variant needs an A/B agent markdown file.' };
+      return { valid: false, message: 'Every variant needs an A/B agent spec from the experiment catalog.' };
     }
     for (const variant of state.variantForm) {
       const providerType = String(variant.provider || '').trim();
@@ -360,6 +375,7 @@
   }
 
   function updateSettingsSaveState() {
+    if (!state.canManage) return;
     const validation = validateSettingsForm();
     if (els.save) {
       els.save.disabled = !validation.valid;
@@ -372,6 +388,7 @@
   }
 
   function updateVariantSaveState() {
+    if (!state.canManage) return;
     const validation = validateVariantsForm();
     if (els.variantSave) {
       els.variantSave.disabled = !validation.valid;
@@ -430,13 +447,15 @@
   }
 
   function agentOptionsHtml(selectedFilename) {
-    const options = ['<option value="">Select an A/B agent markdown</option>'];
+    const options = ['<option value="">Select an A/B agent spec</option>'];
     for (const agent of state.agents) {
       options.push(
         `<option value="${escapeHtml(agent.filename)}"${agent.filename === selectedFilename ? ' selected' : ''}>${escapeHtml(agent.name)} (${escapeHtml(agent.filename)})</option>`
       );
     }
-    options.push('<option value="__create_new__">Add new A/B agent…</option>');
+    if (state.canManage) {
+      options.push('<option value="__create_new__">Add new A/B agent…</option>');
+    }
     return options.join('');
   }
 
@@ -455,38 +474,45 @@
 
     els.variantList.innerHTML = state.variantForm.map((variant, index) => {
       const modelState = buildModelSelectState(variant);
+      const disabledAttr = state.canManage ? '' : 'disabled';
       return `
         <article class="ab-variant-card" data-index="${index}">
           <div class="ab-variant-card-header">
             <div>
               <h3>Variant ${index + 1}</h3>
-              <p>Configure the experiment label, isolated A/B agent spec, and optional runtime overrides.</p>
+              <p>Configure the experiment label, A/B agent spec, and optional runtime overrides.</p>
             </div>
-            <button class="ab-variant-remove" type="button" data-remove="${index}">Remove</button>
+            <button class="ab-variant-remove" type="button" data-remove="${index}" ${disabledAttr}>Remove</button>
           </div>
           <div class="ab-variant-grid">
             <label class="ab-admin-field">
               <span>Label</span>
-              <input type="text" data-field="label" value="${escapeHtml(variant.label)}" placeholder="baseline">
+              <input type="text" data-field="label" value="${escapeHtml(variant.label)}" placeholder="baseline" ${disabledAttr}>
             </label>
-            <div class="ab-admin-field">
+              <div class="ab-admin-field">
               <span>Agent Spec</span>
               <div class="ab-agent-select-row">
-                <select data-field="agent_spec">
+                <select data-field="agent_spec" ${disabledAttr}>
                   ${agentOptionsHtml(variant.agent_spec)}
                 </select>
+                <button
+                  class="ab-variant-inline-btn"
+                  type="button"
+                  data-edit-agent="${index}"
+                  ${!state.canManage || !String(variant.agent_spec || '').trim() ? 'disabled' : ''}
+                >Edit</button>
               </div>
             </div>
             <label class="ab-admin-field">
               <span>Provider Override</span>
-              <select data-field="provider">
+              <select data-field="provider" ${disabledAttr}>
                 ${providerOptionsHtml(variant.provider)}
               </select>
             </label>
             <div class="ab-admin-field">
               <span>Model Override</span>
               <div class="ab-model-control">
-                <select data-field="model_select" ${modelState.disabled ? 'disabled' : ''}>
+                <select data-field="model_select" ${state.canManage && !modelState.disabled ? '' : 'disabled'}>
                   ${modelState.options}
                 </select>
                 <input
@@ -495,6 +521,7 @@
                   value="${escapeHtml(modelState.customValue)}"
                   placeholder="${escapeHtml((getDefaultModelForProvider(variant.provider) || state.defaults.model || 'custom-model') + ' (default)')}"
                   style="${modelState.customVisible ? '' : 'display:none;'}"
+                  ${disabledAttr}
                 >
               </div>
             </div>
@@ -507,6 +534,7 @@
                 step="1"
                 value="${escapeHtml(variant.recursion_limit)}"
                 placeholder="${escapeHtml(String(state.defaults.recursion_limit) + ' (default)')}"
+                ${disabledAttr}
               >
             </label>
             <label class="ab-admin-field">
@@ -518,6 +546,7 @@
                 step="1"
                 value="${escapeHtml(variant.num_documents_to_retrieve)}"
                 placeholder="${escapeHtml(String(state.defaults.num_documents_to_retrieve) + ' (default)')}"
+                ${disabledAttr}
               >
             </label>
           </div>
@@ -538,21 +567,77 @@
     if (els.traceMode) els.traceMode.value = state.settingsForm.default_trace_mode || 'minimal';
     if (els.maxPending) els.maxPending.value = String(state.settingsForm.max_pending_per_conversation ?? 1);
     if (els.disable) els.disable.style.display = state.enabledRequested ? '' : 'none';
+    if (els.readOnly) els.readOnly.style.display = state.canManage ? 'none' : '';
+    if (els.sampleRate) els.sampleRate.disabled = !state.canManage;
+    if (els.disclosureMode) els.disclosureMode.disabled = !state.canManage;
+    if (els.traceMode) els.traceMode.disabled = !state.canManage;
+    if (els.maxPending) els.maxPending.disabled = !state.canManage;
+    if (els.save) els.save.disabled = !state.canManage;
+    if (els.disable) els.disable.disabled = !state.canManage;
+    if (els.variantSave) els.variantSave.disabled = !state.canManage;
+    if (els.addVariant) els.addVariant.disabled = !state.canManage;
     renderWarnings();
     syncChampionOptions();
     renderVariants();
-    updateSettingsSaveState();
+    if (state.canManage) {
+      updateSettingsSaveState();
+    }
   }
 
   function applyPoolResponseMeta(poolResponse = {}) {
     state.defaults = normalizeDefaults(poolResponse.defaults || state.defaults || {});
     state.warnings = Array.isArray(poolResponse.warnings) ? poolResponse.warnings : [];
     state.enabledRequested = poolResponse.enabled_requested === true;
+    state.canManage = poolResponse.can_manage === true || state.canManage === true;
+    state.canViewMetrics = poolResponse.can_view_metrics === true || state.canViewMetrics === true;
   }
 
   async function loadAgents() {
     const agentsResponse = await fetchJson(ENDPOINTS.agents);
     state.agents = Array.isArray(agentsResponse.agents) ? agentsResponse.agents : [];
+  }
+
+  function renderMetrics() {
+    if (!els.metricsPanel || !els.metricsList) return;
+    if (!state.canViewMetrics) {
+      els.metricsPanel.style.display = 'none';
+      return;
+    }
+    els.metricsPanel.style.display = '';
+    if (!state.metrics.length) {
+      els.metricsList.innerHTML = `
+        <div class="ab-admin-empty-state">
+          <strong>No comparison data yet.</strong>
+          <span>Metrics will appear after participants submit A/B votes.</span>
+        </div>
+      `;
+      return;
+    }
+
+    els.metricsList.innerHTML = `
+      <table class="ab-admin-metrics-table">
+        <thead>
+          <tr>
+            <th>Variant</th>
+            <th>Wins</th>
+            <th>Losses</th>
+            <th>Ties</th>
+            <th>Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${state.metrics.map((metric) => `
+            <tr>
+              <td>${escapeHtml(metric.variant_name || '')}</td>
+              <td>${escapeHtml(metric.wins ?? 0)}</td>
+              <td>${escapeHtml(metric.losses ?? 0)}</td>
+              <td>${escapeHtml(metric.ties ?? 0)}</td>
+              <td>${escapeHtml(metric.total_comparisons ?? 0)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `;
   }
 
   function applyPersistedPool(pool = {}, options = {}) {
@@ -586,15 +671,21 @@
   }
 
   async function loadState() {
-    const [poolResponse, providersResponse] = await Promise.all([
+    const requests = [
       fetchJson(ENDPOINTS.pool),
       fetchJson(ENDPOINTS.providers),
-    ]);
+    ];
+    if (state.canViewMetrics) {
+      requests.push(fetchJson(ENDPOINTS.metrics));
+    }
+    const [poolResponse, providersResponse, metricsResponse] = await Promise.all(requests);
     await loadAgents();
     state.providers = Array.isArray(providersResponse.providers) ? providersResponse.providers : [];
+    state.metrics = Array.isArray(metricsResponse?.metrics) ? metricsResponse.metrics : [];
     applyPoolResponseMeta(poolResponse);
     applyPersistedPool(poolResponse);
     renderForm();
+    renderMetrics();
   }
 
   function readOptionalInt(value) {
@@ -635,6 +726,7 @@
   }
 
   function addVariant() {
+    if (!state.canManage) return;
     const firstAgent = state.agents[0] || {};
     state.variantForm.push({
       label: uniqueLabel(firstAgent.name || 'Variant'),
@@ -650,6 +742,7 @@
   }
 
   async function saveSettings() {
+    if (!state.canManage) return;
     const validation = validateSettingsForm();
     if (!validation.valid) {
       setMessage(validation.message, 'error');
@@ -680,6 +773,7 @@
   }
 
   async function saveVariants() {
+    if (!state.canManage) return;
     const validation = validateVariantsForm();
     if (!validation.valid) {
       setVariantMessage(validation.message, 'error');
@@ -714,6 +808,7 @@
   }
 
   async function disablePool() {
+    if (!state.canManage) return;
     els.disable.disabled = true;
     try {
       const poolResponse = await fetchJson(ENDPOINTS.disable, {
@@ -745,8 +840,34 @@
     return yaml + String(prompt || '').trim();
   }
 
+  function configureModalForMode(mode, options = {}) {
+    state.modal.mode = mode === 'edit' ? 'edit' : 'create';
+    state.modal.targetIndex = Number.isInteger(options.targetIndex) ? options.targetIndex : null;
+    state.modal.sourceName = String(options.sourceName || '').trim();
+    state.modal.sourceFilename = String(options.sourceFilename || '').trim();
+    if (els.modalTitle) {
+      els.modalTitle.textContent = state.modal.mode === 'edit' ? 'Edit A/B Agent' : 'New A/B Agent';
+    }
+    if (els.modalDescription) {
+      els.modalDescription.textContent = state.modal.mode === 'edit'
+        ? 'Editing creates a new immutable A/B agent spec and switches the current variant to that new copy.'
+        : 'Create an agent spec that is only available to A/B experiments.';
+    }
+    if (els.modalNameLabel) {
+      els.modalNameLabel.textContent = state.modal.mode === 'edit' ? 'Source Agent Name' : 'Agent Name';
+    }
+    if (els.modalName) {
+      els.modalName.disabled = state.modal.mode === 'edit';
+      els.modalName.placeholder = state.modal.mode === 'edit' ? 'Immutable copy will be named automatically' : 'A/B Candidate';
+    }
+    if (els.modalSave) {
+      els.modalSave.textContent = state.modal.mode === 'edit' ? 'Save Edited Copy' : 'Create Agent';
+    }
+  }
+
   async function openCreateAgentModal(targetIndex = null) {
-    state.modal.targetIndex = Number.isInteger(targetIndex) ? targetIndex : null;
+    if (!state.canManage) return;
+    configureModalForMode('create', { targetIndex });
     setModalMessage('');
     if (els.modalName) els.modalName.value = '';
     if (els.modalPrompt) els.modalPrompt.value = '';
@@ -774,17 +895,65 @@
     }
   }
 
+  async function openEditAgentModal(targetIndex) {
+    if (!state.canManage || !Number.isInteger(targetIndex) || !state.variantForm[targetIndex]) return;
+    const variant = state.variantForm[targetIndex];
+    const selectedAgent = getAgentByFilename(variant.agent_spec);
+    if (!selectedAgent) {
+      setVariantMessage('Select an A/B agent before editing it.', 'error');
+      return;
+    }
+
+    configureModalForMode('edit', {
+      targetIndex,
+      sourceName: selectedAgent.name,
+      sourceFilename: selectedAgent.filename,
+    });
+    setModalMessage('');
+    if (els.modalName) els.modalName.value = selectedAgent.name;
+    if (els.modalPrompt) els.modalPrompt.value = '';
+    if (els.modalTools) els.modalTools.innerHTML = '<div class="ab-admin-empty-state">Loading agent…</div>';
+    if (els.modal) els.modal.style.display = '';
+
+    try {
+      const [template, spec] = await Promise.all([
+        fetchJson(`${ENDPOINTS.agentTemplate}&name=${encodeURIComponent(selectedAgent.name)}`),
+        fetchJson(`/api/agents/spec?scope=ab&filename=${encodeURIComponent(selectedAgent.filename)}`),
+      ]);
+      state.modal.tools = Array.isArray(template.tools) ? template.tools : [];
+      state.modal.sourceTemplate = String(template.template || '');
+      if (els.modalPrompt) {
+        els.modalPrompt.value = String(spec.prompt || '').trim();
+      }
+      const enabledTools = new Set(Array.isArray(spec.tools) ? spec.tools : []);
+      if (els.modalTools) {
+        els.modalTools.innerHTML = state.modal.tools.map((tool) => `
+          <label class="ab-agent-tool-item">
+            <input type="checkbox" value="${escapeHtml(tool.name)}" ${enabledTools.has(tool.name) ? 'checked' : ''}>
+            <span>${escapeHtml(tool.name)}</span>
+            <small>${escapeHtml(tool.description || '')}</small>
+          </label>
+        `).join('');
+      }
+    } catch (error) {
+      setModalMessage(error.message || 'Unable to load the selected A/B agent.', 'error');
+    }
+  }
+
   function closeCreateAgentModal() {
     if (els.modal) els.modal.style.display = 'none';
+    configureModalForMode('create', { targetIndex: null });
     state.modal.targetIndex = null;
     setModalMessage('');
   }
 
   async function saveNewAgent() {
+    if (!state.canManage) return;
     const name = String(els.modalName?.value || '').trim();
     const prompt = String(els.modalPrompt?.value || '').trim();
     const tools = [...(els.modalTools?.querySelectorAll('input[type="checkbox"]:checked') || [])].map((checkbox) => checkbox.value);
-    if (!name) {
+    const isEdit = state.modal.mode === 'edit';
+    if (!isEdit && !name) {
       setModalMessage('Agent name is required.', 'error');
       els.modalName?.focus();
       return;
@@ -796,15 +965,16 @@
     }
 
     els.modalSave.disabled = true;
-    els.modalSave.textContent = 'Creating…';
+    els.modalSave.textContent = isEdit ? 'Saving…' : 'Creating…';
     try {
-      const content = serialiseAgentSpec(name, tools, prompt);
+      const content = serialiseAgentSpec(isEdit ? state.modal.sourceName : name, tools, prompt);
       const response = await fetchJson(ENDPOINTS.saveAgent, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           scope: 'ab',
-          mode: 'create',
+          mode: isEdit ? 'edit' : 'create',
+          existing_name: isEdit ? state.modal.sourceName : null,
           content,
         }),
       });
@@ -818,16 +988,22 @@
         renderVariants();
       }
       closeCreateAgentModal();
-      setVariantMessage(`Created A/B agent '${response.name}'.`, 'success');
+      setVariantMessage(
+        isEdit
+          ? `Saved edited copy '${response.name}' and updated the variant to use it.`
+          : `Created A/B agent '${response.name}'.`,
+        'success',
+      );
     } catch (error) {
-      setModalMessage(error.message || 'Unable to create A/B agent.', 'error');
+      setModalMessage(error.message || (isEdit ? 'Unable to save edited A/B agent copy.' : 'Unable to create A/B agent.'), 'error');
     } finally {
       els.modalSave.disabled = false;
-      els.modalSave.textContent = 'Create Agent';
+      els.modalSave.textContent = isEdit ? 'Save Edited Copy' : 'Create Agent';
     }
   }
 
   function handleVariantFieldChange(target, isInputEvent = false) {
+    if (!state.canManage) return;
     const card = target.closest('.ab-variant-card');
     if (!card) return;
     const index = Number.parseInt(card.dataset.index || '-1', 10);
@@ -953,6 +1129,14 @@
           renderVariants();
         }
         return;
+      }
+
+      const editButton = event.target.closest('[data-edit-agent]');
+      if (editButton) {
+        const index = Number.parseInt(editButton.dataset.editAgent || '-1', 10);
+        if (index >= 0) {
+          openEditAgentModal(index);
+        }
       }
     });
 

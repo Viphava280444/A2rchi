@@ -4,6 +4,7 @@ import os
 
 from flask import Flask
 
+from src.interfaces.chat_app.api import register_api
 from src.interfaces.chat_app.app import FlaskAppWrapper
 from src.utils.env import read_secret
 from src.utils.logging import setup_logging
@@ -44,11 +45,13 @@ def main():
     print(f"Accessible externally at (host, port): ({hostname}, {external_port})")
 
     generate_script(chat_config, static_folder)
-    app = FlaskAppWrapper(Flask(
+    flask_app = Flask(
         __name__,
         template_folder=template_folder,
         static_folder=static_folder,
-    ))
+    )
+    register_api(flask_app)
+    app = FlaskAppWrapper(flask_app)
     app.run(debug=True, use_reloader=False, port=port, host=host)
 
 

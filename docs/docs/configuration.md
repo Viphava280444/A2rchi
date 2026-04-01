@@ -116,11 +116,15 @@ services:
           base-user:
             permissions:
               - chat:query
-          ab-admin:
+              - ab:participate
+          ab-reviewer:
             permissions:
               - documents:view
-              - config:modify
-              - view:metrics
+              - ab:view
+              - ab:metrics
+          ab-admin:
+            permissions:
+              - ab:manage
 ```
 
 #### Provider Configuration
@@ -294,7 +298,6 @@ services:
   chat_app:
     ab_testing:
       enabled: true
-      ab_agents_dir: /root/archi/ab_agents
       sample_rate: 0.25
       disclosure_mode: post_vote_reveal
       default_trace_mode: minimal
@@ -320,16 +323,18 @@ services:
 
 `services.ab_testing` is deprecated and no longer loaded. Use `services.chat_app.ab_testing` only.
 
-If `enabled: true` is set before the A/B pool is fully configured, Archi starts successfully but keeps A/B inactive until setup is completed in the admin UI. Missing `ab_agents_dir`, missing champion/variants, or missing A/B agent-spec files are surfaced as warnings instead of blocking startup.
+If `enabled: true` is set before the A/B pool is fully configured, Archi starts successfully but keeps A/B inactive until setup is completed in the admin UI. Missing champion/variants or unresolved A/B agent-spec records are surfaced as warnings instead of blocking startup.
 
-When `ab_agents_dir` is set in the source deployment config, Archi copies those markdown files into the generated deployment and rewrites the runtime config to the internal A/B pool path (`/root/archi/ab_agents`). Pool `agent_spec` values should therefore always be filenames, not host paths.
+The runtime source of truth for A/B agent specs is now PostgreSQL. The optional `ab_agents_dir` path is treated only as a legacy import source during reconciliation; runtime A/B loading never falls back to reading staged container markdown files directly.
+
+New A/B specs created through the admin UI are stored in the same PostgreSQL-backed catalog. Editing an existing A/B spec is immutable: Archi creates a new suffixed spec such as `_v2` and switches the edited variant to that new catalog entry, preserving the older spec for audit and historical comparison references.
 
 ### Variant Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `label` | string | *required* | Unique human-facing variant label used in the UI and metrics |
-| `agent_spec` | string | *required* | Agent markdown filename to load from `ab_agents_dir` |
+| `agent_spec` | string | *required* | A/B agent-spec filename resolved from the database-backed A/B catalog |
 | `provider` | string | `null` | Override LLM provider |
 | `model` | string | `null` | Override LLM model |
 | `num_documents_to_retrieve` | int | `null` | Override retriever document count |
@@ -340,7 +345,7 @@ When `ab_agents_dir` is set in the source deployment config, Archi copies those 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable the experiment pool |
-| `ab_agents_dir` | string | `/root/archi/ab_agents` | Isolated directory for A/B-only agent markdown files |
+| `ab_agents_dir` | string | `/root/archi/ab_agents` | Optional legacy import directory for migrating A/B markdown specs into the DB catalog |
 | `sample_rate` | float | `1.0` | Fraction of eligible turns that should run A/B |
 | `disclosure_mode` | string | `post_vote_reveal` | One of `blind`, `post_vote_reveal`, `named` |
 | `default_trace_mode` | string | `minimal` | One of `minimal`, `normal`, `verbose` |
@@ -349,6 +354,19 @@ When `ab_agents_dir` is set in the source deployment config, Archi copies those 
 | `target_permissions` | list[string] | `[]` | Restrict participation to matching permissions |
 
 The `champion` field must reference an existing variant `label`. At least two variants are required before the experiment becomes active. `name`-only variant config is not supported. When a user enables A/B mode in the chat UI, the pool takes over — the champion always appears in one arm, and a random challenger is placed in the other. Arm positions (A vs B) are randomized per comparison.
+
+### A/B RBAC and User Preference
+
+Use RBAC to separate participation, read-only review, metrics access, and write access:
+
+| Permission | Purpose |
+|------------|---------|
+| `ab:participate` | Makes a user eligible for A/B comparisons and shows the per-user sampling slider in chat settings |
+| `ab:view` | Allows read-only access to the A/B admin page |
+| `ab:metrics` | Allows access to aggregate A/B metrics |
+| `ab:manage` | Allows editing variants, A/B agent specs, and experiment settings |
+
+`services.chat_app.ab_testing.sample_rate` remains the deployment default. Users with `ab:participate` can override that default per account with a `0..1` slider in chat settings.
 
 Variant metrics (wins, losses, ties) are tracked in the `ab_variant_metrics` database table and available via `GET /api/ab/metrics`.
 

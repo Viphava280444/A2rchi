@@ -1218,6 +1218,24 @@
   gap: 14px;
 }
 
+.ab-admin-metrics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+.ab-admin-metrics-table th,
+.ab-admin-metrics-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-color, #30363d);
+  text-align: left;
+}
+
+.ab-admin-metrics-table th {
+  color: var(--text-secondary, #8b949e);
+  font-weight: 600;
+}
+
 .ab-admin-warning-list {
   display: flex;
   flex-direction: column;

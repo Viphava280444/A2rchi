@@ -1,6 +1,9 @@
 import pytest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from src.cli.managers.config_manager import ConfigurationManager
+from src.interfaces.chat_app.app import ChatWrapper
 from src.utils.ab_testing import ABPool, ABPoolError, load_ab_pool_state
 
 
@@ -148,6 +151,31 @@ def test_load_ab_pool_state_activates_when_ab_specs_exist(tmp_path):
     assert state.pool.champion_name == "Baseline"
 
 
+def test_load_ab_pool_state_accepts_database_spec_lookup_callback():
+    state = load_ab_pool_state(
+        {
+            "services": {
+                "chat_app": {
+                    "ab_testing": {
+                        "enabled": True,
+                        "pool": {
+                            "champion": "Baseline",
+                            "variants": [
+                                {"label": "Baseline", "agent_spec": "baseline.md"},
+                                {"label": "Challenger", "agent_spec": "challenger.md"},
+                            ],
+                        },
+                    }
+                }
+            }
+        },
+        agent_spec_exists=lambda filename: filename in {"baseline.md", "challenger.md"},
+    )
+
+    assert state.pool is not None
+    assert state.pool.champion_name == "Baseline"
+
+
 def test_validate_ab_testing_config_allows_incomplete_ui_bootstrap():
     manager = object.__new__(ConfigurationManager)
 
@@ -159,3 +187,51 @@ def test_validate_ab_testing_config_allows_incomplete_ui_bootstrap():
             }
         }
     )
+
+
+def test_chat_refresh_ab_pool_merges_import_warnings_with_pool_state():
+    chat = object.__new__(ChatWrapper)
+    chat.config = {
+        "services": {
+            "chat_app": {
+                "ab_testing": {
+                    "enabled": True,
+                    "pool": {
+                        "champion": "Baseline",
+                        "variants": [
+                            {"label": "Baseline", "agent_spec": "baseline.md"},
+                            {"label": "Challenger", "agent_spec": "challenger.md"},
+                        ],
+                    },
+                }
+            }
+        }
+    }
+    chat.ab_agent_spec_service = Mock()
+    chat.ab_agent_spec_service.spec_exists = Mock(return_value=True)
+    chat._sync_ab_agent_specs_from_filesystem = Mock(return_value={
+        "warnings": ["A/B agent import conflict: baseline.md failed to import"],
+        "conflicts": ["baseline.md failed to import"],
+        "imported": 0,
+        "updated": 0,
+        "skipped": 0,
+    })
+
+    with patch(
+        "src.interfaces.chat_app.app.load_ab_pool_state",
+        return_value=SimpleNamespace(
+            pool=None,
+            warnings=["A/B testing is enabled but inactive because the A/B agent pool is missing: ['baseline.md']."],
+            enabled_requested=True,
+            agent_dir="/root/archi/ab_agents",
+            agent_dir_configured=True,
+        ),
+    ):
+        ChatWrapper.refresh_ab_pool(chat)
+
+    assert chat.ab_pool is None
+    assert chat.ab_pool_state.warnings == [
+        "A/B agent import conflict: baseline.md failed to import",
+        "A/B testing is enabled but inactive because the A/B agent pool is missing: ['baseline.md'].",
+    ]
+    assert chat.ab_agent_import_diagnostics["conflicts"] == ["baseline.md failed to import"]

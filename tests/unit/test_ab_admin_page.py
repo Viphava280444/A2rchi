@@ -52,16 +52,36 @@ def test_data_viewer_page_passes_ab_manage_flag_to_template():
     render_template_mock.assert_called_once_with("data.html", can_manage_ab_testing=True)
 
 
-def test_ab_testing_admin_page_requires_manage_permission():
+def test_ab_testing_admin_page_requires_view_permission():
     app = Flask(__name__)
     wrapper = object.__new__(FlaskAppWrapper)
     wrapper.app = app
 
     with app.test_request_context("/admin/ab-testing"):
-        with patch.object(wrapper, "_can_manage_ab_testing", return_value=False):
+        with patch.object(wrapper, "_can_view_ab_testing", return_value=False):
             result = FlaskAppWrapper.ab_testing_admin_page(wrapper)
 
     assert result == ("Forbidden", 403)
+
+
+def test_ab_testing_admin_page_renders_template_for_viewer():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+
+    with app.test_request_context("/admin/ab-testing"):
+        with patch.object(wrapper, "_can_view_ab_testing", return_value=True):
+            with patch.object(wrapper, "_can_manage_ab_testing", return_value=False):
+                with patch.object(wrapper, "_can_view_ab_metrics", return_value=True):
+                    with patch("src.interfaces.chat_app.app.render_template", return_value="ok") as render_template_mock:
+                        result = FlaskAppWrapper.ab_testing_admin_page(wrapper)
+
+    assert result == "ok"
+    render_template_mock.assert_called_once_with(
+        "ab_testing.html",
+        can_manage_ab_testing=False,
+        can_view_ab_metrics=True,
+    )
 
 
 def test_ab_testing_admin_page_renders_template_for_admin():
@@ -70,12 +90,18 @@ def test_ab_testing_admin_page_renders_template_for_admin():
     wrapper.app = app
 
     with app.test_request_context("/admin/ab-testing"):
-        with patch.object(wrapper, "_can_manage_ab_testing", return_value=True):
-            with patch("src.interfaces.chat_app.app.render_template", return_value="ok") as render_template_mock:
-                result = FlaskAppWrapper.ab_testing_admin_page(wrapper)
+        with patch.object(wrapper, "_can_view_ab_testing", return_value=True):
+            with patch.object(wrapper, "_can_manage_ab_testing", return_value=True):
+                with patch.object(wrapper, "_can_view_ab_metrics", return_value=True):
+                    with patch("src.interfaces.chat_app.app.render_template", return_value="ok") as render_template_mock:
+                        result = FlaskAppWrapper.ab_testing_admin_page(wrapper)
 
     assert result == "ok"
-    render_template_mock.assert_called_once_with("ab_testing.html")
+    render_template_mock.assert_called_once_with(
+        "ab_testing.html",
+        can_manage_ab_testing=True,
+        can_view_ab_metrics=True,
+    )
 
 
 def test_ab_testing_template_includes_theme_init_and_inline_agent_creation():
@@ -156,8 +182,10 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
         }
     }
     wrapper.global_config = {"DATA_PATH": "/root/data"}
-    wrapper._get_ab_agents_dir = Mock(return_value=Path("/root/archi/ab_agents"))
     wrapper._is_admin_request = Mock(return_value=True)
+    wrapper._can_view_ab_testing = Mock(return_value=True)
+    wrapper._can_manage_ab_testing = Mock(return_value=True)
+    wrapper._can_view_ab_metrics = Mock(return_value=True)
     wrapper.chat = SimpleNamespace(
         ab_pool=SimpleNamespace(
             enabled=True,
@@ -172,6 +200,7 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
             ],
         ),
         ab_pool_state=SimpleNamespace(warnings=["A/B testing is active."]),
+        ab_agent_import_diagnostics={"imported": 2, "conflicts": []},
     )
 
     payload = FlaskAppWrapper._build_admin_ab_pool_payload(wrapper)
@@ -180,9 +209,40 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
     assert payload["enabled_requested"] is True
     assert payload["champion"] == "Baseline"
     assert payload["variants"] == ["Baseline", "Poet"]
-    assert payload["defaults"]["ab_agents_dir"] == "/root/archi/ab_agents"
+    assert payload["defaults"]["ab_catalog_source"] == "database"
     assert payload["defaults"]["provider"] == "openrouter"
     assert payload["warnings"] == ["A/B testing is active."]
+    assert payload["import_diagnostics"]["imported"] == 2
+
+
+def test_save_agent_spec_ab_edit_creates_immutable_copy():
+    app = Flask(__name__)
+    wrapper = object.__new__(FlaskAppWrapper)
+    wrapper.app = app
+    wrapper._get_agent_scope = Mock(return_value="ab")
+    wrapper._can_manage_ab_testing = Mock(return_value=True)
+    ab_service = Mock()
+    ab_service.save_edited_copy.return_value = SimpleNamespace(name="Baseline_v2", filename="baseline-v2.md")
+    wrapper._get_ab_agent_spec_service = Mock(return_value=ab_service)
+
+    with app.test_request_context(
+        "/api/agents",
+        method="POST",
+        json={
+            "scope": "ab",
+            "mode": "edit",
+            "existing_name": "Baseline",
+            "content": "---\nname: Baseline\nab_only: true\n---\nUpdated prompt\n",
+        },
+    ):
+        response, status = FlaskAppWrapper.save_agent_spec(wrapper)
+
+    payload = response.get_json()
+    assert status == 200
+    assert payload["name"] == "Baseline_v2"
+    assert payload["filename"] == "baseline-v2.md"
+    ab_service.save_edited_copy.assert_called_once()
+    assert ab_service.save_edited_copy.call_args.kwargs["existing_name"] == "Baseline"
 
 
 def test_ab_disable_pool_persists_disable_and_returns_admin_payload():

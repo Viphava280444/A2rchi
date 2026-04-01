@@ -12,7 +12,7 @@ import json
 import random
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.utils.logging import get_logger
 
@@ -31,6 +31,13 @@ class ABVariant:
     model: Optional[str] = None               # e.g. "claude-sonnet-4-20250514"
     num_documents_to_retrieve: Optional[int] = None
     recursion_limit: Optional[int] = None
+    agent_spec_id: Optional[int] = None
+    agent_spec_name: Optional[str] = None
+    agent_spec_version_id: Optional[int] = None
+    agent_spec_version_number: Optional[int] = None
+    agent_spec_content_hash: Optional[str] = None
+    agent_spec_tools: Optional[List[str]] = None
+    agent_spec_prompt_hash: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -215,6 +222,13 @@ class ABPool:
                 model=entry.get("model"),
                 num_documents_to_retrieve=entry.get("num_documents_to_retrieve"),
                 recursion_limit=entry.get("recursion_limit"),
+                agent_spec_id=entry.get("agent_spec_id"),
+                agent_spec_name=entry.get("agent_spec_name"),
+                agent_spec_version_id=entry.get("agent_spec_version_id"),
+                agent_spec_version_number=entry.get("agent_spec_version_number"),
+                agent_spec_content_hash=entry.get("agent_spec_content_hash"),
+                agent_spec_tools=entry.get("agent_spec_tools"),
+                agent_spec_prompt_hash=entry.get("agent_spec_prompt_hash"),
             ))
 
         if champion_name not in seen_labels:
@@ -348,7 +362,11 @@ def resolve_ab_agents_dir(chat_app_config: Dict[str, Any]) -> Tuple[Path, bool]:
     return Path(DEFAULT_AB_AGENTS_DIR), False
 
 
-def load_ab_pool_state(config: Dict[str, Any]) -> ABPoolLoadState:
+def load_ab_pool_state(
+    config: Dict[str, Any],
+    *,
+    agent_spec_exists: Optional[Callable[[str], bool]] = None,
+) -> ABPoolLoadState:
     """
     Inspect the chat_app A/B configuration and return both the active pool
     (when valid) and non-fatal warnings for incomplete setup.
@@ -369,12 +387,6 @@ def load_ab_pool_state(config: Dict[str, Any]) -> ABPoolLoadState:
         return ABPoolLoadState(pool=None, warnings=[], enabled_requested=False, agent_dir=str(agent_dir), agent_dir_configured=configured)
 
     enabled_requested = bool(ab_config.get("enabled", False))
-    if enabled_requested and not configured:
-        warnings.append(
-            f"A/B testing is using the default ab_agents_dir '{agent_dir}'. "
-            "Create A/B-only agent specs from the admin UI before the experiment can activate."
-        )
-
     if not enabled_requested:
         return ABPoolLoadState(pool=None, warnings=warnings, enabled_requested=False, agent_dir=str(agent_dir), agent_dir_configured=configured)
 
@@ -387,14 +399,21 @@ def load_ab_pool_state(config: Dict[str, Any]) -> ABPoolLoadState:
         )
         return ABPoolLoadState(pool=None, warnings=warnings, enabled_requested=True, agent_dir=str(agent_dir), agent_dir_configured=configured)
 
-    missing_specs = [
-        variant.agent_spec
-        for variant in pool.variants
-        if not (agent_dir / variant.agent_spec).exists()
-    ]
+    if agent_spec_exists is None:
+        missing_specs = [
+            variant.agent_spec
+            for variant in pool.variants
+            if not (agent_dir / variant.agent_spec).exists()
+        ]
+    else:
+        missing_specs = [
+            variant.agent_spec
+            for variant in pool.variants
+            if not agent_spec_exists(variant.agent_spec)
+        ]
     if missing_specs:
         warnings.append(
-            f"A/B testing is enabled but inactive because the A/B agent pool is missing: {sorted(missing_specs)} in '{agent_dir}'."
+            f"A/B testing is enabled but inactive because the A/B agent pool is missing: {sorted(missing_specs)}."
         )
         return ABPoolLoadState(pool=None, warnings=warnings, enabled_requested=True, agent_dir=str(agent_dir), agent_dir_configured=configured)
 
