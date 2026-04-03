@@ -55,6 +55,16 @@ async function waitForABPlaywrightHook(page: import('@playwright/test').Page) {
   await page.waitForFunction(() => typeof (window as any).__ARCHI_PLAYWRIGHT__?.ab !== 'undefined');
 }
 
+async function enableVisibleABTraceMode(page: import('@playwright/test').Page) {
+  await waitForABPlaywrightHook(page);
+  await page.evaluate(() => {
+    (window as any).__ARCHI_PLAYWRIGHT__.ab.patchPoolState({
+      enabled: true,
+      activity_panel_default_state: 'collapsed',
+    });
+  });
+}
+
 async function loadConversationFromSidebar(page: import('@playwright/test').Page, conversationId: number) {
   const conversation = page.locator(`.conversation-item[data-id="${conversationId}"]`);
   await expect(conversation).toBeVisible();
@@ -637,6 +647,7 @@ test.describe('A/B Comparison Streaming', () => {
     await setupBasicMocks(page);
     await setupABAdminMocks(page);
     await openChatPage(page);
+    await enableVisibleABTraceMode(page);
 
     await waitForABPlaywrightHook(page);
     await page.evaluate(() => {
@@ -996,16 +1007,6 @@ test.describe('A/B Vote Submission', () => {
 
     await page.route('**/api/ab/compare', async (route: any) => {
       await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
-    });
-  }
-
-  async function enableVisibleABTraceMode(page: any) {
-    await waitForABPlaywrightHook(page);
-    await page.evaluate(() => {
-      (window as any).__ARCHI_PLAYWRIGHT__.ab.patchPoolState({
-        enabled: true,
-        activity_panel_default_state: 'collapsed',
-      });
     });
   }
 
