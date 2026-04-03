@@ -16,9 +16,13 @@ def _build_wrapper(*, sample_rate=1.0, max_pending=1, pending_count=0):
     wrapper.chat.ab_pool = SimpleNamespace(
         enabled=True,
         sample_rate=sample_rate,
+        comparison_rate=sample_rate,
         disclosure_mode="post_vote_reveal",
-        default_trace_mode="minimal",
+        default_trace_mode="hidden",
         max_pending_per_conversation=max_pending,
+        variant_label_mode="post_vote_reveal",
+        activity_panel_default_state="hidden",
+        max_pending_comparisons_per_conversation=max_pending,
     )
     wrapper.chat.conv_service = Mock()
     wrapper.chat.conv_service.count_pending_ab_comparisons.return_value = pending_count
@@ -44,7 +48,7 @@ def test_ab_decision_allows_second_unresolved_comparison_below_limit():
     assert status == 200
     assert payload["use_ab"] is True
     assert payload["reason"] == "sampled"
-    assert payload["max_pending_per_conversation"] == 2
+    assert payload["max_pending_comparisons_per_conversation"] == 2
 
 
 def test_ab_decision_blocks_when_pending_limit_is_reached():
@@ -58,7 +62,7 @@ def test_ab_decision_blocks_when_pending_limit_is_reached():
     assert payload["use_ab"] is False
     assert payload["reason"] == "pending_vote"
     assert payload["pending_count"] == 2
-    assert payload["max_pending_per_conversation"] == 2
+    assert payload["max_pending_comparisons_per_conversation"] == 2
 
 
 def test_ab_pending_endpoint_returns_all_pending_comparisons():

@@ -289,7 +289,7 @@ data_manager:
 
 ## A/B Testing Pool
 
-Archi supports champion/challenger A/B testing via a server-side variant pool. When configured, the system automatically pairs the champion agent against a random challenger for each comparison. Users vote on which response is better, and aggregate metrics are tracked per variant.
+Archi supports champion-vs-variant A/B testing via a server-side variant pool. When configured, the system automatically pairs the champion agent against a random variant for each comparison. Users vote on which response is better, and aggregate metrics are tracked per variant.
 
 Configure A/B testing under `services.chat_app.ab_testing`:
 
@@ -298,12 +298,13 @@ services:
   chat_app:
     ab_testing:
       enabled: true
-      sample_rate: 0.25
-      disclosure_mode: post_vote_reveal
-      default_trace_mode: minimal
-      max_pending_per_conversation: 1
-      target_roles: []
-      target_permissions: []
+      force_yaml_override: false
+      comparison_rate: 0.25
+      variant_label_mode: post_vote_reveal
+      activity_panel_default_state: hidden
+      max_pending_comparisons_per_conversation: 1
+      eligible_roles: []
+      eligible_permissions: []
       pool:
         champion: default
         variants:
@@ -323,11 +324,13 @@ services:
 
 `services.ab_testing` is deprecated and no longer loaded. Use `services.chat_app.ab_testing` only.
 
-If `enabled: true` is set before the A/B pool is fully configured, Archi starts successfully but keeps A/B inactive until setup is completed in the admin UI. Missing champion/variants or unresolved A/B agent-spec records are surfaced as warnings instead of blocking startup.
+If `enabled: true` is set before the A/B pool is fully configured, Archi starts successfully but keeps A/B inactive until setup is completed in the admin UI. Missing champion/variant selections or unresolved A/B agent-spec records are surfaced as warnings instead of blocking startup.
 
 The runtime source of truth for A/B agent specs is now PostgreSQL. The optional `ab_agents_dir` path is treated only as a legacy import source during reconciliation; runtime A/B loading never falls back to reading staged container markdown files directly.
 
 New A/B specs created through the admin UI are stored in the same PostgreSQL-backed catalog. Existing A/B specs are not edited through the admin page; if you need a changed prompt or tool selection, create a new A/B spec and point the variant at that new catalog entry.
+
+For `services.chat_app.ab_testing`, the persisted PostgreSQL-backed static config becomes authoritative after the first successful bootstrap. On later restarts or reseeds, the rendered YAML A/B block is used only if no persisted A/B block exists yet, unless `force_yaml_override: true` is set to intentionally replace the saved A/B state. This flag is bootstrap-only and defaults to `false`.
 
 ### Variant Fields
 
@@ -346,14 +349,29 @@ New A/B specs created through the admin UI are stored in the same PostgreSQL-bac
 |-------|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable the experiment pool |
 | `ab_agents_dir` | string | `/root/archi/ab_agents` | Optional legacy import directory for migrating A/B markdown specs into the DB catalog |
-| `sample_rate` | float | `1.0` | Fraction of eligible turns that should run A/B |
-| `disclosure_mode` | string | `post_vote_reveal` | One of `blind`, `post_vote_reveal`, `named` |
-| `default_trace_mode` | string | `minimal` | One of `minimal`, `normal`, `verbose` |
-| `max_pending_per_conversation` | int | `1` | Maximum unresolved comparisons per conversation |
-| `target_roles` | list[string] | `[]` | Restrict participation to matching RBAC roles |
-| `target_permissions` | list[string] | `[]` | Restrict participation to matching permissions |
+| `force_yaml_override` | boolean | `false` | Bootstrap-only override that forces the rendered YAML A/B block to replace persisted A/B state on reseed/restart |
+| `comparison_rate` | float | `1.0` | Fraction of eligible turns that should run A/B |
+| `variant_label_mode` | string | `post_vote_reveal` | One of `hidden`, `post_vote_reveal`, `always_visible` |
+| `activity_panel_default_state` | string | `hidden` | One of `hidden`, `collapsed`, `expanded` |
+| `max_pending_comparisons_per_conversation` | int | `1` | Maximum unresolved comparisons per conversation |
+| `eligible_roles` | list[string] | `[]` | Restrict participation to matching RBAC roles |
+| `eligible_permissions` | list[string] | `[]` | Restrict participation to matching permissions |
 
-The `champion` field must reference an existing variant `label`. At least two variants are required before the experiment becomes active. `name`-only variant config is not supported. When a user enables A/B mode in the chat UI, the pool takes over — the champion always appears in one arm, and a random challenger is placed in the other. Arm positions (A vs B) are randomized per comparison.
+### Config-To-UI Mapping
+
+| Config Field | Config Value | UI Label | Runtime Meaning |
+|--------------|--------------|----------|-----------------|
+| `comparison_rate` | `0.0..1.0` | `Comparison Rate` | Fraction of eligible turns that become A/B comparisons |
+| `variant_label_mode` | `hidden` | `Hidden` | Hide variant labels before and after the vote |
+| `variant_label_mode` | `post_vote_reveal` | `Post-Vote Reveal` | Hide variant labels until the vote is submitted |
+| `variant_label_mode` | `always_visible` | `Always Visible` | Show variant labels throughout the comparison |
+| `activity_panel_default_state` | `hidden` | `Hidden` | Do not show the per-arm activity panel by default |
+| `activity_panel_default_state` | `collapsed` | `Collapsed` | Show the activity panel in a collapsed state |
+| `activity_panel_default_state` | `expanded` | `Expanded` | Show the activity panel expanded by default |
+| `max_pending_comparisons_per_conversation` | integer >= 1 | `Max Pending Comparisons Per Conversation` | Limit unresolved comparisons before the user must vote |
+| `pool.champion` | existing variant label | `Champion` | Baseline variant that always appears in each comparison |
+
+The `champion` field must reference an existing variant `label`. At least two variants are required before the experiment becomes active. `name`-only variant config is not supported. When a user enables A/B mode in the chat UI, the pool takes over: the champion always appears in one arm, and a random variant is placed in the other. Arm positions (A vs B) are randomized per comparison.
 
 ### A/B RBAC and User Preference
 
@@ -366,7 +384,7 @@ Use RBAC to separate participation, read-only review, metrics access, and write 
 | `ab:metrics` | Allows access to aggregate A/B metrics |
 | `ab:manage` | Allows editing variants, A/B agent specs, and experiment settings |
 
-`services.chat_app.ab_testing.sample_rate` remains the deployment default. Users with `ab:participate` can override that default per account with a `0..1` slider in chat settings.
+`services.chat_app.ab_testing.comparison_rate` remains the deployment default. Users with `ab:participate` can override that default per account with a `0..1` slider in chat settings.
 
 Users with `ab:view`, `ab:metrics`, or `ab:manage` can open the dedicated A/B Testing page from the data viewer and from chat settings. Users with `ab:participate` but not A/B page access still get the personal sampling slider in chat settings.
 

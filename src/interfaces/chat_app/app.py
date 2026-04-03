@@ -70,7 +70,11 @@ from src.utils.ab_testing import (
     ABPoolLoadState,
     ABVariant,
     ABPoolError,
+    DEFAULT_DISCLOSURE_MODE,
+    DEFAULT_TRACE_MODE,
     load_ab_pool_state,
+    normalize_ab_disclosure_mode,
+    normalize_ab_trace_mode,
     resolve_ab_agents_dir,
 )
 from src.interfaces.chat_app.event_formatter import PipelineEventFormatter
@@ -268,6 +272,13 @@ class ChatRequestContext:
 
 
 class ChatWrapper:
+    AUTO_SOURCE_SECTION_LABEL = "Retrieved documents"
+    AUTO_SOURCE_SECTION_EXPLANATION = "These are the knowledge-base documents retrieved for this answer."
+    _AUTO_SOURCE_SECTION_PATTERN = re.compile(
+        r"(Show all sources|Retrieved documents|Sources cited in this answer)\s*\(\d+\)",
+        flags=re.IGNORECASE,
+    )
+
     """
     Wrapper which holds functionality for the chatbot
     """
@@ -730,7 +741,15 @@ class ChatWrapper:
                 </div>
             '''
 
-        _output += f'<details style="margin-top: 0.4em;"><summary style="cursor: pointer; color: #66b3ff; font-weight: 700;">Show all sources ({len(top_sources)})</summary>'
+        _output += (
+            f'<div style="margin: 0.4em 0 0.3em 0;">'
+            f'{ChatWrapper.AUTO_SOURCE_SECTION_EXPLANATION}'
+            f'</div>'
+        )
+        _output += (
+            f'<details style="margin-top: 0.4em;"><summary style="cursor: pointer; color: #66b3ff; '
+            f'font-weight: 700;">{ChatWrapper.AUTO_SOURCE_SECTION_LABEL} ({len(top_sources)})</summary>'
+        )
         for entry in top_sources:
             _output += _entry_html(entry)
         _output += '</details>'
@@ -744,12 +763,28 @@ class ChatWrapper:
         if not top_sources:
             return ""
 
-        _output = f"\n\n---\n<details><summary><strong>Show all sources ({len(top_sources)})</strong></summary>\n\n"
+        _output = (
+            "\n\n---\n"
+            f"*{ChatWrapper.AUTO_SOURCE_SECTION_EXPLANATION}*\n\n"
+            f"<details><summary><strong>{ChatWrapper.AUTO_SOURCE_SECTION_LABEL} ({len(top_sources)})</strong></summary>\n\n"
+        )
         for entry in top_sources:
             _output += ChatWrapper._format_source_entry(entry)
         _output += "\n</details>\n"
 
         return _output
+
+    @classmethod
+    def _contains_source_section(cls, output: str) -> bool:
+        return bool(output and cls._AUTO_SOURCE_SECTION_PATTERN.search(output))
+
+    @classmethod
+    def append_source_section(cls, output: str, top_sources, *, render_markdown: bool) -> str:
+        if not top_sources or cls._contains_source_section(output):
+            return output
+        if render_markdown:
+            return output + cls.format_links(top_sources)
+        return output + cls.format_links_markdown(top_sources)
 
     @staticmethod
     def _looks_like_url(value: str | None) -> bool:
@@ -1538,10 +1573,11 @@ class ChatWrapper:
         provider_api_key: Optional[str] = None,
     ) -> Iterator[Dict[str, Any]]:
         """
-        Stream a champion/challenger A/B comparison.
+        Stream a champion-vs-variant A/B comparison.
 
         Yields interleaved NDJSON events tagged with ``arm: 'a'`` or ``arm: 'b'``
         in real-time as each arm's pipeline produces output.
+        Each arm emits its own terminal ``final`` event when generation ends.
         A final ``ab_meta`` event carries the comparison_id and variant mapping.
         """
         import queue
@@ -1611,8 +1647,12 @@ class ChatWrapper:
         # PipelineEventFormatter yielding *accumulated* content (not deltas);
         # the last write per arm is therefore the complete response text.
         arm_results = {
-            "a": {"final_text": "", "error": None},
-            "b": {"final_text": "", "error": None},
+            "a": {"final_text": "", "error": None, "final_emitted": False},
+            "b": {"final_text": "", "error": None, "final_emitted": False},
+        }
+        arm_model_used = {
+            "a": f"{arm_a_variant.provider or ''}/{arm_a_variant.model or ''}".strip("/"),
+            "b": f"{arm_b_variant.provider or ''}/{arm_b_variant.model or ''}".strip("/"),
         }
 
         def _stream_arm(arm_archi, arm_label):
@@ -1633,6 +1673,7 @@ class ChatWrapper:
                     conversation_id=context.conversation_id,
                     vectorstore=vs,
                 ):
+                    output_meta = output.metadata or {}
                     for event in formatter.process(output):
                         if not first_event_logged:
                             logger.info(
@@ -1644,6 +1685,25 @@ class ChatWrapper:
                         if event["type"] == "text":
                             arm_results[arm_label]["final_text"] = event["content"]
                         event_queue.put(event)
+                    if output_meta.get("event_type") == "final" and not arm_results[arm_label]["final_emitted"]:
+                        if not first_event_logged:
+                            logger.info(
+                                "A/B arm '%s' first event (t+%.1fs): type=final",
+                                arm_label, _time.monotonic() - t0,
+                            )
+                            first_event_logged = True
+                        final_text = getattr(output, "answer", "") or formatter.last_text or arm_results[arm_label]["final_text"]
+                        arm_results[arm_label]["final_text"] = final_text
+                        arm_results[arm_label]["final_emitted"] = True
+                        event_queue.put({
+                            "type": "final",
+                            "arm": arm_label,
+                            "response": final_text,
+                            "usage": output_meta.get("usage"),
+                            "model": output_meta.get("model"),
+                            "model_used": arm_model_used[arm_label],
+                            "duration_ms": int((_time.monotonic() - t0) * 1000),
+                        })
             except Exception as exc:
                 arm_results[arm_label]["error"] = str(exc)
                 event_queue.put({"type": "error", "arm": arm_label, "message": str(exc)})
@@ -1659,7 +1719,7 @@ class ChatWrapper:
             "type": "ab_arms",
             "arm_a_name": arm_a_variant.name,
             "arm_b_name": arm_b_variant.name,
-            "disclosure_mode": self.ab_pool.disclosure_mode,
+            "variant_label_mode": self.ab_pool.variant_label_mode,
         }
 
         # Start both arms in parallel threads
@@ -1769,7 +1829,7 @@ class ChatWrapper:
             "is_champion_first": is_champion_first,
             "arm_a_message_id": arm_a_mid,
             "arm_b_message_id": arm_b_mid,
-            "disclosure_mode": self.ab_pool.disclosure_mode,
+            "variant_label_mode": self.ab_pool.variant_label_mode,
         }
 
     def _store_assistant_message(self, conversation_id, content, model_used=None, pipeline_used=None):
@@ -1903,11 +1963,11 @@ class ChatWrapper:
         scores = result.get("metadata", {}).get("retriever_scores", [])
         top_sources = self.get_top_sources(documents, scores)
         
-        # Use markdown links for client-side rendering, HTML for server-side
-        if render_markdown:
-            output += self.format_links(top_sources)
-        else:
-            output += self.format_links_markdown(top_sources)
+        output = self.append_source_section(
+            output,
+            top_sources,
+            render_markdown=render_markdown,
+        )
 
         timestamps["archi_message_ts"] = datetime.now(timezone.utc)
         context_data = self.prepare_context_for_storage(documents, scores)
@@ -3069,6 +3129,24 @@ class FlaskAppWrapper(object):
             })
         return details
 
+    @staticmethod
+    def _get_ab_setting(
+        mapping: Dict[str, Any],
+        canonical_key: str,
+        legacy_key: Optional[str] = None,
+        default: Any = None,
+    ) -> Any:
+        if isinstance(mapping, dict):
+            if canonical_key in mapping:
+                return mapping.get(canonical_key)
+            if legacy_key and legacy_key in mapping:
+                return mapping.get(legacy_key)
+        return default
+
+    @classmethod
+    def _get_ab_pool_champion(cls, raw_pool: Dict[str, Any]) -> str:
+        return str(cls._get_ab_setting(raw_pool, "champion", "control", "") or "").strip()
+
     def _build_admin_ab_pool_payload(self) -> Dict[str, Any]:
         chat_cfg = self.services_config.get("chat_app", {}) or {}
         raw_ab_cfg = (chat_cfg.get("ab_testing") or {}) if isinstance(chat_cfg.get("ab_testing"), dict) else {}
@@ -3079,19 +3157,35 @@ class FlaskAppWrapper(object):
         defaults = self._get_ab_runtime_defaults()
 
         variant_details = self._normalize_ab_variant_details(raw_pool.get("variants"))
-        champion = str(raw_pool.get("champion") or "").strip()
-        sample_rate = raw_ab_cfg.get("sample_rate", 1.0)
-        disclosure_mode = raw_ab_cfg.get("disclosure_mode", "post_vote_reveal")
-        default_trace_mode = raw_ab_cfg.get("default_trace_mode", "minimal")
-        max_pending = raw_ab_cfg.get("max_pending_per_conversation", 1)
+        champion = self._get_ab_pool_champion(raw_pool)
+        comparison_rate = self._get_ab_setting(raw_ab_cfg, "comparison_rate", "sample_rate", 1.0)
+        variant_label_mode = normalize_ab_disclosure_mode(
+            self._get_ab_setting(
+                raw_ab_cfg, "variant_label_mode", "disclosure_mode", DEFAULT_DISCLOSURE_MODE
+            )
+        )
+        activity_panel_default_state = normalize_ab_trace_mode(
+            self._get_ab_setting(
+                raw_ab_cfg,
+                "activity_panel_default_state",
+                "default_trace_mode",
+                DEFAULT_TRACE_MODE,
+            )
+        )
+        max_pending = self._get_ab_setting(
+            raw_ab_cfg,
+            "max_pending_comparisons_per_conversation",
+            "max_pending_per_conversation",
+            1,
+        )
 
         if active_pool:
             variant_details = [variant.to_meta() for variant in active_pool.variants]
             champion = active_pool.champion_name
-            sample_rate = active_pool.sample_rate
-            disclosure_mode = active_pool.disclosure_mode
-            default_trace_mode = active_pool.default_trace_mode
-            max_pending = active_pool.max_pending_per_conversation
+            comparison_rate = active_pool.comparison_rate
+            variant_label_mode = active_pool.variant_label_mode
+            activity_panel_default_state = active_pool.activity_panel_default_state
+            max_pending = active_pool.max_pending_comparisons_per_conversation
 
         return {
             "success": True,
@@ -3109,13 +3203,17 @@ class FlaskAppWrapper(object):
             "variants": [variant.get("label", "") for variant in variant_details if variant.get("label")],
             "variant_details": variant_details,
             "variant_count": len(variant_details),
-            "sample_rate": sample_rate,
-            "default_sample_rate": float(raw_ab_cfg.get("sample_rate", sample_rate or 1.0)),
-            "target_roles": list(raw_ab_cfg.get("target_roles") or []),
-            "target_permissions": list(raw_ab_cfg.get("target_permissions") or []),
-            "max_pending_per_conversation": max_pending,
-            "disclosure_mode": disclosure_mode,
-            "default_trace_mode": default_trace_mode,
+            "comparison_rate": comparison_rate,
+            "default_comparison_rate": float(
+                self._get_ab_setting(raw_ab_cfg, "comparison_rate", "sample_rate", comparison_rate or 1.0)
+            ),
+            "eligible_roles": list(self._get_ab_setting(raw_ab_cfg, "eligible_roles", "target_roles", []) or []),
+            "eligible_permissions": list(
+                self._get_ab_setting(raw_ab_cfg, "eligible_permissions", "target_permissions", []) or []
+            ),
+            "max_pending_comparisons_per_conversation": max_pending,
+            "variant_label_mode": variant_label_mode,
+            "activity_panel_default_state": activity_panel_default_state,
             "defaults": defaults,
             "warnings": list(getattr(state, "warnings", []) or []),
             "import_diagnostics": dict(getattr(self.chat, "ab_agent_import_diagnostics", {}) or {}),
@@ -3211,19 +3309,19 @@ class FlaskAppWrapper(object):
         enabled: bool,
         champion_name: str,
         variants: List[ABVariant],
-        sample_rate: float,
-        disclosure_mode: str,
-        default_trace_mode: str,
-        max_pending_per_conversation: int,
+        comparison_rate: float,
+        variant_label_mode: str,
+        activity_panel_default_state: str,
+        max_pending_comparisons_per_conversation: int,
     ) -> None:
         self.config_service.update_services_config({
             "chat_app": {
                 "ab_testing": {
                     "enabled": enabled,
-                    "sample_rate": sample_rate,
-                    "disclosure_mode": disclosure_mode,
-                    "default_trace_mode": default_trace_mode,
-                    "max_pending_per_conversation": max_pending_per_conversation,
+                    "comparison_rate": comparison_rate,
+                    "variant_label_mode": variant_label_mode,
+                    "activity_panel_default_state": activity_panel_default_state,
+                    "max_pending_comparisons_per_conversation": max_pending_comparisons_per_conversation,
                     "pool": {
                         "champion": champion_name,
                         "variants": [variant.to_meta() for variant in variants],
@@ -4219,8 +4317,8 @@ class FlaskAppWrapper(object):
             "variant_a_name": comparison.variant_a_name,
             "variant_b_name": comparison.variant_b_name,
             "preference": comparison.preference,
-            "disclosure_mode": self.chat.ab_pool.disclosure_mode if self.chat.ab_pool else "post_vote_reveal",
-            "default_trace_mode": self.chat.ab_pool.default_trace_mode if self.chat.ab_pool else "minimal",
+            "variant_label_mode": self.chat.ab_pool.variant_label_mode if self.chat.ab_pool else DEFAULT_DISCLOSURE_MODE,
+            "activity_panel_default_state": self.chat.ab_pool.activity_panel_default_state if self.chat.ab_pool else DEFAULT_TRACE_MODE,
         }
 
     def _serialize_pending_ab_comparisons(
@@ -4837,7 +4935,14 @@ class FlaskAppWrapper(object):
             can_use = participation["eligible"]
             can_participate = participation["can_participate"]
             raw_ab_cfg = ((self.services_config.get("chat_app", {}) or {}).get("ab_testing") or {})
-            default_sample_rate = float(raw_ab_cfg.get("sample_rate", getattr(pool, "sample_rate", 1.0) or 1.0))
+            default_comparison_rate = float(
+                self._get_ab_setting(
+                    raw_ab_cfg,
+                    "comparison_rate",
+                    "sample_rate",
+                    getattr(pool, "comparison_rate", getattr(pool, "sample_rate", 1.0) or 1.0),
+                )
+            )
             if can_view:
                 return jsonify(self._build_admin_ab_pool_payload()), 200
             if pool and can_use:
@@ -4853,8 +4958,8 @@ class FlaskAppWrapper(object):
                     'participant_reason': participation["reason"],
                     'participant_targeted': True,
                     **pool.participant_info(),
-                    'sample_rate': effective_rate,
-                    'default_sample_rate': default_sample_rate,
+                    'comparison_rate': effective_rate,
+                    'default_comparison_rate': default_comparison_rate,
                 }), 200
             return jsonify({
                 'success': True,
@@ -4868,8 +4973,8 @@ class FlaskAppWrapper(object):
                 'participant_eligible': participation["eligible"],
                 'participant_reason': participation["reason"],
                 'participant_targeted': participation["targeted"],
-                'sample_rate': self._get_effective_ab_sample_rate(default_sample_rate) if can_participate else default_sample_rate,
-                'default_sample_rate': default_sample_rate,
+                'comparison_rate': self._get_effective_ab_sample_rate(default_comparison_rate) if can_participate else default_comparison_rate,
+                'default_comparison_rate': default_comparison_rate,
             }), 200
         except Exception as e:
             logger.error(f"Error getting A/B pool: {str(e)}")
@@ -4912,7 +5017,7 @@ class FlaskAppWrapper(object):
                         'reason': 'pending_vote',
                         'comparison_id': getattr(pending, 'comparison_id', None),
                         'pending_count': pending_count,
-                        'max_pending_per_conversation': pool.max_pending_per_conversation,
+                        'max_pending_comparisons_per_conversation': pool.max_pending_comparisons_per_conversation,
                     }), 200
 
             sample_rate = self._get_effective_ab_sample_rate(pool.sample_rate)
@@ -4927,7 +5032,7 @@ class FlaskAppWrapper(object):
                 use_ab = roll < sample_rate
 
             logger.info(
-                "A/B decision: use_ab=%s sample_rate=%.3f roll=%s conversation_id=%s client_id=%s",
+                "A/B decision: use_ab=%s comparison_rate=%.3f roll=%s conversation_id=%s client_id=%s",
                 use_ab,
                 sample_rate,
                 "forced" if roll is None else f"{roll:.5f}",
@@ -4940,11 +5045,11 @@ class FlaskAppWrapper(object):
                 'enabled': True,
                 'use_ab': use_ab,
                 'reason': 'sampled' if use_ab else 'not_sampled',
-                'sample_rate': sample_rate,
-                'default_sample_rate': float(pool.sample_rate),
-                'disclosure_mode': pool.disclosure_mode,
-                'default_trace_mode': pool.default_trace_mode,
-                'max_pending_per_conversation': pool.max_pending_per_conversation,
+                'comparison_rate': sample_rate,
+                'default_comparison_rate': float(pool.comparison_rate),
+                'variant_label_mode': pool.variant_label_mode,
+                'activity_panel_default_state': pool.activity_panel_default_state,
+                'max_pending_comparisons_per_conversation': pool.max_pending_comparisons_per_conversation,
             }), 200
         except Exception as e:
             logger.error(f"Error deciding A/B sampling: {str(e)}")
@@ -4959,11 +5064,17 @@ class FlaskAppWrapper(object):
             return jsonify({'error': 'Admin access required'}), 403
         try:
             data = request.get_json(force=True)
-            champion_name = (data.get('champion') or '').strip()
-            sample_rate = float(data.get('sample_rate', 1.0))
-            disclosure_mode = (data.get('disclosure_mode') or 'post_vote_reveal').strip() or 'post_vote_reveal'
-            default_trace_mode = (data.get('default_trace_mode') or 'minimal').strip() or 'minimal'
-            max_pending = int(data.get('max_pending_per_conversation', 1))
+            champion_name = str(data.get('champion') or data.get('control') or '').strip()
+            comparison_rate = float(data.get('comparison_rate', data.get('sample_rate', 1.0)))
+            variant_label_mode = normalize_ab_disclosure_mode(
+                data.get('variant_label_mode') or data.get('disclosure_mode') or DEFAULT_DISCLOSURE_MODE
+            )
+            activity_panel_default_state = normalize_ab_trace_mode(
+                data.get('activity_panel_default_state') or data.get('default_trace_mode') or DEFAULT_TRACE_MODE
+            )
+            max_pending = int(
+                data.get('max_pending_comparisons_per_conversation', data.get('max_pending_per_conversation', 1))
+            )
             if not champion_name:
                 return jsonify({'error': 'champion is required'}), 400
             variant_items = data.get('variants') or []
@@ -4981,19 +5092,19 @@ class FlaskAppWrapper(object):
                 variants=variants,
                 champion_name=champion_name,
                 enabled=True,
-                sample_rate=sample_rate,
-                disclosure_mode=disclosure_mode,
-                default_trace_mode=default_trace_mode,
+                sample_rate=comparison_rate,
+                disclosure_mode=variant_label_mode,
+                default_trace_mode=activity_panel_default_state,
                 max_pending_per_conversation=max_pending,
             )
             self._persist_ab_pool_config(
                 enabled=True,
                 champion_name=champion_name,
                 variants=variants,
-                sample_rate=pool.sample_rate,
-                disclosure_mode=pool.disclosure_mode,
-                default_trace_mode=pool.default_trace_mode,
-                max_pending_per_conversation=pool.max_pending_per_conversation,
+                comparison_rate=pool.comparison_rate,
+                variant_label_mode=pool.variant_label_mode,
+                activity_panel_default_state=pool.activity_panel_default_state,
+                max_pending_comparisons_per_conversation=pool.max_pending_comparisons_per_conversation,
             )
             logger.info("Persisted A/B pool update: champion='%s', variants=%s", champion_name, parsed_labels)
             return jsonify(self._build_admin_ab_pool_payload()), 200
@@ -5012,7 +5123,9 @@ class FlaskAppWrapper(object):
             chat_cfg = self.services_config.get("chat_app", {}) or {}
             raw_ab_cfg = (chat_cfg.get("ab_testing") or {}) if isinstance(chat_cfg.get("ab_testing"), dict) else {}
             raw_pool = raw_ab_cfg.get("pool") or {}
-            champion_name = str(data.get('champion') or raw_pool.get('champion') or '').strip()
+            champion_name = str(
+                data.get('champion') or data.get('control') or self._get_ab_pool_champion(raw_pool) or ''
+            ).strip()
             if not champion_name:
                 return jsonify({'error': 'champion is required'}), 400
 
@@ -5031,19 +5144,50 @@ class FlaskAppWrapper(object):
                 variants=variants,
                 champion_name=champion_name,
                 enabled=True,
-                sample_rate=float(data.get('sample_rate', raw_ab_cfg.get('sample_rate', 1.0))),
-                disclosure_mode=(data.get('disclosure_mode') or raw_ab_cfg.get('disclosure_mode') or 'post_vote_reveal').strip() or 'post_vote_reveal',
-                default_trace_mode=(data.get('default_trace_mode') or raw_ab_cfg.get('default_trace_mode') or 'minimal').strip() or 'minimal',
-                max_pending_per_conversation=int(data.get('max_pending_per_conversation', raw_ab_cfg.get('max_pending_per_conversation', 1))),
+                sample_rate=float(
+                    data.get(
+                        'comparison_rate',
+                        data.get(
+                            'sample_rate',
+                            self._get_ab_setting(raw_ab_cfg, 'comparison_rate', 'sample_rate', 1.0),
+                        ),
+                    )
+                ),
+                disclosure_mode=normalize_ab_disclosure_mode(
+                    data.get('variant_label_mode')
+                    or data.get('disclosure_mode')
+                    or self._get_ab_setting(raw_ab_cfg, 'variant_label_mode', 'disclosure_mode', DEFAULT_DISCLOSURE_MODE)
+                ),
+                default_trace_mode=normalize_ab_trace_mode(
+                    data.get('activity_panel_default_state')
+                    or data.get('default_trace_mode')
+                    or self._get_ab_setting(
+                        raw_ab_cfg, 'activity_panel_default_state', 'default_trace_mode', DEFAULT_TRACE_MODE
+                    )
+                ),
+                max_pending_per_conversation=int(
+                    data.get(
+                        'max_pending_comparisons_per_conversation',
+                        data.get(
+                            'max_pending_per_conversation',
+                            self._get_ab_setting(
+                                raw_ab_cfg,
+                                'max_pending_comparisons_per_conversation',
+                                'max_pending_per_conversation',
+                                1,
+                            ),
+                        ),
+                    )
+                ),
             )
             self._persist_ab_pool_config(
                 enabled=True,
                 champion_name=champion_name,
                 variants=variants,
-                sample_rate=pool.sample_rate,
-                disclosure_mode=pool.disclosure_mode,
-                default_trace_mode=pool.default_trace_mode,
-                max_pending_per_conversation=pool.max_pending_per_conversation,
+                comparison_rate=pool.comparison_rate,
+                variant_label_mode=pool.variant_label_mode,
+                activity_panel_default_state=pool.activity_panel_default_state,
+                max_pending_comparisons_per_conversation=pool.max_pending_comparisons_per_conversation,
             )
             logger.info("Persisted A/B settings update: champion='%s'", champion_name)
             return jsonify(self._build_admin_ab_pool_payload()), 200
@@ -5071,14 +5215,27 @@ class FlaskAppWrapper(object):
                 existing_variants=existing_variants,
             )
 
-            champion_name = str(raw_pool.get('champion') or '').strip()
+            champion_name = self._get_ab_pool_champion(raw_pool)
             if champion_name not in parsed_labels:
                 champion_name = parsed_labels[0]
 
-            sample_rate = float(raw_ab_cfg.get('sample_rate', 1.0))
-            disclosure_mode = (raw_ab_cfg.get('disclosure_mode') or 'post_vote_reveal').strip() or 'post_vote_reveal'
-            default_trace_mode = (raw_ab_cfg.get('default_trace_mode') or 'minimal').strip() or 'minimal'
-            max_pending = int(raw_ab_cfg.get('max_pending_per_conversation', 1))
+            comparison_rate = float(self._get_ab_setting(raw_ab_cfg, 'comparison_rate', 'sample_rate', 1.0))
+            variant_label_mode = normalize_ab_disclosure_mode(
+                self._get_ab_setting(raw_ab_cfg, 'variant_label_mode', 'disclosure_mode', DEFAULT_DISCLOSURE_MODE)
+            )
+            activity_panel_default_state = normalize_ab_trace_mode(
+                self._get_ab_setting(
+                    raw_ab_cfg, 'activity_panel_default_state', 'default_trace_mode', DEFAULT_TRACE_MODE
+                )
+            )
+            max_pending = int(
+                self._get_ab_setting(
+                    raw_ab_cfg,
+                    'max_pending_comparisons_per_conversation',
+                    'max_pending_per_conversation',
+                    1,
+                )
+            )
             enabled_requested = bool(raw_ab_cfg.get('enabled', False))
 
             # Validate the resulting pool shape even if currently disabled.
@@ -5086,19 +5243,19 @@ class FlaskAppWrapper(object):
                 variants=variants,
                 champion_name=champion_name,
                 enabled=True,
-                sample_rate=sample_rate,
-                disclosure_mode=disclosure_mode,
-                default_trace_mode=default_trace_mode,
+                sample_rate=comparison_rate,
+                disclosure_mode=variant_label_mode,
+                default_trace_mode=activity_panel_default_state,
                 max_pending_per_conversation=max_pending,
             )
             self._persist_ab_pool_config(
                 enabled=enabled_requested,
                 champion_name=champion_name,
                 variants=variants,
-                sample_rate=sample_rate,
-                disclosure_mode=disclosure_mode,
-                default_trace_mode=default_trace_mode,
-                max_pending_per_conversation=max_pending,
+                comparison_rate=comparison_rate,
+                variant_label_mode=variant_label_mode,
+                activity_panel_default_state=activity_panel_default_state,
+                max_pending_comparisons_per_conversation=max_pending,
             )
             logger.info("Persisted A/B variants update: champion='%s', variants=%s", champion_name, parsed_labels)
             return jsonify(self._build_admin_ab_pool_payload()), 200
@@ -5135,7 +5292,7 @@ class FlaskAppWrapper(object):
 
     def ab_compare_stream(self):
         """
-        Stream a pool-based A/B comparison (champion vs challenger).
+        Stream a pool-based A/B comparison (champion vs variant).
 
         POST body:
         - message: [sender, content] pair
@@ -5172,12 +5329,15 @@ class FlaskAppWrapper(object):
 
         if conversation_id:
             pending_count = self.chat.conv_service.count_pending_ab_comparisons(conversation_id)
-            max_pending = int(self.chat.ab_pool.max_pending_per_conversation) if self.chat.ab_pool else 1
+            max_pending = (
+                int(self.chat.ab_pool.max_pending_comparisons_per_conversation)
+                if self.chat.ab_pool else 1
+            )
             if pending_count >= max_pending:
                 return jsonify({
                     'error': 'Resolve one of the pending comparisons before sending another message',
                     'pending_count': pending_count,
-                    'max_pending_per_conversation': max_pending,
+                    'max_pending_comparisons_per_conversation': max_pending,
                 }), 409
 
         return self._ndjson_response(self.chat.stream_ab_comparison(

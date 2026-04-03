@@ -9,7 +9,7 @@ from src.utils.config_service import StaticConfig
 from src.utils.rbac import Permission
 
 
-def _static_config_with_ab(sample_rate=1.0):
+def _static_config_with_ab(comparison_rate=1.0):
     return StaticConfig(
         deployment_name="ab",
         config_version="1",
@@ -25,7 +25,7 @@ def _static_config_with_ab(sample_rate=1.0):
             "chat_app": {
                 "ab_testing": {
                     "enabled": True,
-                    "sample_rate": sample_rate,
+                    "comparison_rate": comparison_rate,
                     "pool": {
                         "champion": "baseline",
                         "variants": [
@@ -125,27 +125,27 @@ def test_ab_testing_template_includes_theme_init_and_inline_agent_creation():
 def test_refresh_runtime_config_uses_local_static_config_snapshot_not_global_accessor():
     wrapper = object.__new__(FlaskAppWrapper)
     wrapper.config_service = Mock()
-    wrapper.config_service.get_static_config.return_value = _static_config_with_ab(sample_rate=0.4)
+    wrapper.config_service.get_static_config.return_value = _static_config_with_ab(comparison_rate=0.4)
     wrapper.chat = Mock()
 
     with patch("src.interfaces.chat_app.app.get_full_config", side_effect=AssertionError("should not use get_full_config")):
         FlaskAppWrapper._refresh_runtime_config(wrapper)
 
-    assert wrapper.services_config["chat_app"]["ab_testing"]["sample_rate"] == 0.4
-    assert wrapper.chat_app_config["ab_testing"]["sample_rate"] == 0.4
+    assert wrapper.services_config["chat_app"]["ab_testing"]["comparison_rate"] == 0.4
+    assert wrapper.chat_app_config["ab_testing"]["comparison_rate"] == 0.4
     wrapper.chat.reload_static_state.assert_called_once()
 
 
 def test_chat_reload_static_state_uses_local_static_config_snapshot_not_global_accessor():
     chat = object.__new__(ChatWrapper)
     chat.config_service = Mock()
-    chat.config_service.get_static_config.return_value = _static_config_with_ab(sample_rate=0.25)
+    chat.config_service.get_static_config.return_value = _static_config_with_ab(comparison_rate=0.25)
     chat.refresh_ab_pool = Mock()
 
     with patch("src.interfaces.chat_app.app.get_full_config", side_effect=AssertionError("should not use get_full_config")):
         ChatWrapper.reload_static_state(chat)
 
-    assert chat.services_config["chat_app"]["ab_testing"]["sample_rate"] == 0.25
+    assert chat.services_config["chat_app"]["ab_testing"]["comparison_rate"] == 0.25
     assert chat.global_config["DATA_PATH"] == "/root/data"
     chat.refresh_ab_pool.assert_called_once()
 
@@ -167,17 +167,18 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
     wrapper = object.__new__(FlaskAppWrapper)
     wrapper.app = app
     wrapper.services_config = {
-        "chat_app": {
-            "default_provider": "openrouter",
-            "default_model": "openai/gpt-4o",
-            "ab_testing": {
-                "enabled": True,
-                "sample_rate": 0.5,
-                "default_trace_mode": "minimal",
-                "max_pending_per_conversation": 2,
-                "pool": {
-                    "champion": "Baseline",
-                    "variants": [
+            "chat_app": {
+                "default_provider": "openrouter",
+                "default_model": "openai/gpt-4o",
+                "ab_testing": {
+                    "enabled": True,
+                    "comparison_rate": 0.5,
+                    "variant_label_mode": "post_vote_reveal",
+                    "activity_panel_default_state": "hidden",
+                    "max_pending_comparisons_per_conversation": 2,
+                    "pool": {
+                        "champion": "Baseline",
+                        "variants": [
                         {"label": "Baseline", "agent_spec": "baseline-ab.md"},
                         {"label": "Poet", "agent_spec": "poet-ab.md"},
                     ],
@@ -211,8 +212,12 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
             champion_name="Baseline",
             sample_rate=0.5,
             disclosure_mode="post_vote_reveal",
-            default_trace_mode="minimal",
+            default_trace_mode="hidden",
             max_pending_per_conversation=2,
+            comparison_rate=0.5,
+            variant_label_mode="post_vote_reveal",
+            activity_panel_default_state="hidden",
+            max_pending_comparisons_per_conversation=2,
             variants=[
                 SimpleNamespace(to_meta=lambda: {"label": "Baseline", "agent_spec": "baseline-ab.md"}),
                 SimpleNamespace(to_meta=lambda: {"label": "Poet", "agent_spec": "poet-ab.md", "provider": "openrouter", "model": "anthropic/claude-3.5-sonnet"}),
@@ -229,6 +234,8 @@ def test_build_admin_ab_pool_payload_exposes_current_runtime_pool_and_defaults()
     assert payload["enabled_requested"] is True
     assert payload["champion"] == "Baseline"
     assert payload["variants"] == ["Baseline", "Poet"]
+    assert payload["variant_label_mode"] == "post_vote_reveal"
+    assert payload["activity_panel_default_state"] == "hidden"
     assert payload["defaults"]["ab_catalog_source"] == "database"
     assert payload["defaults"]["provider"] == "openrouter"
     assert payload["can_participate"] is False
@@ -319,7 +326,7 @@ def test_ab_get_pool_reports_untargeted_participant_state():
     app = Flask(__name__)
     wrapper = object.__new__(FlaskAppWrapper)
     wrapper.app = app
-    wrapper.services_config = {"chat_app": {"ab_testing": {"enabled": True, "sample_rate": 0.5}}}
+    wrapper.services_config = {"chat_app": {"ab_testing": {"enabled": True, "comparison_rate": 0.5}}}
     wrapper.chat = SimpleNamespace(
         ab_pool=SimpleNamespace(
             enabled=True,

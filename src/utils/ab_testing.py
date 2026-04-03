@@ -1,5 +1,5 @@
 """
-A/B Testing Pool — config-driven champion/challenger agent variant pools.
+A/B Testing Pool — config-driven champion-vs-variant agent pools.
 
 Provides:
 - ABVariant dataclass for variant definitions
@@ -19,6 +19,10 @@ from src.utils.logging import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_AB_AGENTS_DIR = "/root/archi/ab_agents"
+DEFAULT_VARIANT_LABEL_MODE = "post_vote_reveal"
+DEFAULT_ACTIVITY_PANEL_DEFAULT_STATE = "hidden"
+DEFAULT_DISCLOSURE_MODE = DEFAULT_VARIANT_LABEL_MODE
+DEFAULT_TRACE_MODE = DEFAULT_ACTIVITY_PANEL_DEFAULT_STATE
 
 
 @dataclass(frozen=True)
@@ -93,8 +97,8 @@ class ABPool:
                     model: "gpt-4o"
     """
 
-    VALID_DISCLOSURE_MODES = {"blind", "named", "post_vote_reveal"}
-    VALID_TRACE_MODES = {"minimal", "normal", "verbose"}
+    VALID_DISCLOSURE_MODES = {"hidden", "post_vote_reveal", "always_visible"}
+    VALID_TRACE_MODES = {"hidden", "collapsed", "expanded"}
 
     def __init__(
         self,
@@ -106,24 +110,27 @@ class ABPool:
         target_roles: Optional[List[str]] = None,
         target_permissions: Optional[List[str]] = None,
         max_pending_per_conversation: int = 1,
-        disclosure_mode: str = "post_vote_reveal",
-        default_trace_mode: str = "minimal",
+        disclosure_mode: str = DEFAULT_DISCLOSURE_MODE,
+        default_trace_mode: str = DEFAULT_TRACE_MODE,
     ) -> None:
         if len(variants) < 2:
             raise ABPoolError("ABPool requires at least 2 variants for A/B comparison.")
         if champion_name not in {v.label for v in variants}:
             raise ABPoolError(f"Champion '{champion_name}' not found in variant list.")
         if not 0 <= float(sample_rate) <= 1:
-            raise ABPoolError("ab_testing.sample_rate must be between 0 and 1.")
+            raise ABPoolError("ab_testing.comparison_rate must be between 0 and 1.")
         if max_pending_per_conversation < 1:
-            raise ABPoolError("ab_testing.max_pending_per_conversation must be at least 1.")
+            raise ABPoolError(
+                "ab_testing.max_pending_comparisons_per_conversation must be at least 1."
+            )
         if disclosure_mode not in self.VALID_DISCLOSURE_MODES:
             raise ABPoolError(
-                f"ab_testing.disclosure_mode must be one of {sorted(self.VALID_DISCLOSURE_MODES)}."
+                f"ab_testing.variant_label_mode must be one of {sorted(self.VALID_DISCLOSURE_MODES)}."
             )
         if default_trace_mode not in self.VALID_TRACE_MODES:
             raise ABPoolError(
-                f"ab_testing.default_trace_mode must be one of {sorted(self.VALID_TRACE_MODES)}."
+                "ab_testing.activity_panel_default_state must be one of "
+                f"{sorted(self.VALID_TRACE_MODES)}."
             )
         self.variants = variants
         self.champion_name = champion_name
@@ -173,7 +180,7 @@ class ABPool:
         if not pool_config or not isinstance(pool_config, dict):
             raise ABPoolError("ab_testing.pool must be a mapping with 'champion' and 'variants'.")
 
-        champion_name = pool_config.get("champion")
+        champion_name = _get_first_config_value(pool_config, "champion", "control")
         if isinstance(champion_name, str):
             champion_name = champion_name.strip()
         if not champion_name or not isinstance(champion_name, str):
@@ -248,12 +255,30 @@ class ABPool:
             variants=variants,
             champion_name=champion_name,
             enabled=ab_config.get("enabled", True),
-            sample_rate=ab_config.get("sample_rate", 1.0),
-            target_roles=ab_config.get("target_roles") or [],
-            target_permissions=ab_config.get("target_permissions") or [],
-            max_pending_per_conversation=ab_config.get("max_pending_per_conversation", 1),
-            disclosure_mode=ab_config.get("disclosure_mode", "post_vote_reveal"),
-            default_trace_mode=ab_config.get("default_trace_mode", "minimal"),
+            sample_rate=_get_first_config_value(ab_config, "comparison_rate", "sample_rate", default=1.0),
+            target_roles=_get_first_config_value(ab_config, "eligible_roles", "target_roles", default=[]) or [],
+            target_permissions=_get_first_config_value(
+                ab_config, "eligible_permissions", "target_permissions", default=[]
+            ) or [],
+            max_pending_per_conversation=_get_first_config_value(
+                ab_config,
+                "max_pending_comparisons_per_conversation",
+                "max_pending_per_conversation",
+                default=1,
+            ),
+            disclosure_mode=normalize_ab_disclosure_mode(
+                _get_first_config_value(
+                    ab_config, "variant_label_mode", "disclosure_mode", default=DEFAULT_DISCLOSURE_MODE
+                )
+            ),
+            default_trace_mode=normalize_ab_trace_mode(
+                _get_first_config_value(
+                    ab_config,
+                    "activity_panel_default_state",
+                    "default_trace_mode",
+                    default=DEFAULT_TRACE_MODE,
+                )
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -265,6 +290,34 @@ class ABPool:
         return self._variant_map[self.champion_name]
 
     @property
+    def control_name(self) -> str:
+        return self.champion_name
+
+    @property
+    def comparison_rate(self) -> float:
+        return self.sample_rate
+
+    @property
+    def eligible_roles(self) -> List[str]:
+        return list(self.target_roles)
+
+    @property
+    def eligible_permissions(self) -> List[str]:
+        return list(self.target_permissions)
+
+    @property
+    def max_pending_comparisons_per_conversation(self) -> int:
+        return self.max_pending_per_conversation
+
+    @property
+    def variant_label_mode(self) -> str:
+        return self.disclosure_mode
+
+    @property
+    def activity_panel_default_state(self) -> str:
+        return self.default_trace_mode
+
+    @property
     def challengers(self) -> List[ABVariant]:
         return [v for v in self.variants if v.label != self.champion_name]
 
@@ -272,10 +325,10 @@ class ABPool:
         return self._variant_map.get(label)
 
     def sample_challenger(self) -> ABVariant:
-        """Return a random challenger (any variant that is not the champion)."""
+        """Return a random comparison variant that is not the champion."""
         pool = self.challengers
         if not pool:
-            raise ABPoolError("No challengers available (pool has only the champion).")
+            raise ABPoolError("No variants available for comparison (pool has only the champion).")
         return random.choice(pool)
 
     def sample_matchup(self) -> Tuple[ABVariant, ABVariant, bool]:
@@ -315,22 +368,56 @@ class ABPool:
             "variants": [v.label for v in self.variants],
             "variant_details": [v.to_meta() for v in self.variants],
             "variant_count": len(self.variants),
-            "sample_rate": self.sample_rate,
-            "target_roles": list(self.target_roles),
-            "target_permissions": list(self.target_permissions),
-            "max_pending_per_conversation": self.max_pending_per_conversation,
-            "disclosure_mode": self.disclosure_mode,
-            "default_trace_mode": self.default_trace_mode,
+            "comparison_rate": self.comparison_rate,
+            "eligible_roles": self.eligible_roles,
+            "eligible_permissions": self.eligible_permissions,
+            "max_pending_comparisons_per_conversation": self.max_pending_comparisons_per_conversation,
+            "variant_label_mode": self.variant_label_mode,
+            "activity_panel_default_state": self.activity_panel_default_state,
         }
 
     def participant_info(self) -> Dict[str, Any]:
         return {
             "enabled": self.enabled,
-            "sample_rate": self.sample_rate,
-            "disclosure_mode": self.disclosure_mode,
-            "default_trace_mode": self.default_trace_mode,
-            "max_pending_per_conversation": self.max_pending_per_conversation,
+            "comparison_rate": self.comparison_rate,
+            "variant_label_mode": self.variant_label_mode,
+            "activity_panel_default_state": self.activity_panel_default_state,
+            "max_pending_comparisons_per_conversation": self.max_pending_comparisons_per_conversation,
         }
+
+
+def _get_first_config_value(mapping: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if isinstance(mapping, dict) and key in mapping:
+            return mapping.get(key)
+    return default
+
+
+def normalize_ab_disclosure_mode(value: Any) -> str:
+    normalized = str(value or DEFAULT_DISCLOSURE_MODE).strip()
+    if not normalized:
+        return DEFAULT_DISCLOSURE_MODE
+    if normalized == "reveal_after_vote":
+        normalized = "post_vote_reveal"
+    elif normalized == "show_during_streaming":
+        normalized = "always_visible"
+    if normalized not in ABPool.VALID_DISCLOSURE_MODES:
+        raise ABPoolError(
+            f"ab_testing.variant_label_mode must be one of {sorted(ABPool.VALID_DISCLOSURE_MODES)}."
+        )
+    return normalized
+
+
+def normalize_ab_trace_mode(value: Any) -> str:
+    normalized = str(value or DEFAULT_TRACE_MODE).strip()
+    if not normalized:
+        return DEFAULT_TRACE_MODE
+    if normalized not in ABPool.VALID_TRACE_MODES:
+        raise ABPoolError(
+            "ab_testing.activity_panel_default_state must be one of "
+            f"{sorted(ABPool.VALID_TRACE_MODES)}."
+        )
+    return normalized
 
 
 def load_ab_pool(config: Dict[str, Any]) -> Optional[ABPool]:

@@ -51,11 +51,11 @@ test.describe('Settings Modal', () => {
           participant_eligible: true,
           participant_reason: 'eligible',
           participant_targeted: true,
-          sample_rate: 0.75,
-          default_sample_rate: 0.5,
-          disclosure_mode: 'post_vote_reveal',
-          default_trace_mode: 'minimal',
-          max_pending_per_conversation: 1,
+          comparison_rate: 0.75,
+          default_comparison_rate: 0.5,
+          variant_label_mode: 'post_vote_reveal',
+          activity_panel_default_state: 'hidden',
+          max_pending_comparisons_per_conversation: 1,
         },
       });
     });
@@ -67,6 +67,7 @@ test.describe('Settings Modal', () => {
     await page.getByRole('button', { name: 'A/B Testing' }).click();
     await expect(page.locator('#ab-participation-group')).toBeVisible();
     await expect(page.locator('#ab-participation-default')).toContainText('Default: 50%');
+    await expect(page.locator('#ab-participation-group .settings-description').nth(1)).toContainText('standard single-response flow');
   });
 
   test('changing the A/B sampling slider saves the user preference', async ({ page }) => {
@@ -85,11 +86,11 @@ test.describe('Settings Modal', () => {
           participant_eligible: true,
           participant_reason: 'eligible',
           participant_targeted: true,
-          sample_rate: 0.75,
-          default_sample_rate: 0.5,
-          disclosure_mode: 'post_vote_reveal',
-          default_trace_mode: 'minimal',
-          max_pending_per_conversation: 1,
+          comparison_rate: 0.75,
+          default_comparison_rate: 0.5,
+          variant_label_mode: 'post_vote_reveal',
+          activity_panel_default_state: 'hidden',
+          max_pending_comparisons_per_conversation: 1,
         },
       });
     });

@@ -107,11 +107,11 @@ export const mockData = {
       { label: 'Baseline', agent_spec: 'baseline-ab.md' },
       { label: 'Poet', agent_spec: 'poet-ab.md', provider: 'openrouter', model: 'anthropic/claude-3.5-sonnet' },
     ],
-    sample_rate: 1,
-    default_sample_rate: 1,
-    disclosure_mode: 'post_vote_reveal',
-    default_trace_mode: 'minimal',
-    max_pending_per_conversation: 1,
+    comparison_rate: 1,
+    default_comparison_rate: 1,
+    variant_label_mode: 'post_vote_reveal',
+    activity_panel_default_state: 'hidden',
+    max_pending_comparisons_per_conversation: 1,
     defaults: {
       provider: 'openrouter',
       model: 'openai/gpt-4o',
@@ -136,11 +136,11 @@ export const mockData = {
     champion: '',
     variants: [],
     variant_details: [],
-    sample_rate: 1,
-    default_sample_rate: 1,
-    disclosure_mode: 'post_vote_reveal',
-    default_trace_mode: 'minimal',
-    max_pending_per_conversation: 1,
+    comparison_rate: 1,
+    default_comparison_rate: 1,
+    variant_label_mode: 'post_vote_reveal',
+    activity_panel_default_state: 'hidden',
+    max_pending_comparisons_per_conversation: 1,
     defaults: {
       provider: 'openrouter',
       model: 'openai/gpt-4o',
@@ -161,7 +161,7 @@ export const mockData = {
     participant_eligible: false,
     participant_reason: 'not_participant',
     participant_targeted: false,
-    default_sample_rate: 1,
+    default_comparison_rate: 1,
   },
 
   currentUser: {
@@ -224,15 +224,15 @@ function abAdminPageHtml() {
         <div class="ab-admin-panel-header">
           <div>
             <h2>Experiment Settings</h2>
-            <p>Manage participant sampling, disclosure behavior, and the active champion/challenger pool.</p>
+            <p>Manage participant comparison rate, variant label visibility, activity panel defaults, and the active champion/variant pool.</p>
           </div>
           <span class="ab-pool-status" id="ab-admin-status">Inactive</span>
         </div>
         <div class="ab-admin-settings-grid">
-          <label class="ab-admin-field"><span>Sampling Rate</span><input type="number" id="ab-admin-sample-rate" min="0" max="1" step="0.05" value="1"></label>
-          <label class="ab-admin-field"><span>Disclosure Mode</span><select id="ab-admin-disclosure-mode"><option value="post_vote_reveal">Reveal after vote</option><option value="blind">Keep variants hidden</option><option value="named">Show variants while streaming</option></select></label>
-          <label class="ab-admin-field"><span>Agent Activity Default</span><select id="ab-admin-trace-mode"><option value="minimal">Hidden</option><option value="normal">Collapsed</option><option value="verbose">Expanded</option></select></label>
-          <label class="ab-admin-field"><span>Max Pending Per Conversation</span><input type="number" id="ab-admin-max-pending" min="1" step="1" value="1"></label>
+          <label class="ab-admin-field"><span>Comparison Rate</span><input type="number" id="ab-admin-sample-rate" min="0" max="1" step="0.05" value="1"></label>
+          <label class="ab-admin-field"><span>Variant Label Mode</span><select id="ab-admin-disclosure-mode"><option value="post_vote_reveal">Post-Vote Reveal</option><option value="hidden">Hidden</option><option value="always_visible">Always Visible</option></select></label>
+          <label class="ab-admin-field"><span>Activity Panel Default State</span><select id="ab-admin-trace-mode"><option value="hidden">Hidden</option><option value="collapsed">Collapsed</option><option value="expanded">Expanded</option></select></label>
+          <label class="ab-admin-field"><span>Max Pending Comparisons Per Conversation</span><input type="number" id="ab-admin-max-pending" min="1" step="1" value="1"></label>
           <label class="ab-admin-field ab-admin-field-wide"><span>Champion</span><select id="ab-admin-champion"></select></label>
         </div>
         <div class="ab-admin-actions">
@@ -494,8 +494,8 @@ export async function setupBasicMocks(page: Page) {
         participant_eligible: false,
         participant_reason: 'not_participant',
         participant_targeted: false,
-        sample_rate: 1,
-        default_sample_rate: 1,
+        comparison_rate: 1,
+        default_comparison_rate: 1,
       },
     });
   });
@@ -509,7 +509,7 @@ export async function setupBasicMocks(page: Page) {
         use_ab: false,
         reason: 'disabled',
         pending_count: 0,
-        max_pending_per_conversation: 1,
+        max_pending_comparisons_per_conversation: 1,
       },
     });
   });
@@ -525,7 +525,7 @@ export async function setupABDecisionMock(page: Page, overrides: Record<string, 
         use_ab: false,
         reason: 'disabled',
         pending_count: 0,
-        max_pending_per_conversation: 1,
+        max_pending_comparisons_per_conversation: 1,
         ...overrides,
       },
     });
@@ -615,7 +615,7 @@ export async function setupABAdminMocks(page: Page) {
     use_ab: true,
     reason: 'sampled',
     pending_count: 0,
-    max_pending_per_conversation: mockData.abPoolAdmin.max_pending_per_conversation,
+    max_pending_comparisons_per_conversation: mockData.abPoolAdmin.max_pending_comparisons_per_conversation,
   });
 }
 
@@ -633,7 +633,7 @@ export async function setupABAdminInactiveMocks(page: Page) {
     use_ab: false,
     reason: 'disabled',
     pending_count: 0,
-    max_pending_per_conversation: mockData.abPoolAdminInactive.max_pending_per_conversation,
+    max_pending_comparisons_per_conversation: mockData.abPoolAdminInactive.max_pending_comparisons_per_conversation,
   });
 }
 
@@ -650,6 +650,8 @@ export function createABStreamResponse(options: {
   armAMessageId?: number;
   armBMessageId?: number;
   disclosureMode?: string;
+  armADurationMs?: number;
+  armBDurationMs?: number;
 } = {}) {
   const {
     armAContent = 'Response from arm A',
@@ -661,6 +663,8 @@ export function createABStreamResponse(options: {
     armAMessageId = 101,
     armBMessageId = 102,
     disclosureMode = 'post_vote_reveal',
+    armADurationMs = 150,
+    armBDurationMs = 300,
   } = options;
 
   const events = [
@@ -669,12 +673,12 @@ export function createABStreamResponse(options: {
       type: 'ab_arms',
       arm_a_name: armAVariant,
       arm_b_name: armBVariant,
-      disclosure_mode: disclosureMode,
+      variant_label_mode: disclosureMode,
     },
     { arm: 'a', type: 'chunk', content: armAContent },
     { arm: 'b', type: 'chunk', content: armBContent },
-    { arm: 'a', type: 'final', response: armAContent, model_used: 'openai/gpt-4o' },
-    { arm: 'b', type: 'final', response: armBContent, model_used: 'anthropic/claude-3.5-sonnet' },
+    { arm: 'a', type: 'final', response: armAContent, model: 'gpt-4o', model_used: 'openai/gpt-4o', duration_ms: armADurationMs },
+    { arm: 'b', type: 'final', response: armBContent, model: 'claude-3.5-sonnet', model_used: 'anthropic/claude-3.5-sonnet', duration_ms: armBDurationMs },
     {
       type: 'ab_meta',
       comparison_id: comparisonId,
@@ -683,7 +687,7 @@ export function createABStreamResponse(options: {
       arm_b_message_id: armBMessageId,
       arm_a_variant: armAVariant,
       arm_b_variant: armBVariant,
-      disclosure_mode: disclosureMode,
+      variant_label_mode: disclosureMode,
     },
   ];
 
@@ -700,7 +704,7 @@ export async function enableABMode(page: Page) {
         enabled: true,
         champion: 'Baseline',
         variants: ['Baseline', 'Poet'],
-        max_pending_per_conversation: 1,
+        max_pending_comparisons_per_conversation: 1,
       };
     }
   });

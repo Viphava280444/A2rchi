@@ -671,6 +671,7 @@ window.Markdown = Markdown;
 const UI = {
   elements: {},
   sendBtnDefaultHtml: null,
+  traceTimerIntervals: new Map(),
 
   init() {
     this.elements = {
@@ -896,16 +897,16 @@ const UI = {
       const msgEl = document.getElementById('ab-pool-message');
       const sampleRate = Number(document.getElementById('ab-sample-rate')?.value || 1);
       const disclosureMode = document.getElementById('ab-disclosure-mode')?.value || 'post_vote_reveal';
-      const defaultTraceMode = document.getElementById('ab-trace-mode')?.value || 'minimal';
+      const defaultTraceMode = document.getElementById('ab-trace-mode')?.value || 'hidden';
       saveBtn.disabled = true;
       saveBtn.textContent = 'Saving…';
       try {
         const result = await API.saveABPool({
           champion: sel.champion,
           variants: sel.variants,
-          sample_rate: sampleRate,
-          disclosure_mode: disclosureMode,
-          default_trace_mode: defaultTraceMode,
+          comparison_rate: sampleRate,
+          variant_label_mode: disclosureMode,
+          activity_panel_default_state: defaultTraceMode,
         });
         if (result?.success) {
           if (msgEl) { msgEl.textContent = 'Pool saved'; msgEl.className = 'ab-pool-message success'; }
@@ -1642,11 +1643,41 @@ const UI = {
   },
 
   getABDisclosureMode() {
-    return Chat.state.abPool?.disclosure_mode || 'post_vote_reveal';
+    return this.normalizeABDisclosureMode(
+      Chat.state.abPool?.variant_label_mode ?? Chat.state.abPool?.disclosure_mode
+    );
   },
 
   getABTraceMode() {
-    return Chat.state.abPool?.default_trace_mode || 'minimal';
+    return this.normalizeABTraceMode(
+      Chat.state.abPool?.activity_panel_default_state ?? Chat.state.abPool?.default_trace_mode
+    );
+  },
+
+  normalizeABDisclosureMode(mode) {
+    if (mode === 'reveal_after_vote') return 'post_vote_reveal';
+    if (mode === 'show_during_streaming') return 'always_visible';
+    return ['hidden', 'post_vote_reveal', 'always_visible'].includes(mode)
+      ? mode
+      : 'post_vote_reveal';
+  },
+
+  normalizeABTraceMode(mode) {
+    return ['hidden', 'collapsed', 'expanded'].includes(mode)
+      ? mode
+      : 'hidden';
+  },
+
+  isTraceVisibleMode(mode) {
+    return !['minimal', 'hidden'].includes(mode);
+  },
+
+  isTraceCollapsedMode(mode) {
+    return ['normal', 'collapsed'].includes(mode);
+  },
+
+  isTraceExpandedMode(mode) {
+    return ['verbose', 'expanded'].includes(mode);
   },
 
   shouldUseABForNextTurn() {
@@ -2133,7 +2164,13 @@ const UI = {
       return;
     }
 
-    const defaultRate = Number(abState.default_sample_rate ?? abState.sample_rate ?? 1);
+    const defaultRate = Number(
+      abState.default_comparison_rate
+      ?? abState.default_sample_rate
+      ?? abState.comparison_rate
+      ?? abState.sample_rate
+      ?? 1
+    );
     const usingDefault = currentUser.ab_participation_rate == null || Number.isNaN(Number(currentUser.ab_participation_rate));
     const effectiveRate = usingDefault ? defaultRate : Number(currentUser.ab_participation_rate);
     const percent = Math.max(0, Math.min(100, Math.round(effectiveRate * 100)));
@@ -2185,7 +2222,7 @@ const UI = {
     // Use allAgents so AB-only variants appear in the pool editor
     const agents = Chat.state.allAgents || Chat.state.agents || [];
     const poolEnabled = poolInfo?.enabled === true;
-    const currentChampion = poolInfo?.champion || null;
+    const currentChampion = poolInfo?.champion || poolInfo?.control || null;
     const currentVariants = poolInfo?.variants || [];
 
     // Update status badge
@@ -2199,13 +2236,13 @@ const UI = {
       disableBtn.style.display = poolEnabled ? '' : 'none';
     }
     if (sampleRateInput) {
-      sampleRateInput.value = String(poolInfo?.sample_rate ?? 1);
+      sampleRateInput.value = String(poolInfo?.comparison_rate ?? poolInfo?.sample_rate ?? 1);
     }
     if (disclosureModeInput) {
-      disclosureModeInput.value = poolInfo?.disclosure_mode || 'post_vote_reveal';
+      disclosureModeInput.value = poolInfo?.variant_label_mode || poolInfo?.disclosure_mode || 'post_vote_reveal';
     }
     if (traceModeInput) {
-      traceModeInput.value = poolInfo?.default_trace_mode || 'minimal';
+      traceModeInput.value = poolInfo?.activity_panel_default_state || poolInfo?.default_trace_mode || 'hidden';
     }
 
     // Render agent rows
@@ -2295,7 +2332,7 @@ const UI = {
         msgEl.textContent = 'Select at least 2 agents';
         msgEl.className = 'ab-pool-message error';
       } else if (selected.length >= 2 && !hasChampion) {
-        msgEl.textContent = 'Click "Champion" to designate the baseline agent';
+        msgEl.textContent = 'Click "Champion" to designate the baseline variant';
         msgEl.className = 'ab-pool-message error';
       } else {
         msgEl.textContent = '';
@@ -2522,15 +2559,25 @@ const UI = {
       : 'Agent Activity';
   },
 
+  bindTraceToggleHandlers(root = document) {
+    if (!root?.querySelectorAll) return;
+    root.querySelectorAll('[data-trace-toggle]').forEach(el => {
+      if (!el._traceToggleBound) {
+        el._traceToggleBound = true;
+        el.addEventListener('click', () => UI.toggleTraceExpanded(el.dataset.traceToggle));
+      }
+    });
+  },
+
   addABComparisonContainer(msgIdA, msgIdB, options = {}) {
     // Remove empty state if present
     const empty = this.elements.messagesInner?.querySelector('.messages-empty');
     if (empty) empty.remove();
 
-    const traceMode = options.traceMode || this.getABTraceMode();
-    const showTrace = traceMode !== 'minimal';
+    const traceMode = this.normalizeABTraceMode(options.traceMode || this.getABTraceMode());
+    const showTrace = this.isTraceVisibleMode(traceMode);
     const traceIconSvg = this.getTraceIconSvg();
-    const traceCollapsed = traceMode === 'normal';
+    const traceCollapsed = this.isTraceCollapsedMode(traceMode);
     const traceHtml = (id) => showTrace ? `
           <div class="trace-container ab-trace-container${traceCollapsed ? ' collapsed' : ''}" data-message-id="${id}" data-trace-mode="${traceMode}">
             <div class="trace-header">
@@ -2586,12 +2633,7 @@ const UI = {
 
     this.elements.messagesInner?.insertAdjacentHTML('beforeend', html);
     // Bind trace toggle handlers (replacing inline onclick for CSP compliance)
-    document.querySelectorAll('[data-trace-toggle]').forEach(el => {
-      if (!el._traceToggleBound) {
-        el._traceToggleBound = true;
-        el.addEventListener('click', () => UI.toggleTraceExpanded(el.dataset.traceToggle));
-      }
-    });
+    this.bindTraceToggleHandlers(this.elements.messagesInner || document);
     // Start timers for both A/B arms
     if (showTrace) {
       this.startTraceTimer(msgIdA);
@@ -2652,7 +2694,9 @@ const UI = {
     { variantName = '', modelUsed = '' } = {},
     { disclosureMode = 'post_vote_reveal', reveal = false } = {},
   ) {
-    const showVariant = disclosureMode === 'named' || (disclosureMode === 'post_vote_reveal' && reveal);
+    const normalizedDisclosureMode = this.normalizeABDisclosureMode(disclosureMode);
+    const showVariant = normalizedDisclosureMode === 'always_visible'
+      || (normalizedDisclosureMode === 'post_vote_reveal' && reveal);
     this.updateABVariantLabel(armId, showVariant ? variantName : '');
     this.updateABArmMeta(armId, modelUsed, showVariant && !!modelUsed);
   },
@@ -2677,6 +2721,12 @@ const UI = {
       if (toggle) {
         toggle.dataset.traceToggle = String(newId);
       }
+    }
+
+    const activeInterval = this.traceTimerIntervals.get(String(oldId));
+    if (activeInterval != null) {
+      this.traceTimerIntervals.set(String(newId), activeInterval);
+      this.traceTimerIntervals.delete(String(oldId));
     }
   },
 
@@ -2736,6 +2786,13 @@ const UI = {
     document.querySelector('.ab-vote-container')?.remove();
   },
 
+  stopTraceTimersInElement(container) {
+    if (!container) return;
+    container.querySelectorAll('.trace-container[data-message-id]').forEach((traceEl) => {
+      this.stopTraceTimer(traceEl.dataset.messageId);
+    });
+  },
+
   markABWinner(preference, comparisonState = null) {
     const comparisonEl = this.findABComparisonElement(comparisonState);
     if (!comparisonEl) return;
@@ -2761,6 +2818,8 @@ const UI = {
       });
     }
 
+    this.stopTraceTimersInElement(comparisonEl);
+
     const arms = comparisonEl.querySelectorAll('.ab-arm');
     const armA = arms[0];
     const armB = arms[1];
@@ -2775,29 +2834,27 @@ const UI = {
 
     // Winner/loser — collapse to single message
     const winner = preference === 'a' ? armA : armB;
-    const loser = preference === 'a' ? armB : armA;
 
     if (winner) {
       // Remove the AB label
       winner.querySelector('.ab-arm-label')?.remove();
       winner.classList.remove('ab-arm');
     }
-    if (loser) {
-      loser.remove();
-    }
 
-    // Unwrap from the comparison container
-    if (winner) {
-      comparisonEl.outerHTML = winner.outerHTML;
+    // Move the live winner node out of the comparison container so its
+    // finalized timer text and bound trace interactions are preserved.
+    if (winner && comparisonEl.parentNode) {
+      comparisonEl.parentNode.insertBefore(winner, comparisonEl);
+      comparisonEl.remove();
     }
   },
 
   removeABComparisonContainer(comparisonState = null) {
-    if (comparisonState) {
-      this.findABComparisonElement(comparisonState)?.remove();
-    } else {
-      document.querySelector('.ab-comparison:last-of-type')?.remove();
-    }
+    const comparisonEl = comparisonState
+      ? this.findABComparisonElement(comparisonState)
+      : document.querySelector('.ab-comparison:last-of-type');
+    this.stopTraceTimersInElement(comparisonEl);
+    comparisonEl?.remove();
     this.hideABVoteButtons();
   },
 
@@ -2871,26 +2928,65 @@ const UI = {
     this.startTraceTimer(messageId);
   },
 
-  startTraceTimer(messageId) {
-    const timerEl = document.querySelector(`.trace-container[data-message-id="${messageId}"] .trace-timer`);
-    if (!timerEl) return;
-    
-    const startTime = parseInt(timerEl.dataset.start, 10);
-    const updateTimer = () => {
-      const elapsed = (Date.now() - startTime) / 1000;
-      timerEl.textContent = elapsed.toFixed(1) + 's';
-    };
-    
-    const intervalId = setInterval(updateTimer, 100);
-    timerEl.dataset.intervalId = intervalId;
+  getTraceTimerElement(messageId) {
+    return document.querySelector(`.trace-container[data-message-id="${messageId}"] .trace-timer`);
   },
 
-  stopTraceTimer(messageId) {
-    const timerEl = document.querySelector(`.trace-container[data-message-id="${messageId}"] .trace-timer`);
-    if (!timerEl || !timerEl.dataset.intervalId) return;
-    
-    clearInterval(parseInt(timerEl.dataset.intervalId, 10));
-    delete timerEl.dataset.intervalId;
+  getTraceElapsedMs(messageId) {
+    const timerEl = this.getTraceTimerElement(messageId);
+    if (!timerEl?.dataset.start) return null;
+    const startTime = Number.parseInt(timerEl.dataset.start, 10);
+    if (!Number.isFinite(startTime)) return null;
+    return Math.max(Date.now() - startTime, 0);
+  },
+
+  startTraceTimer(messageId) {
+    const timerKey = String(messageId);
+    const timerEl = this.getTraceTimerElement(messageId);
+    if (!timerEl) return;
+
+    this.stopTraceTimer(timerKey);
+    delete timerEl.dataset.finalDurationMs;
+
+    const startTime = Number.parseInt(timerEl.dataset.start, 10);
+    if (!Number.isFinite(startTime)) {
+      timerEl.dataset.start = String(Date.now());
+    }
+    const updateTimer = () => {
+      const baseTime = Number.parseInt(timerEl.dataset.start, 10);
+      const elapsed = (Date.now() - baseTime) / 1000;
+      timerEl.textContent = elapsed.toFixed(1) + 's';
+    };
+
+    updateTimer();
+    const intervalId = window.setInterval(updateTimer, 100);
+    this.traceTimerIntervals.set(timerKey, intervalId);
+  },
+
+  stopTraceTimer(messageId, durationMs = null) {
+    const timerKey = String(messageId);
+    const intervalId = this.traceTimerIntervals.get(timerKey);
+    if (intervalId != null) {
+      clearInterval(intervalId);
+      this.traceTimerIntervals.delete(timerKey);
+    }
+
+    const timerEl = this.getTraceTimerElement(messageId);
+    if (!timerEl) return;
+
+    let resolvedDurationMs = durationMs;
+    if (resolvedDurationMs == null && timerEl.dataset.finalDurationMs) {
+      const storedDurationMs = Number.parseInt(timerEl.dataset.finalDurationMs, 10);
+      if (Number.isFinite(storedDurationMs)) {
+        resolvedDurationMs = storedDurationMs;
+      }
+    }
+
+    const elapsedMs = resolvedDurationMs ?? this.getTraceElapsedMs(messageId);
+    if (elapsedMs != null) {
+      timerEl.dataset.finalDurationMs = String(elapsedMs);
+      timerEl.textContent = Utils.formatDuration(elapsedMs);
+    }
   },
 
   toggleTraceExpanded(messageId) {
@@ -3020,7 +3116,7 @@ const UI = {
     this.scrollToBottom();
 
     // Auto-expand if verbose mode
-    if (this.getTraceModeForMessage(messageId) === 'verbose') {
+    if (this.isTraceExpandedMode(this.getTraceModeForMessage(messageId))) {
       const step = timeline.querySelector(`[data-step-id="${event.tool_call_id}"]`);
       step?.classList.add('expanded');
       const details = step?.querySelector('.step-details');
@@ -3099,7 +3195,7 @@ const UI = {
     // Auto-collapse if many tools
     const timeline = step.closest('.step-timeline');
     const toolCount = timeline?.querySelectorAll('.tool-step').length || 0;
-    if (this.getTraceModeForMessage(messageId) === 'normal' && toolCount > CONFIG.TRACE.AUTO_COLLAPSE_TOOL_COUNT) {
+    if (this.isTraceCollapsedMode(this.getTraceModeForMessage(messageId)) && toolCount > CONFIG.TRACE.AUTO_COLLAPSE_TOOL_COUNT) {
       step.classList.remove('expanded');
       const details = step.querySelector('.step-details');
       if (details) details.style.display = 'none';
@@ -3150,7 +3246,7 @@ const UI = {
   // =========================================================================
 
   finalizeTrace(messageId, trace, finalEvent) {
-    this.stopTraceTimer(messageId);
+    this.stopTraceTimer(messageId, finalEvent?.duration_ms ?? null);
     
     const container = document.querySelector(`.trace-container[data-message-id="${messageId}"]`);
     if (!container) return;
@@ -3172,7 +3268,7 @@ const UI = {
     }
 
     // Auto-collapse in normal mode
-    if (this.getTraceModeForMessage(messageId) === 'normal') {
+    if (this.isTraceCollapsedMode(this.getTraceModeForMessage(messageId))) {
       container.classList.add('collapsed');
       const toggleIcon = container.querySelector('.toggle-icon');
       if (toggleIcon) toggleIcon.innerHTML = '&#9654;';
@@ -3624,7 +3720,11 @@ const Chat = {
   },
 
   getABPendingLimit() {
-    const configured = Number(this.state.abPool?.max_pending_per_conversation ?? 1);
+    const configured = Number(
+      this.state.abPool?.max_pending_comparisons_per_conversation
+      ?? this.state.abPool?.max_pending_per_conversation
+      ?? 1
+    );
     return Number.isFinite(configured) && configured >= 1 ? configured : 1;
   },
 
@@ -4146,8 +4246,12 @@ const Chat = {
   restorePendingABComparison(comparison) {
     if (!comparison?.response_a || !comparison?.response_b) return;
 
-    const traceMode = comparison.default_trace_mode || 'minimal';
-    const disclosureMode = comparison.disclosure_mode || 'post_vote_reveal';
+    const traceMode = UI.normalizeABTraceMode(
+      comparison.activity_panel_default_state ?? comparison.default_trace_mode
+    );
+    const disclosureMode = UI.normalizeABDisclosureMode(
+      comparison.variant_label_mode ?? comparison.disclosure_mode
+    );
     const responseAId = comparison.response_a.message_id;
     const responseBId = comparison.response_b.message_id;
 
@@ -4172,7 +4276,7 @@ const Chat = {
       reveal: false,
     });
 
-    if (traceMode !== 'minimal' && comparison.response_a.trace) {
+    if (UI.isTraceVisibleMode(traceMode) && comparison.response_a.trace) {
       document.querySelector(`.ab-arm[data-id="${responseAId}"] .trace-container`)?.remove();
       UI.stopTraceTimer(responseAId);
       UI.renderHistoricalTrace(responseAId, comparison.response_a.trace);
@@ -4180,7 +4284,7 @@ const Chat = {
       UI.stopTraceTimer(responseAId);
       document.querySelector(`.ab-arm[data-id="${responseAId}"] .trace-container`)?.remove();
     }
-    if (traceMode !== 'minimal' && comparison.response_b.trace) {
+    if (UI.isTraceVisibleMode(traceMode) && comparison.response_b.trace) {
       document.querySelector(`.ab-arm[data-id="${responseBId}"] .trace-container`)?.remove();
       UI.stopTraceTimer(responseBId);
       UI.renderHistoricalTrace(responseBId, comparison.response_b.trace);
@@ -4395,11 +4499,11 @@ const Chat = {
 
         if (event.type === 'ab_arms') {
           UI.updateABArmPresentation(msgIdA, { variantName: event.arm_a_name }, {
-            disclosureMode: event.disclosure_mode || disclosureMode,
+            disclosureMode: event.variant_label_mode || event.disclosure_mode || disclosureMode,
             reveal: false,
           });
           UI.updateABArmPresentation(msgIdB, { variantName: event.arm_b_name }, {
-            disclosureMode: event.disclosure_mode || disclosureMode,
+            disclosureMode: event.variant_label_mode || event.disclosure_mode || disclosureMode,
             reveal: false,
           });
           continue;
@@ -4431,12 +4535,13 @@ const Chat = {
           armTexts[arm] = finalText;
           finalEvents[arm] = event;
           UI.updateABResponse(targetId, Markdown.render(finalText), false);
+          UI.finalizeTrace(targetId, traceState, event);
           if (abMeta) {
             UI.updateABArmPresentation(targetId, {
               variantName: arm === 'a' ? abMeta.arm_a_variant : abMeta.arm_b_variant,
               modelUsed: event.model_used || '',
             }, {
-              disclosureMode: abMeta.disclosure_mode || disclosureMode,
+              disclosureMode: abMeta.variant_label_mode || abMeta.disclosure_mode || disclosureMode,
               reveal: false,
             });
           }
@@ -4479,10 +4584,6 @@ const Chat = {
       UI.updateABResponse(msgIdA, Markdown.render(armTexts.a), false);
       UI.updateABResponse(msgIdB, Markdown.render(armTexts.b), false);
 
-      // Stop trace timers and finalize trace containers
-      UI.finalizeTrace(msgIdA, armTraces.a, finalEvents.a);
-      UI.finalizeTrace(msgIdB, armTraces.b, finalEvents.b);
-
       // Set up voting if we got a comparison_id
       if (abMeta?.comparison_id) {
         if (abMeta.arm_a_message_id) {
@@ -4503,7 +4604,7 @@ const Chat = {
           responseBModelUsed: finalEvents.b?.model_used || abMeta.arm_b_model_used || '',
           variantA: abMeta.arm_a_variant,
           variantB: abMeta.arm_b_variant,
-          disclosureMode: abMeta.disclosure_mode || disclosureMode,
+          disclosureMode: abMeta.variant_label_mode || abMeta.disclosure_mode || disclosureMode,
           traceMode,
         };
         UI.setABComparisonId(comparisonState);
@@ -4605,7 +4706,7 @@ const Chat = {
    * tool/thinking rendering logic is defined in exactly one place.
    */
   _renderStreamEvent(messageId, event) {
-    const showTrace = UI.getTraceModeForMessage(messageId) !== 'minimal';
+    const showTrace = UI.isTraceVisibleMode(UI.getTraceModeForMessage(messageId));
     if (!showTrace) return;
     switch (event.type) {
       case 'tool_start':

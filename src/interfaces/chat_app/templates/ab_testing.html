@@ -48,7 +48,7 @@
         <div class="ab-admin-panel-header">
           <div>
             <h2>Experiment Settings</h2>
-            <p>Manage participant sampling, disclosure behavior, and the active champion/challenger pool.</p>
+            <p>Manage participant comparison rate, variant label visibility, activity panel defaults, and the active champion/variant pool.</p>
           </div>
           <span class="ab-pool-status" id="ab-admin-status">Inactive</span>
         </div>
@@ -56,27 +56,27 @@
 
         <div class="ab-admin-settings-grid">
           <label class="ab-admin-field">
-            <span>Sampling Rate</span>
+            <span>Comparison Rate</span>
             <input type="number" id="ab-admin-sample-rate" min="0" max="1" step="0.05" value="1">
           </label>
           <label class="ab-admin-field">
-            <span>Disclosure Mode</span>
+            <span>Variant Label Mode</span>
             <select id="ab-admin-disclosure-mode">
-              <option value="post_vote_reveal">Reveal after vote</option>
-              <option value="blind">Keep variants hidden</option>
-              <option value="named">Show variants while streaming</option>
+              <option value="post_vote_reveal">Post-Vote Reveal</option>
+              <option value="hidden">Hidden</option>
+              <option value="always_visible">Always Visible</option>
             </select>
           </label>
           <label class="ab-admin-field">
-            <span>Agent Activity Default</span>
+            <span>Activity Panel Default State</span>
             <select id="ab-admin-trace-mode">
-              <option value="minimal">Hidden</option>
-              <option value="normal">Collapsed</option>
-              <option value="verbose">Expanded</option>
+              <option value="hidden">Hidden</option>
+              <option value="collapsed">Collapsed</option>
+              <option value="expanded">Expanded</option>
             </select>
           </label>
           <label class="ab-admin-field">
-            <span>Max Pending Per Conversation</span>
+            <span>Max Pending Comparisons Per Conversation</span>
             <input type="number" id="ab-admin-max-pending" min="1" step="1" value="1">
           </label>
           <label class="ab-admin-field ab-admin-field-wide">

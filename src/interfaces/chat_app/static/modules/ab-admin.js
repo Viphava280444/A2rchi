@@ -34,18 +34,18 @@
     persisted: {
       enabled: false,
       champion: '',
-      sample_rate: 1,
-      disclosure_mode: 'post_vote_reveal',
-      default_trace_mode: 'minimal',
-      max_pending_per_conversation: 1,
+      comparison_rate: 1,
+      variant_label_mode: 'post_vote_reveal',
+      activity_panel_default_state: 'hidden',
+      max_pending_comparisons_per_conversation: 1,
       variants: [],
     },
     settingsForm: {
       champion: '',
-      sample_rate: 1,
-      disclosure_mode: 'post_vote_reveal',
-      default_trace_mode: 'minimal',
-      max_pending_per_conversation: 1,
+      comparison_rate: 1,
+      variant_label_mode: 'post_vote_reveal',
+      activity_panel_default_state: 'hidden',
+      max_pending_comparisons_per_conversation: 1,
     },
     variantForm: [],
     modal: {
@@ -183,11 +183,13 @@
     }
     return {
       enabled: pool.enabled === true,
-      champion: String(pool.champion || '').trim(),
-      sample_rate: Number(pool.sample_rate ?? 1),
-      disclosure_mode: pool.disclosure_mode || 'post_vote_reveal',
-      default_trace_mode: pool.default_trace_mode || 'minimal',
-      max_pending_per_conversation: Number(pool.max_pending_per_conversation ?? 1),
+      champion: String(pool.champion || pool.control || '').trim(),
+      comparison_rate: Number(pool.comparison_rate ?? pool.sample_rate ?? 1),
+      variant_label_mode: pool.variant_label_mode || pool.disclosure_mode || 'post_vote_reveal',
+      activity_panel_default_state: pool.activity_panel_default_state || pool.default_trace_mode || 'hidden',
+      max_pending_comparisons_per_conversation: Number(
+        pool.max_pending_comparisons_per_conversation ?? pool.max_pending_per_conversation ?? 1
+      ),
       variants: details.map(normalizeVariant),
     };
   }
@@ -198,11 +200,13 @@
 
   function extractSettings(pool = {}) {
     return {
-      champion: String(pool.champion || '').trim(),
-      sample_rate: Number(pool.sample_rate ?? 1),
-      disclosure_mode: pool.disclosure_mode || 'post_vote_reveal',
-      default_trace_mode: pool.default_trace_mode || 'minimal',
-      max_pending_per_conversation: Number(pool.max_pending_per_conversation ?? 1),
+      champion: String(pool.champion || pool.control || '').trim(),
+      comparison_rate: Number(pool.comparison_rate ?? pool.sample_rate ?? 1),
+      variant_label_mode: pool.variant_label_mode || pool.disclosure_mode || 'post_vote_reveal',
+      activity_panel_default_state: pool.activity_panel_default_state || pool.default_trace_mode || 'hidden',
+      max_pending_comparisons_per_conversation: Number(
+        pool.max_pending_comparisons_per_conversation ?? pool.max_pending_per_conversation ?? 1
+      ),
     };
   }
 
@@ -343,11 +347,14 @@
     if (!labels.includes(state.settingsForm.champion)) {
       return { valid: false, message: 'Champion must match one of the saved variants.' };
     }
-    if (!Number.isFinite(state.settingsForm.sample_rate) || state.settingsForm.sample_rate < 0 || state.settingsForm.sample_rate > 1) {
-      return { valid: false, message: 'Sampling rate must be between 0 and 1.' };
+    if (!Number.isFinite(state.settingsForm.comparison_rate) || state.settingsForm.comparison_rate < 0 || state.settingsForm.comparison_rate > 1) {
+      return { valid: false, message: 'Comparison rate must be between 0 and 1.' };
     }
-    if (!Number.isInteger(state.settingsForm.max_pending_per_conversation) || state.settingsForm.max_pending_per_conversation < 1) {
-      return { valid: false, message: 'Max pending per conversation must be at least 1.' };
+    if (
+      !Number.isInteger(state.settingsForm.max_pending_comparisons_per_conversation)
+      || state.settingsForm.max_pending_comparisons_per_conversation < 1
+    ) {
+      return { valid: false, message: 'Max pending comparisons per conversation must be at least 1.' };
     }
     return { valid: true, message: '' };
   }
@@ -470,7 +477,7 @@
       els.variantList.innerHTML = `
         <div class="ab-admin-empty-state">
           <strong>No variants configured.</strong>
-          <span>Add at least two variants to enable champion/challenger comparisons.</span>
+          <span>Add at least two variants to enable champion-vs-variant comparisons.</span>
         </div>
       `;
       updateVariantSaveState();
@@ -561,10 +568,10 @@
       els.status.textContent = state.persisted.enabled ? 'Active' : 'Inactive';
       els.status.classList.toggle('active', state.persisted.enabled);
     }
-    if (els.sampleRate) els.sampleRate.value = String(state.settingsForm.sample_rate ?? 1);
-    if (els.disclosureMode) els.disclosureMode.value = state.settingsForm.disclosure_mode || 'post_vote_reveal';
-    if (els.traceMode) els.traceMode.value = state.settingsForm.default_trace_mode || 'minimal';
-    if (els.maxPending) els.maxPending.value = String(state.settingsForm.max_pending_per_conversation ?? 1);
+    if (els.sampleRate) els.sampleRate.value = String(state.settingsForm.comparison_rate ?? 1);
+    if (els.disclosureMode) els.disclosureMode.value = state.settingsForm.variant_label_mode || 'post_vote_reveal';
+    if (els.traceMode) els.traceMode.value = state.settingsForm.activity_panel_default_state || 'hidden';
+    if (els.maxPending) els.maxPending.value = String(state.settingsForm.max_pending_comparisons_per_conversation ?? 1);
     if (els.disable) els.disable.style.display = state.enabledRequested ? '' : 'none';
     if (els.readOnly) els.readOnly.style.display = state.canManage ? 'none' : '';
     if (els.sampleRate) els.sampleRate.disabled = !state.canManage;
@@ -697,10 +704,10 @@
   function collectSettingsPayload() {
     return {
       champion: state.settingsForm.champion,
-      sample_rate: state.settingsForm.sample_rate,
-      disclosure_mode: state.settingsForm.disclosure_mode,
-      default_trace_mode: state.settingsForm.default_trace_mode,
-      max_pending_per_conversation: state.settingsForm.max_pending_per_conversation,
+      comparison_rate: state.settingsForm.comparison_rate,
+      variant_label_mode: state.settingsForm.variant_label_mode,
+      activity_panel_default_state: state.settingsForm.activity_panel_default_state,
+      max_pending_comparisons_per_conversation: state.settingsForm.max_pending_comparisons_per_conversation,
     };
   }
 
@@ -995,22 +1002,22 @@
 
   function bindEvents() {
     els.sampleRate?.addEventListener('input', (event) => {
-      state.settingsForm.sample_rate = Number(event.target.value);
+      state.settingsForm.comparison_rate = Number(event.target.value);
       setSettingsDirty(true);
       updateSettingsSaveState();
     });
     els.disclosureMode?.addEventListener('change', (event) => {
-      state.settingsForm.disclosure_mode = event.target.value;
+      state.settingsForm.variant_label_mode = event.target.value;
       setSettingsDirty(true);
       updateSettingsSaveState();
     });
     els.traceMode?.addEventListener('change', (event) => {
-      state.settingsForm.default_trace_mode = event.target.value;
+      state.settingsForm.activity_panel_default_state = event.target.value;
       setSettingsDirty(true);
       updateSettingsSaveState();
     });
     els.maxPending?.addEventListener('input', (event) => {
-      state.settingsForm.max_pending_per_conversation = Number.parseInt(event.target.value || '0', 10);
+      state.settingsForm.max_pending_comparisons_per_conversation = Number.parseInt(event.target.value || '0', 10);
       setSettingsDirty(true);
       updateSettingsSaveState();
     });

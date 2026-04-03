@@ -65,8 +65,8 @@ Get the server-side A/B testing pool configuration. The response shape depends o
   "can_manage": false,
   "champion": "default",
   "variants": ["default", "creative", "concise"],
-  "sample_rate": 0.25,
-  "default_sample_rate": 0.25,
+  "comparison_rate": 0.25,
+  "default_comparison_rate": 0.25,
   "participant_eligible": true,
   "participant_reason": "eligible"
 }
@@ -76,7 +76,7 @@ Participant payloads can also report `participant_reason: "not_targeted"` when t
 
 ### `POST /api/ab/compare`
 
-Stream a pool-based champion vs. challenger A/B comparison. The server randomly pairs the champion against a challenger from the pool and streams interleaved NDJSON events tagged with `arm: "a"` or `arm: "b"`. A final `ab_meta` event carries the `comparison_id` and variant mapping.
+Stream a pool-based champion-vs-variant A/B comparison. The server randomly pairs the champion against another variant from the pool and streams interleaved NDJSON events tagged with `arm: "a"` or `arm: "b"`. A final `ab_meta` event carries the `comparison_id` and variant mapping.
 
 **Request body:** Same as `/api/get_chat_response_stream`.
 

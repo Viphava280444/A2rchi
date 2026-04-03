@@ -102,11 +102,11 @@ test.describe('A/B Management Entry Point -- Admin Gating', () => {
           participant_eligible: true,
           participant_reason: 'eligible',
           participant_targeted: true,
-          sample_rate: 0.7,
-          default_sample_rate: 0.5,
-          disclosure_mode: 'post_vote_reveal',
-          default_trace_mode: 'minimal',
-          max_pending_per_conversation: 1,
+          comparison_rate: 0.7,
+          default_comparison_rate: 0.5,
+          variant_label_mode: 'post_vote_reveal',
+          activity_panel_default_state: 'hidden',
+          max_pending_comparisons_per_conversation: 1,
         },
       });
     });
@@ -137,8 +137,8 @@ test.describe('A/B Management Entry Point -- Admin Gating', () => {
           participant_eligible: false,
           participant_reason: 'not_targeted',
           participant_targeted: false,
-          sample_rate: 0.5,
-          default_sample_rate: 0.5,
+          comparison_rate: 0.5,
+          default_comparison_rate: 0.5,
         },
       });
     });
@@ -311,7 +311,7 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     expect(savedPayload).toBeTruthy();
     expect(savedPayload.champion).toBe(mockData.abPoolAdmin.champion);
     expect(savedPayload).not.toHaveProperty('variants');
-    expect(savedPayload.sample_rate).toBe(mockData.abPoolAdmin.sample_rate);
+    expect(savedPayload.comparison_rate).toBe(mockData.abPoolAdmin.comparison_rate);
   });
 
   test('settings save keeps backend-confirmed values visible without relying on a follow-up GET', async ({ page }) => {
@@ -326,22 +326,22 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
         status: 200,
         json: {
           ...mockData.abPoolAdmin,
-          sample_rate: 0.4,
-          disclosure_mode: 'blind',
-          default_trace_mode: 'verbose',
+          comparison_rate: 0.4,
+          variant_label_mode: 'hidden',
+          activity_panel_default_state: 'expanded',
         },
       });
     });
 
     await openABAdminPage(page);
     await page.locator('#ab-admin-sample-rate').fill('0.4');
-    await page.locator('#ab-admin-disclosure-mode').selectOption('blind');
-    await page.locator('#ab-admin-trace-mode').selectOption('verbose');
+    await page.locator('#ab-admin-disclosure-mode').selectOption('hidden');
+    await page.locator('#ab-admin-trace-mode').selectOption('expanded');
     await page.locator('#ab-admin-save').click();
 
     await expect(page.locator('#ab-admin-sample-rate')).toHaveValue('0.4');
-    await expect(page.locator('#ab-admin-disclosure-mode')).toHaveValue('blind');
-    await expect(page.locator('#ab-admin-trace-mode')).toHaveValue('verbose');
+    await expect(page.locator('#ab-admin-disclosure-mode')).toHaveValue('hidden');
+    await expect(page.locator('#ab-admin-trace-mode')).toHaveValue('expanded');
   });
 
   test('clicking save variants sends only variant details', async ({ page }) => {
@@ -360,7 +360,7 @@ test.describe('A/B Admin Page -- Save and Disable', () => {
     await page.waitForTimeout(300);
     expect(savedPayload).toBeTruthy();
     expect(savedPayload).toHaveProperty('variants');
-    expect(savedPayload).not.toHaveProperty('sample_rate');
+    expect(savedPayload).not.toHaveProperty('comparison_rate');
     expect(savedPayload.variants).toEqual(expect.arrayContaining([
       expect.objectContaining({
         label: 'Baseline',
@@ -570,13 +570,116 @@ test.describe('A/B Comparison Streaming', () => {
     await expect(armB).toContainText('Beta answer');
   });
 
-  test('A/B headers render cleanly with named disclosure and minimal trace mode', async ({ page }) => {
+  test('faster A/B arm finalizes before the slower arm finishes', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+
+    const abStream = [
+      JSON.stringify({ type: 'meta', event: 'stream_started' }),
+      JSON.stringify({ type: 'ab_arms', arm_a_name: 'Baseline', arm_b_name: 'Poet', variant_label_mode: 'post_vote_reveal' }),
+      JSON.stringify({ arm: 'a', type: 'chunk', content: 'Fast arm chunk' }),
+      JSON.stringify({ arm: 'b', type: 'chunk', content: 'Slow arm chunk' }),
+      JSON.stringify({ arm: 'a', type: 'final', response: 'Fast arm done', model_used: 'openai/gpt-4o' }),
+      JSON.stringify({ arm: 'b', type: 'chunk', content: 'Slow arm still streaming' }),
+      JSON.stringify({ arm: 'b', type: 'final', response: 'Slow arm done', model_used: 'anthropic/claude-3.5-sonnet' }),
+      JSON.stringify({
+        type: 'ab_meta',
+        comparison_id: 42,
+        conversation_id: 1,
+        arm_a_message_id: 101,
+        arm_b_message_id: 102,
+        arm_a_variant: 'Baseline',
+        arm_b_variant: 'Poet',
+        variant_label_mode: 'post_vote_reveal',
+      }),
+    ].join('\n') + '\n';
+
+    await page.route('**/api/ab/compare', async (route) => {
+      await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
+    });
+
+    await page.goto('/chat');
+    await page.waitForFunction(() => typeof (window as any).UI !== 'undefined');
+    await page.evaluate(() => {
+      const events: string[] = [];
+      (window as any).__abTraceEventOrder = events;
+      const originalFinalizeTrace = (window as any).UI.finalizeTrace.bind((window as any).UI);
+      const originalUpdateABResponse = (window as any).UI.updateABResponse.bind((window as any).UI);
+
+      (window as any).UI.finalizeTrace = (messageId: string, trace: unknown, finalEvent: unknown) => {
+        if (String(messageId).endsWith('-ab-a')) events.push('finalize:a');
+        if (String(messageId).endsWith('-ab-b')) events.push('finalize:b');
+        return originalFinalizeTrace(messageId, trace, finalEvent);
+      };
+
+      (window as any).UI.updateABResponse = (responseId: string, html: string, streaming = false) => {
+        if (!streaming && String(responseId).endsWith('-ab-a')) events.push('response:a');
+        if (!streaming && String(responseId).endsWith('-ab-b')) events.push('response:b');
+        return originalUpdateABResponse(responseId, html, streaming);
+      };
+    });
+
+    await page.getByLabel('Message input').fill('Test AB');
+    await page.getByRole('button', { name: 'Send message' }).click();
+    await expect(page.locator('.ab-vote-container')).toBeVisible();
+
+    const eventOrder = await page.evaluate(() => (window as any).__abTraceEventOrder as string[]);
+    expect(eventOrder.indexOf('finalize:a')).toBeGreaterThanOrEqual(0);
+    expect(eventOrder.indexOf('response:b')).toBeGreaterThanOrEqual(0);
+    expect(eventOrder.indexOf('finalize:a')).toBeLessThan(eventOrder.indexOf('response:b'));
+  });
+
+  test('completed A/B arm timer freezes while the slower arm is still streaming', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+    await openChatPage(page);
+
+    await page.waitForFunction(() => typeof (window as any).API !== 'undefined');
+    await page.evaluate(() => {
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      (window as any).API.streamABComparison = async function* () {
+        yield { type: 'ab_arms', arm_a_name: 'Baseline', arm_b_name: 'Poet', variant_label_mode: 'post_vote_reveal' };
+        yield { arm: 'a', type: 'chunk', content: 'Fast arm chunk' };
+        yield { arm: 'b', type: 'chunk', content: 'Slow arm chunk' };
+        await sleep(150);
+        yield { arm: 'a', type: 'final', response: 'Fast arm done', model_used: 'openai/gpt-4o', duration_ms: 150 };
+        await sleep(350);
+        yield { arm: 'b', type: 'final', response: 'Slow arm done', model_used: 'anthropic/claude-3.5-sonnet', duration_ms: 500 };
+        yield {
+          type: 'ab_meta',
+          comparison_id: 42,
+          conversation_id: 1,
+          arm_a_message_id: 101,
+          arm_b_message_id: 102,
+          arm_a_variant: 'Baseline',
+          arm_b_variant: 'Poet',
+          variant_label_mode: 'post_vote_reveal',
+        };
+      };
+    });
+
+    await page.getByLabel('Message input').fill('Test AB timers');
+    await page.getByRole('button', { name: 'Send message' }).click();
+
+    const armATimer = page.locator('.ab-comparison .trace-timer').first();
+    const armBTimer = page.locator('.ab-comparison .trace-timer').nth(1);
+
+    await expect.poll(async () => (await armATimer.textContent())?.trim()).toBe('150ms');
+    const armBTimerBefore = (await armBTimer.textContent())?.trim();
+    await page.waitForTimeout(200);
+    await expect(armATimer).toHaveText('150ms');
+    const armBTimerAfter = (await armBTimer.textContent())?.trim();
+    expect(armBTimerAfter).not.toBe(armBTimerBefore);
+    await expect(page.locator('.ab-vote-container')).toBeVisible();
+  });
+
+  test('A/B headers render cleanly with streaming disclosure and hidden trace mode', async ({ page }) => {
     await setupBasicMocks(page);
     await setupABDecisionMock(page, {
       use_ab: true,
       reason: 'sampled',
       pending_count: 0,
-      max_pending_per_conversation: 1,
+      max_pending_comparisons_per_conversation: 1,
     });
 
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
@@ -585,10 +688,10 @@ test.describe('A/B Comparison Streaming', () => {
         json: {
           enabled: true,
           is_admin: false,
-          sample_rate: 1,
-          disclosure_mode: 'named',
-          default_trace_mode: 'minimal',
-          max_pending_per_conversation: 1,
+          comparison_rate: 1,
+          variant_label_mode: 'always_visible',
+          activity_panel_default_state: 'hidden',
+          max_pending_comparisons_per_conversation: 1,
         },
       });
     });
@@ -599,7 +702,7 @@ test.describe('A/B Comparison Streaming', () => {
         type: 'ab_arms',
         arm_a_name: 'Baseline',
         arm_b_name: 'Poet',
-        disclosure_mode: 'named',
+        variant_label_mode: 'always_visible',
       }),
       JSON.stringify({ arm: 'a', type: 'chunk', content: 'Champion says hello' }),
       JSON.stringify({ arm: 'b', type: 'chunk', content: 'Challenger says hi' }),
@@ -611,7 +714,7 @@ test.describe('A/B Comparison Streaming', () => {
         arm_b_message_id: 102,
         arm_a_variant: 'Baseline',
         arm_b_variant: 'Poet',
-        disclosure_mode: 'named',
+        variant_label_mode: 'always_visible',
       }),
     ].join('\n') + '\n';
 
@@ -635,7 +738,7 @@ test.describe('A/B Comparison Streaming', () => {
       use_ab: true,
       reason: 'sampled',
       pending_count: 0,
-      max_pending_per_conversation: 1,
+      max_pending_comparisons_per_conversation: 1,
     });
 
     await page.route(/\/api\/ab\/pool(\?|$)/, async (route) => {
@@ -644,10 +747,10 @@ test.describe('A/B Comparison Streaming', () => {
         json: {
           enabled: true,
           is_admin: false,
-          sample_rate: 1,
-          disclosure_mode: 'blind',
-          default_trace_mode: 'normal',
-          max_pending_per_conversation: 1,
+          comparison_rate: 1,
+          variant_label_mode: 'hidden',
+          activity_panel_default_state: 'collapsed',
+          max_pending_comparisons_per_conversation: 1,
         },
       });
     });
@@ -664,7 +767,7 @@ test.describe('A/B Comparison Streaming', () => {
         arm_b_message_id: 102,
         arm_a_variant: 'normal',
         arm_b_variant: 'mad',
-        disclosure_mode: 'blind',
+        variant_label_mode: 'hidden',
       }),
     ].join('\n') + '\n';
 
@@ -743,10 +846,10 @@ test.describe('A/B Comparison Streaming', () => {
           enabled: true,
           is_admin: false,
           can_manage: false,
-          sample_rate: 1,
-          disclosure_mode: 'post_vote_reveal',
-          default_trace_mode: 'minimal',
-          max_pending_per_conversation: 2,
+          comparison_rate: 1,
+          variant_label_mode: 'post_vote_reveal',
+          activity_panel_default_state: 'hidden',
+          max_pending_comparisons_per_conversation: 2,
         },
       });
     });
@@ -765,8 +868,8 @@ test.describe('A/B Comparison Streaming', () => {
               comparison_id: 2001,
               variant_a_name: 'Baseline',
               variant_b_name: 'Poet',
-              disclosure_mode: 'post_vote_reveal',
-              default_trace_mode: 'minimal',
+              variant_label_mode: 'post_vote_reveal',
+              activity_panel_default_state: 'hidden',
               response_a: { message_id: 501, content: 'Pending A', model_used: 'openai/gpt-4o' },
               response_b: { message_id: 502, content: 'Pending B', model_used: 'anthropic/claude-3.5-sonnet' },
             },
@@ -775,8 +878,8 @@ test.describe('A/B Comparison Streaming', () => {
             comparison_id: 2001,
             variant_a_name: 'Baseline',
             variant_b_name: 'Poet',
-            disclosure_mode: 'post_vote_reveal',
-            default_trace_mode: 'minimal',
+            variant_label_mode: 'post_vote_reveal',
+            activity_panel_default_state: 'hidden',
             response_a: { message_id: 501, content: 'Pending A', model_used: 'openai/gpt-4o' },
             response_b: { message_id: 502, content: 'Pending B', model_used: 'anthropic/claude-3.5-sonnet' },
           },
@@ -788,7 +891,7 @@ test.describe('A/B Comparison Streaming', () => {
       use_ab: true,
       reason: 'sampled',
       pending_count: 0,
-      max_pending_per_conversation: 2,
+      max_pending_comparisons_per_conversation: 2,
     });
 
     await openChatPage(page);
@@ -809,10 +912,10 @@ test.describe('A/B Comparison Streaming', () => {
           enabled: true,
           is_admin: false,
           can_manage: false,
-          sample_rate: 1,
-          disclosure_mode: 'post_vote_reveal',
-          default_trace_mode: 'minimal',
-          max_pending_per_conversation: 2,
+          comparison_rate: 1,
+          variant_label_mode: 'post_vote_reveal',
+          activity_panel_default_state: 'hidden',
+          max_pending_comparisons_per_conversation: 2,
         },
       });
     });
@@ -831,8 +934,8 @@ test.describe('A/B Comparison Streaming', () => {
               comparison_id: 2001,
               variant_a_name: 'Baseline',
               variant_b_name: 'Poet',
-              disclosure_mode: 'post_vote_reveal',
-              default_trace_mode: 'minimal',
+              variant_label_mode: 'post_vote_reveal',
+              activity_panel_default_state: 'hidden',
               response_a: { message_id: 501, content: 'Pending A1', model_used: 'openai/gpt-4o' },
               response_b: { message_id: 502, content: 'Pending B1', model_used: 'anthropic/claude-3.5-sonnet' },
             },
@@ -840,8 +943,8 @@ test.describe('A/B Comparison Streaming', () => {
               comparison_id: 2002,
               variant_a_name: 'Baseline',
               variant_b_name: 'Critic',
-              disclosure_mode: 'post_vote_reveal',
-              default_trace_mode: 'minimal',
+              variant_label_mode: 'post_vote_reveal',
+              activity_panel_default_state: 'hidden',
               response_a: { message_id: 503, content: 'Pending A2', model_used: 'openai/gpt-4o' },
               response_b: { message_id: 504, content: 'Pending B2', model_used: 'anthropic/claude-3.5-sonnet' },
             },
@@ -850,8 +953,8 @@ test.describe('A/B Comparison Streaming', () => {
             comparison_id: 2002,
             variant_a_name: 'Baseline',
             variant_b_name: 'Critic',
-            disclosure_mode: 'post_vote_reveal',
-            default_trace_mode: 'minimal',
+            variant_label_mode: 'post_vote_reveal',
+            activity_panel_default_state: 'hidden',
             response_a: { message_id: 503, content: 'Pending A2', model_used: 'openai/gpt-4o' },
             response_b: { message_id: 504, content: 'Pending B2', model_used: 'anthropic/claude-3.5-sonnet' },
           },
@@ -863,7 +966,7 @@ test.describe('A/B Comparison Streaming', () => {
       use_ab: true,
       reason: 'sampled',
       pending_count: 0,
-      max_pending_per_conversation: 2,
+      max_pending_comparisons_per_conversation: 2,
     });
 
     await openChatPage(page);
@@ -889,6 +992,17 @@ test.describe('A/B Vote Submission', () => {
 
     await page.route('**/api/ab/compare', async (route: any) => {
       await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
+    });
+  }
+
+  async function enableVisibleABTraceMode(page: any) {
+    await page.waitForFunction(() => typeof (window as any).Chat !== 'undefined');
+    await page.evaluate(() => {
+      (window as any).Chat.state.abPool = {
+        ...((window as any).Chat.state.abPool || {}),
+        enabled: true,
+        activity_panel_default_state: 'collapsed',
+      };
     });
   }
 
@@ -1004,6 +1118,121 @@ test.describe('A/B Vote Submission', () => {
     await page.locator('.ab-vote-btn-a').click();
 
     await expect(page.locator('.ab-comparison')).toHaveCount(0);
+  });
+
+  test('choosing A preserves response A timer after collapse', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+
+    const abStream = createABStreamResponse({
+      comparisonId: 99,
+      armADurationMs: 150,
+      armBDurationMs: 320,
+    });
+
+    await page.route('**/api/ab/compare', async (route: any) => {
+      await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
+    });
+    await page.route('**/api/ab/preference', async (route: any) => {
+      await route.fulfill({ status: 200, json: { success: true } });
+    });
+
+    await page.goto('/chat');
+    await enableVisibleABTraceMode(page);
+    await page.getByLabel('Message input').fill('Keep A timer');
+    await page.getByRole('button', { name: 'Send message' }).click();
+
+    await expect(page.locator('.ab-vote-container')).toBeVisible();
+    await expect(page.locator('.ab-comparison .trace-timer').first()).toHaveText('150ms');
+    await expect(page.locator('.ab-comparison .trace-timer').nth(1)).toHaveText('320ms');
+
+    await page.locator('.ab-vote-btn-a').click();
+
+    await expect(page.locator('.ab-comparison')).toHaveCount(0);
+    await expect(page.locator('.message.assistant .trace-timer').last()).toHaveText('150ms');
+  });
+
+  test('choosing B preserves response B timer after collapse', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+
+    const abStream = createABStreamResponse({
+      comparisonId: 99,
+      armADurationMs: 180,
+      armBDurationMs: 410,
+    });
+
+    await page.route('**/api/ab/compare', async (route: any) => {
+      await route.fulfill({ status: 200, contentType: 'text/plain', body: abStream });
+    });
+    await page.route('**/api/ab/preference', async (route: any) => {
+      await route.fulfill({ status: 200, json: { success: true } });
+    });
+
+    await page.goto('/chat');
+    await enableVisibleABTraceMode(page);
+    await page.getByLabel('Message input').fill('Keep B timer');
+    await page.getByRole('button', { name: 'Send message' }).click();
+
+    await expect(page.locator('.ab-vote-container')).toBeVisible();
+    await expect(page.locator('.ab-comparison .trace-timer').first()).toHaveText('180ms');
+    await expect(page.locator('.ab-comparison .trace-timer').nth(1)).toHaveText('410ms');
+
+    await page.locator('.ab-vote-btn-b').click();
+
+    await expect(page.locator('.ab-comparison')).toHaveCount(0);
+    await expect(page.locator('.message.assistant .trace-timer').last()).toHaveText('410ms');
+  });
+
+  test('post-vote winner keeps trace and tool disclosure interactive', async ({ page }) => {
+    await setupBasicMocks(page);
+    await setupABAdminMocks(page);
+
+    await page.route('**/api/ab/preference', async (route: any) => {
+      await route.fulfill({ status: 200, json: { success: true } });
+    });
+
+    await page.goto('/chat');
+    await enableVisibleABTraceMode(page);
+    await page.waitForFunction(() => typeof (window as any).API !== 'undefined');
+    await page.evaluate(() => {
+      (window as any).API.streamABComparison = async function* () {
+        yield { type: 'ab_arms', arm_a_name: 'Baseline', arm_b_name: 'Poet', variant_label_mode: 'post_vote_reveal' };
+        yield { arm: 'a', type: 'tool_start', tool_call_id: 'tool-a', tool_name: 'search', tool_args: { query: 'post vote trace' } };
+        yield { arm: 'a', type: 'tool_output', tool_call_id: 'tool-a', output: 'tool output' };
+        yield { arm: 'a', type: 'tool_end', tool_call_id: 'tool-a', status: 'success', duration_ms: 25 };
+        yield { arm: 'a', type: 'final', response: 'Trace winner', model_used: 'openai/gpt-4o', duration_ms: 150 };
+        yield { arm: 'b', type: 'final', response: 'Trace loser', model_used: 'anthropic/claude-3.5-sonnet', duration_ms: 280 };
+        yield {
+          type: 'ab_meta',
+          comparison_id: 99,
+          conversation_id: 1,
+          arm_a_message_id: 101,
+          arm_b_message_id: 102,
+          arm_a_variant: 'Baseline',
+          arm_b_variant: 'Poet',
+          variant_label_mode: 'post_vote_reveal',
+        };
+      };
+    });
+
+    await page.getByLabel('Message input').fill('Keep trace interactive');
+    await page.getByRole('button', { name: 'Send message' }).click();
+
+    await expect(page.locator('.ab-vote-container')).toBeVisible();
+    await page.locator('.ab-vote-btn-a').click();
+
+    await expect(page.locator('.ab-comparison')).toHaveCount(0);
+
+    const traceContainer = page.locator('.message.assistant .trace-container').last();
+    await expect(traceContainer).toHaveClass(/collapsed/);
+    await traceContainer.locator('.trace-toggle').click();
+    await expect(traceContainer).not.toHaveClass(/collapsed/);
+
+    const toolStep = traceContainer.locator('.tool-step').first();
+    await expect(toolStep).toBeVisible();
+    await toolStep.locator('.step-header').click();
+    await expect(toolStep.locator('.step-details')).toBeVisible();
   });
 
   test('choosing Tie keeps both arms with tie styling', async ({ page }) => {
