@@ -392,6 +392,20 @@ const API = {
    * Each event has an 'arm' field ('a' or 'b') plus 'type', 'content', etc.
    */
   async *streamABComparison(history, conversationId, configName, signal, provider = null, model = null) {
+    const streamOverride = window.__ARCHI_PLAYWRIGHT__?.ab?.streamOverride;
+    if (typeof streamOverride === 'function') {
+      yield* streamOverride({
+        history,
+        conversationId,
+        configName,
+        signal,
+        provider,
+        model,
+        clientId: this.clientId,
+      });
+      return;
+    }
+
     const body = {
       last_message: history.slice(-1),
       conversation_id: conversationId,
@@ -4944,6 +4958,35 @@ const Chat = {
       this.state.traceVerboseMode = mode;
       localStorage.setItem(CONFIG.STORAGE_KEYS.TRACE_VERBOSE_MODE, mode);
     }
+  },
+};
+
+window.__ARCHI_PLAYWRIGHT__ = {
+  ab: {
+    streamOverride: null,
+
+    setStreamOverride(override) {
+      this.streamOverride = typeof override === 'function' ? override : null;
+    },
+
+    clearStreamOverride() {
+      this.streamOverride = null;
+    },
+
+    patchPoolState(patch = {}) {
+      Chat.state.abPool = {
+        ...(Chat.state.abPool || {}),
+        ...patch,
+      };
+      if (typeof UI.updateABPoolUI === 'function') {
+        UI.updateABPoolUI(Chat.state.abPool || {});
+      }
+      return Chat.state.abPool;
+    },
+
+    reset() {
+      this.streamOverride = null;
+    },
   },
 };
 

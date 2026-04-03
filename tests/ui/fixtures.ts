@@ -695,18 +695,14 @@ export function createABStreamResponse(options: {
 }
 
 export async function enableABMode(page: Page) {
-  // Legacy helper — kept for backwards compat but now just ensures the pool
-  // state is wired correctly via evaluate (after page has loaded).
+  await page.waitForFunction(() => typeof (window as any).__ARCHI_PLAYWRIGHT__?.ab !== 'undefined');
   await page.evaluate(() => {
-    // @ts-ignore – Chat is a global in the app
-    if (typeof Chat !== 'undefined') {
-      Chat.state.abPool = {
-        enabled: true,
-        champion: 'Baseline',
-        variants: ['Baseline', 'Poet'],
-        max_pending_comparisons_per_conversation: 1,
-      };
-    }
+    (window as any).__ARCHI_PLAYWRIGHT__.ab.patchPoolState({
+      enabled: true,
+      champion: 'Baseline',
+      variants: ['Baseline', 'Poet'],
+      max_pending_comparisons_per_conversation: 1,
+    });
   });
 }
 

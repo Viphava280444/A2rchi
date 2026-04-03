@@ -3357,10 +3357,10 @@ class FlaskAppWrapper(object):
             return []
         try:
             from src.archi import pipelines
+            agent_cls = getattr(pipelines, agent_class, None)
         except Exception as exc:
-            logger.warning("Failed to import pipelines module: %s", exc)
+            logger.warning("Failed to load pipeline class %s: %s", agent_class, exc)
             return []
-        agent_cls = getattr(pipelines, agent_class, None)
         if not agent_cls or not hasattr(agent_cls, "get_tool_registry"):
             return []
         try:
@@ -3377,10 +3377,10 @@ class FlaskAppWrapper(object):
             return []
         try:
             from src.archi import pipelines
+            agent_cls = getattr(pipelines, agent_class, None)
         except Exception as exc:
-            logger.warning("Failed to import pipelines module: %s", exc)
+            logger.warning("Failed to load pipeline class %s: %s", agent_class, exc)
             return []
-        agent_cls = getattr(pipelines, agent_class, None)
         if not agent_cls or not hasattr(agent_cls, "get_tool_registry"):
             return []
         try:

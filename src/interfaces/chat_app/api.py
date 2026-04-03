@@ -46,10 +46,10 @@ def _get_agent_tool_registry(agent_class_name: Optional[str]) -> List[str]:
         return []
     try:
         from src.archi import pipelines
+        agent_cls = getattr(pipelines, agent_class_name, None)
     except Exception as exc:
-        logger.warning("Failed to import pipelines module: %s", exc)
+        logger.warning("Failed to load pipeline class %s: %s", agent_class_name, exc)
         return []
-    agent_cls = getattr(pipelines, agent_class_name, None)
     if not agent_cls or not hasattr(agent_cls, "get_tool_registry"):
         return []
     try:

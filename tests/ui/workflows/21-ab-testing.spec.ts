@@ -51,6 +51,10 @@ async function openChatPage(page: import('@playwright/test').Page) {
   await expect(page.locator('.conversation-item[data-id]').first()).toBeVisible();
 }
 
+async function waitForABPlaywrightHook(page: import('@playwright/test').Page) {
+  await page.waitForFunction(() => typeof (window as any).__ARCHI_PLAYWRIGHT__?.ab !== 'undefined');
+}
+
 async function loadConversationFromSidebar(page: import('@playwright/test').Page, conversationId: number) {
   const conversation = page.locator(`.conversation-item[data-id="${conversationId}"]`);
   await expect(conversation).toBeVisible();
@@ -634,10 +638,10 @@ test.describe('A/B Comparison Streaming', () => {
     await setupABAdminMocks(page);
     await openChatPage(page);
 
-    await page.waitForFunction(() => typeof (window as any).API !== 'undefined');
+    await waitForABPlaywrightHook(page);
     await page.evaluate(() => {
       const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-      (window as any).API.streamABComparison = async function* () {
+      (window as any).__ARCHI_PLAYWRIGHT__.ab.setStreamOverride(async function* () {
         yield { type: 'ab_arms', arm_a_name: 'Baseline', arm_b_name: 'Poet', variant_label_mode: 'post_vote_reveal' };
         yield { arm: 'a', type: 'chunk', content: 'Fast arm chunk' };
         yield { arm: 'b', type: 'chunk', content: 'Slow arm chunk' };
@@ -655,7 +659,7 @@ test.describe('A/B Comparison Streaming', () => {
           arm_b_variant: 'Poet',
           variant_label_mode: 'post_vote_reveal',
         };
-      };
+      });
     });
 
     await page.getByLabel('Message input').fill('Test AB timers');
@@ -996,13 +1000,12 @@ test.describe('A/B Vote Submission', () => {
   }
 
   async function enableVisibleABTraceMode(page: any) {
-    await page.waitForFunction(() => typeof (window as any).Chat !== 'undefined');
+    await waitForABPlaywrightHook(page);
     await page.evaluate(() => {
-      (window as any).Chat.state.abPool = {
-        ...((window as any).Chat.state.abPool || {}),
+      (window as any).__ARCHI_PLAYWRIGHT__.ab.patchPoolState({
         enabled: true,
         activity_panel_default_state: 'collapsed',
-      };
+      });
     });
   }
 
@@ -1194,9 +1197,9 @@ test.describe('A/B Vote Submission', () => {
 
     await page.goto('/chat');
     await enableVisibleABTraceMode(page);
-    await page.waitForFunction(() => typeof (window as any).API !== 'undefined');
+    await waitForABPlaywrightHook(page);
     await page.evaluate(() => {
-      (window as any).API.streamABComparison = async function* () {
+      (window as any).__ARCHI_PLAYWRIGHT__.ab.setStreamOverride(async function* () {
         yield { type: 'ab_arms', arm_a_name: 'Baseline', arm_b_name: 'Poet', variant_label_mode: 'post_vote_reveal' };
         yield { arm: 'a', type: 'tool_start', tool_call_id: 'tool-a', tool_name: 'search', tool_args: { query: 'post vote trace' } };
         yield { arm: 'a', type: 'tool_output', tool_call_id: 'tool-a', output: 'tool output' };
@@ -1213,7 +1216,7 @@ test.describe('A/B Vote Submission', () => {
           arm_b_variant: 'Poet',
           variant_label_mode: 'post_vote_reveal',
         };
-      };
+      });
     });
 
     await page.getByLabel('Message input').fill('Keep trace interactive');

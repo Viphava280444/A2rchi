@@ -67,7 +67,7 @@ test.describe('Settings Modal', () => {
     await page.getByRole('button', { name: 'A/B Testing' }).click();
     await expect(page.locator('#ab-participation-group')).toBeVisible();
     await expect(page.locator('#ab-participation-default')).toContainText('Default: 50%');
-    await expect(page.locator('#ab-participation-group .settings-description').nth(1)).toContainText('standard single-response flow');
+    await expect(page.locator('#ab-participation-description')).toContainText('standard single-response flow');
   });
 
   test('changing the A/B sampling slider saves the user preference', async ({ page }) => {
