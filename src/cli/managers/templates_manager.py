@@ -474,6 +474,19 @@ class TemplateManager:
 
         template_vars["app_version"] = get_git_version()
 
+        # Open WebUI config (reads from services.openwebui in user config)
+        chat_app_cfg = context.config_manager.config.get("services", {}).get("chat_app", {})
+        openwebui_cfg = context.config_manager.config.get("services", {}).get("openwebui", {})
+        template_vars["openwebui_port"] = openwebui_cfg.get("port", 3001)
+
+        # SSO config for Open WebUI (reuses ARCHI's auth.sso settings)
+        auth_cfg = chat_app_cfg.get("auth", {})
+        sso_cfg = auth_cfg.get("sso", {})
+        template_vars["sso_enabled"] = auth_cfg.get("enabled", False) and sso_cfg.get("enabled", False)
+        template_vars["sso_provider_name"] = sso_cfg.get("provider_name", "SSO")
+        template_vars["sso_server_metadata_url"] = sso_cfg.get("server_metadata_url", "")
+        template_vars["sso_scopes"] = sso_cfg.get("client_kwargs", {}).get("scope", "openid profile email")
+
         # Compose template still expects optional lists
         template_vars.setdefault("prompt_files", [])
         template_vars.setdefault("rubrics", [])

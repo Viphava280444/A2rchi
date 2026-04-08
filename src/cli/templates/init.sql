@@ -549,7 +549,20 @@ CREATE INDEX IF NOT EXISTS idx_service_alerts_banner
     WHERE active = TRUE;
 
 -- ============================================================================
--- 11. GRAFANA ACCESS
+-- 11. OPEN WEBUI CONVERSATION MAPPING
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS openwebui_conversation_map (
+    chat_id TEXT PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversation_metadata(conversation_id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_owui_conv_map_conversation
+    ON openwebui_conversation_map(conversation_id);
+
+-- ============================================================================
+-- 12. GRAFANA ACCESS
 -- ============================================================================
 
 {% if use_grafana -%}
@@ -576,7 +589,8 @@ GRANT SELECT ON
     timing,
     agent_tool_calls,
     ab_comparisons,
-    migration_state
+    migration_state,
+    openwebui_conversation_map
 TO grafana;
 {% endif %}
 
