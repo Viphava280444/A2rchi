@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import secrets
+import string
 import time
 import uuid
 
@@ -60,6 +62,9 @@ from src.utils.sql import (
     SQL_GET_PENDING_AB_COMPARISON, SQL_DELETE_AB_COMPARISON, SQL_GET_AB_COMPARISONS_BY_CONVERSATION,
     SQL_CREATE_AGENT_TRACE, SQL_UPDATE_AGENT_TRACE, SQL_GET_AGENT_TRACE,
     SQL_GET_TRACE_BY_MESSAGE, SQL_GET_ACTIVE_TRACE, SQL_CANCEL_ACTIVE_TRACES,
+    SQL_INSERT_SHARE, SQL_GET_SHARE_BY_TOKEN, SQL_GET_SHARE_BY_CONVERSATION,
+    SQL_REVOKE_SHARE, SQL_REVOKE_SHARES_BY_CONVERSATION,
+    SQL_GET_SHARED_CONVERSATION_MESSAGES, SQL_GET_SHARED_CONVERSATION_METADATA,
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.service_alerts import (
@@ -83,6 +88,50 @@ from src.utils.rbac.audit import log_authentication_event
 
 
 logger = get_logger(__name__)
+
+_BASE62_CHARS = string.ascii_letters + string.digits
+
+def generate_share_token(length: int = 22) -> str:
+    """Generate a URL-safe base62 share token (~131 bits of entropy at 22 chars)."""
+    return ''.join(secrets.choice(_BASE62_CHARS) for _ in range(length))
+
+
+class RateLimiter:
+    """In-memory per-IP rate limiter using a sliding window."""
+
+    def __init__(self, max_requests: int = 30, window_seconds: int = 60):
+        self._max = max_requests
+        self._window = window_seconds
+        self._hits: dict[str, list[float]] = {}
+        self._lock = Lock()
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - self._window
+        with self._lock:
+            timestamps = self._hits.get(key, [])
+            timestamps = [t for t in timestamps if t > cutoff]
+            if len(timestamps) >= self._max:
+                self._hits[key] = timestamps
+                return False
+            timestamps.append(now)
+            self._hits[key] = timestamps
+            return True
+
+
+_share_view_limiter = RateLimiter(max_requests=30, window_seconds=60)
+
+
+def rate_limit_shared(f):
+    """Rate limit decorator for shared conversation routes (30 req/min per IP)."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from flask import request as req
+        client_ip = req.remote_addr or 'unknown'
+        if not _share_view_limiter.is_allowed(client_ip):
+            return jsonify({'error': 'Too many requests. Please try again later.'}), 429
+        return f(*args, **kwargs)
+    return decorated
 
 
 def _build_provider_config_from_payload(config_payload: Dict[str, Any], provider_type: ProviderType) -> Optional[ProviderConfig]:
@@ -2237,6 +2286,15 @@ class FlaskAppWrapper(object):
         self.add_endpoint('/api/new_conversation', 'new_conversation', self.require_auth(self.new_conversation), methods=["POST"])
         self.add_endpoint('/api/delete_conversation', 'delete_conversation', self.require_auth(self.delete_conversation), methods=["POST"])
 
+        # Conversation sharing endpoints
+        logger.info("Adding conversation sharing API endpoints")
+        self.add_endpoint('/api/share_conversation', 'share_conversation', self.require_auth(self.share_conversation), methods=["POST"])
+        self.add_endpoint('/api/revoke_share', 'revoke_share', self.require_auth(self.revoke_share), methods=["POST"])
+        self.add_endpoint('/api/get_share_info', 'get_share_info', self.require_auth(self.get_share_info), methods=["POST"])
+        self.add_endpoint('/api/shared/<token>', 'get_shared_conversation', rate_limit_shared(self.get_shared_conversation), methods=["GET"])
+        self.add_endpoint('/s/<token>', 'shared_view', rate_limit_shared(self.shared_view), methods=["GET"])
+        self.add_endpoint('/api/sharing_config', 'get_sharing_config', self.require_auth(self.get_sharing_config), methods=["GET"])
+
         # A/B testing endpoints
         logger.info("Adding A/B testing API endpoints")
         self.add_endpoint('/api/ab/create', 'ab_create', self.require_auth(self.ab_create_comparison), methods=["POST"])
@@ -2385,14 +2443,21 @@ class FlaskAppWrapper(object):
 
     def login(self):
         """Unified login endpoint supporting multiple auth methods"""
-        # If user is already logged in, redirect to index
+        # If user is already logged in, redirect to next or index
         if session.get('logged_in'):
+            next_url = request.args.get('next', '')
+            if next_url and next_url.startswith('/s/'):
+                return redirect(next_url)
             return redirect(url_for('index'))
         
         # Handle SSO login initiation
         if request.args.get('method') == 'sso' and self.sso_enabled:
             if not self.oauth:
                 return jsonify({'error': 'SSO not configured'}), 400
+            # Store next URL in session for post-login redirect
+            next_url = request.args.get('next', '')
+            if next_url and next_url.startswith('/s/'):
+                session['login_next'] = next_url
             redirect_uri = url_for('sso_callback', _external=True)
             logger.info(f"Initiating SSO login with redirect URI: {redirect_uri}")
             return self.oauth.sso.authorize_redirect(redirect_uri)
@@ -2501,8 +2566,11 @@ class FlaskAppWrapper(object):
             )
             
             logger.info(f"SSO login successful for user: {user_email} with roles: {user_roles}")
-            
-            # Redirect to main page
+
+            # Redirect to stored next URL (e.g., shared conversation) or main page
+            next_url = session.pop('login_next', None)
+            if next_url and next_url.startswith('/s/'):
+                return redirect(next_url)
             return redirect(url_for('index'))
             
         except Exception as e:
@@ -4024,6 +4092,290 @@ class FlaskAppWrapper(object):
         except Exception as e:
             print(f"ERROR in delete_conversation: {str(e)}")
             return jsonify({'error': str(e)}), 500
+
+    # =========================================================================
+    # Conversation Sharing API Endpoints
+    # =========================================================================
+
+    def _get_sharing_config(self) -> dict:
+        """Get sharing config from the services config, with defaults."""
+        try:
+            config = get_full_config()
+            sharing = config.get("services", {}).get("chat_app", {}).get("sharing", {})
+        except Exception:
+            sharing = {}
+        return {
+            "enabled": sharing.get("enabled", True),
+            "allow_public": sharing.get("allow_public", True),
+            "allow_authenticated": sharing.get("allow_authenticated", True),
+            "default_visibility": sharing.get("default_visibility", "public"),
+        }
+
+    def get_sharing_config(self):
+        """Return the sharing config to the frontend."""
+        return jsonify(self._get_sharing_config()), 200
+
+    def share_conversation(self):
+        """
+        Create or update a share link for a conversation.
+
+        POST body:
+        - conversation_id: The conversation to share
+        - client_id: The client's identifier
+        - visibility: 'public' or 'authed'
+
+        Returns:
+            JSON with share_token and share_url
+        """
+        try:
+            sharing_config = self._get_sharing_config()
+            if not sharing_config["enabled"]:
+                return jsonify({'error': 'Sharing is disabled'}), 403
+
+            data = request.json
+            conversation_id = data.get('conversation_id')
+            client_id = data.get('client_id')
+            visibility = data.get('visibility', sharing_config['default_visibility'])
+            user_id = session.get('user', {}).get('id') or None
+
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+            if not client_id:
+                return jsonify({'error': 'client_id is required'}), 400
+            if visibility not in ('public', 'authed'):
+                return jsonify({'error': 'visibility must be "public" or "authed"'}), 400
+            if visibility == 'public' and not sharing_config['allow_public']:
+                return jsonify({'error': 'Public sharing is not allowed'}), 403
+            if visibility == 'authed' and not sharing_config['allow_authenticated']:
+                return jsonify({'error': 'Authenticated sharing is not allowed'}), 403
+
+            conn = psycopg2.connect(**self.pg_config)
+            cursor = conn.cursor()
+
+            # Verify ownership
+            if user_id:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+            if not cursor.fetchone():
+                cursor.close()
+                conn.close()
+                return jsonify({'error': 'Conversation not found'}), 404
+
+            # Revoke any existing active share for this conversation
+            cursor.execute(SQL_REVOKE_SHARES_BY_CONVERSATION, (conversation_id,))
+
+            # Create new share
+            token = generate_share_token()
+            cursor.execute(SQL_INSERT_SHARE, (
+                token, conversation_id, visibility,
+                user_id, client_id
+            ))
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            share_url = f"/s/{token}"
+            logger.info(f"Created share link for conversation {conversation_id}: {share_url}")
+            return jsonify({
+                'share_token': token,
+                'share_url': share_url,
+                'visibility': visibility,
+            }), 200
+
+        except Exception as e:
+            logger.error(f"Error in share_conversation: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def revoke_share(self):
+        """
+        Revoke an active share link.
+
+        POST body:
+        - conversation_id: The conversation whose share to revoke
+        - client_id: The client's identifier
+        """
+        try:
+            data = request.json
+            conversation_id = data.get('conversation_id')
+            client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
+
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+            if not client_id:
+                return jsonify({'error': 'client_id is required'}), 400
+
+            conn = psycopg2.connect(**self.pg_config)
+            cursor = conn.cursor()
+
+            # Verify ownership
+            if user_id:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+            if not cursor.fetchone():
+                cursor.close()
+                conn.close()
+                return jsonify({'error': 'Conversation not found'}), 404
+
+            cursor.execute(SQL_REVOKE_SHARES_BY_CONVERSATION, (conversation_id,))
+            revoked_count = cursor.rowcount
+            conn.commit()
+            cursor.close()
+            conn.close()
+
+            return jsonify({'success': True, 'revoked': revoked_count}), 200
+
+        except Exception as e:
+            logger.error(f"Error in revoke_share: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def get_share_info(self):
+        """
+        Get the current share status for a conversation.
+
+        POST body:
+        - conversation_id: The conversation to check
+        - client_id: The client's identifier
+        """
+        try:
+            data = request.json
+            conversation_id = data.get('conversation_id')
+            client_id = data.get('client_id')
+            user_id = session.get('user', {}).get('id') or None
+
+            if not conversation_id:
+                return jsonify({'error': 'conversation_id is required'}), 400
+            if not client_id:
+                return jsonify({'error': 'client_id is required'}), 400
+
+            conn = psycopg2.connect(**self.pg_config)
+            cursor = conn.cursor()
+
+            # Verify ownership
+            if user_id:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA_BY_USER, (conversation_id, user_id, client_id))
+            else:
+                cursor.execute(SQL_GET_CONVERSATION_METADATA, (conversation_id, client_id))
+            if not cursor.fetchone():
+                cursor.close()
+                conn.close()
+                return jsonify({'error': 'Conversation not found'}), 404
+
+            cursor.execute(SQL_GET_SHARE_BY_CONVERSATION, (conversation_id,))
+            row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            if not row:
+                return jsonify({'shared': False}), 200
+
+            return jsonify({
+                'shared': True,
+                'share_token': row[0],
+                'share_url': f"/s/{row[0]}",
+                'visibility': row[2],
+                'created_at': row[5].isoformat() if row[5] else None,
+            }), 200
+
+        except Exception as e:
+            logger.error(f"Error in get_share_info: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def get_shared_conversation(self, token):
+        """
+        Return shared conversation messages as JSON.
+        No auth required for public shares; auth required for 'authed' shares.
+        """
+        try:
+            conn = psycopg2.connect(**self.pg_config)
+            cursor = conn.cursor()
+
+            cursor.execute(SQL_GET_SHARE_BY_TOKEN, (token,))
+            share_row = cursor.fetchone()
+
+            if not share_row:
+                cursor.close()
+                conn.close()
+                return jsonify({'error': 'Share not found or expired'}), 404
+
+            visibility = share_row[2]
+
+            # Enforce auth for 'authed' visibility
+            if visibility == 'authed':
+                if self.auth_enabled and not session.get('logged_in'):
+                    cursor.close()
+                    conn.close()
+                    return jsonify({'error': 'Authentication required', 'login_required': True}), 401
+
+            conversation_id = share_row[1]
+
+            # Get conversation metadata
+            cursor.execute(SQL_GET_SHARED_CONVERSATION_METADATA, (conversation_id,))
+            meta_row = cursor.fetchone()
+            if not meta_row:
+                cursor.close()
+                conn.close()
+                return jsonify({'error': 'Conversation not found'}), 404
+
+            # Get messages (no RAG context)
+            cursor.execute(SQL_GET_SHARED_CONVERSATION_MESSAGES, (conversation_id,))
+            message_rows = cursor.fetchall()
+
+            cursor.close()
+            conn.close()
+
+            messages = []
+            for row in message_rows:
+                msg = {
+                    'sender': row[0],
+                    'content': row[1],
+                    'ts': row[2].isoformat() if row[2] else None,
+                }
+                if row[3]:
+                    msg['model_used'] = row[3]
+                messages.append(msg)
+
+            return jsonify({
+                'title': meta_row[1] or "Shared Conversation",
+                'created_at': meta_row[2].isoformat() if meta_row[2] else None,
+                'messages': messages,
+                'visibility': visibility,
+            }), 200
+
+        except Exception as e:
+            logger.error(f"Error in get_shared_conversation: {str(e)}")
+            return jsonify({'error': str(e)}), 500
+
+    def shared_view(self, token):
+        """
+        Serve the read-only shared conversation page.
+        For 'authed' shares, redirects to login if not authenticated.
+        """
+        try:
+            conn = psycopg2.connect(**self.pg_config)
+            cursor = conn.cursor()
+
+            cursor.execute(SQL_GET_SHARE_BY_TOKEN, (token,))
+            share_row = cursor.fetchone()
+            cursor.close()
+            conn.close()
+
+            if not share_row:
+                return render_template('shared.html', error='not_found'), 404
+
+            visibility = share_row[2]
+
+            # For authed shares, redirect to login if not authenticated
+            if visibility == 'authed' and self.auth_enabled and not session.get('logged_in'):
+                return redirect(url_for('login', next=f'/s/{token}'))
+
+            return render_template('shared.html', token=token, error=None)
+
+        except Exception as e:
+            logger.error(f"Error in shared_view: {str(e)}")
+            return render_template('shared.html', error='server_error'), 500
 
     # =========================================================================
     # A/B Testing API Endpoints

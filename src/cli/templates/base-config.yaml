@@ -88,6 +88,11 @@ services:
     num_responses_until_feedback: {{ services.chat_app.num_responses_until_feedback | default(3, true) }}
     include_copy_button: {{ services.chat_app.include_copy_button | default(false, true) }}
     flask_debug_mode: {{ services.chat_app.flask_debug_mode | default(true, false) }}
+    sharing:
+      enabled: {{ services.chat_app.sharing.enabled | default(true, true) }}
+      allow_public: {{ services.chat_app.sharing.allow_public | default(true, true) }}
+      allow_authenticated: {{ services.chat_app.sharing.allow_authenticated | default(true, true) }}
+      default_visibility: {{ services.chat_app.sharing.default_visibility | default("public", true) }}
     auth:
       enabled: {{ services.chat_app.auth.enabled | default(false, true) }}
       sso:

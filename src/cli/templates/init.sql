@@ -515,7 +515,26 @@ CREATE INDEX IF NOT EXISTS idx_ab_comparisons_preference ON ab_comparisons(prefe
 CREATE INDEX IF NOT EXISTS idx_ab_comparisons_pending ON ab_comparisons(conversation_id) WHERE preference IS NULL;
 
 -- ============================================================================
--- 9. MIGRATION STATE (for resumable migrations)
+-- 9. CONVERSATION SHARES
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS conversation_shares (
+    share_token VARCHAR(32) PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversation_metadata(conversation_id) ON DELETE CASCADE,
+    visibility VARCHAR(10) NOT NULL CHECK (visibility IN ('public', 'authed')),
+    created_by_user VARCHAR(200) REFERENCES users(id) ON DELETE SET NULL,
+    created_by_client TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ,
+    CONSTRAINT share_has_creator CHECK (created_by_user IS NOT NULL OR created_by_client IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_shares_conversation ON conversation_shares(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_shares_active ON conversation_shares(share_token) WHERE revoked_at IS NULL;
+
+-- ============================================================================
+-- 10. MIGRATION STATE (for resumable migrations)
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS migration_state (
@@ -576,7 +595,9 @@ GRANT SELECT ON
     timing,
     agent_tool_calls,
     ab_comparisons,
-    migration_state
+    conversation_shares,
+    migration_state,
+    service_alerts
 TO grafana;
 {% endif %}
 
