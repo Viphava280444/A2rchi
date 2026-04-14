@@ -478,7 +478,42 @@ class Benchmarker:
                 question_id +=1
                 formatted_question = [("User", question)]
                 start = time.perf_counter()
-                result = self.chain(history=formatted_question)
+
+                max_retries = 3
+                last_error = None
+                result = None
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        result = self.chain(history=formatted_question)
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                        logger.warning(f"Question {question_id} attempt {attempt}/{max_retries} failed: {exc}")
+                        if attempt < max_retries:
+                            logger.info(f"Retrying question {question_id}...")
+
+                if last_error is not None:
+                    end = time.perf_counter()
+                    logger.error(f"Question {question_id} failed after {max_retries} attempts ({end - start:.2f}s): {last_error}")
+                    q_results = {
+                        "time_elapsed": end - start,
+                        "question": question,
+                        "reference_answer": reference_answer,
+                        "answer": f"ERROR: {last_error}",
+                        "messages": [],
+                        "error": str(last_error),
+                        "attempts": max_retries,
+                        "reference_sources_match_fields": [],
+                        "reference_sources_metadata": [],
+                        "sources_metadata": [],
+                        "sources_trunc_content": [],
+                    }
+                    question_wise_results[f"question_{question_id}"] = q_results
+                    logger.info("====================================")
+                    logger.info("")
+                    continue
+
                 end = time.perf_counter()
                 logger.info(f"Finished answering question: {question_id} ({end - start:.2f}s)")
                 q_results = {}
