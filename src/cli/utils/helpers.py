@@ -24,6 +24,8 @@ TEMPLATE_COMPARISON_PATHS = (
     "grafana/grafana.ini",
 )
 
+HELM_PREFIX = Path("helm/templates/")
+
 def check_docker_available() -> bool:
     """Check if Docker is available and not just Podman emulation."""
     if not shutil.which("docker"):
@@ -192,7 +194,7 @@ def _render_config_for_compare(
     updated_config = copy.deepcopy(config)
     if host_mode:
         updated_config["host_mode"] = True
-        TemplateManager(env)._apply_host_mode_port_overrides(updated_config)
+        TemplateManager(env, verbosity)._apply_host_mode_port_overrides(updated_config)
 
     config_template = env.get_template("base-config.yaml")
     rendered = config_template.render(verbosity=verbosity, **updated_config)

@@ -3,10 +3,12 @@ import shlex
 import subprocess
 import sys
 import threading
+import json
 from pathlib import Path
 from typing import Tuple
 
 from src.cli.utils.command_runner import CommandRunner
+from src.cli.utils.helpers import HELM_PREFIX
 from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -21,9 +23,10 @@ class DeploymentError(Exception):
 class DeploymentManager:
     """Manages container deployment using Compose"""
     
-    def __init__(self, use_podman: bool = False):
+    def __init__(self, use_podman: bool = False, helm: bool = False):
         self.use_podman = use_podman
         self.compose_tool = "podman compose" if use_podman else "docker compose"
+        self.helm = helm
     
     def start_deployment(self, deployment_dir: Path) -> None:
         """Start the deployment using compose"""
@@ -127,6 +130,57 @@ class DeploymentManager:
             raise
         except subprocess.SubprocessError as e:
             raise DeploymentError(f"Failed to restart service: {e}", getattr(e, 'returncode', 1))
+
+    def has_service(self, deployment_dir: Path, service_name: str) -> bool:
+        compose_file = deployment_dir / "compose.yaml"
+        if not compose_file.exists():
+            raise FileNotFoundError(f"Compose file not found: {compose_file}")
+        self._validate_compose_file(compose_file)
+        import yaml
+        with open(compose_file, 'r') as f:
+            compose_data = yaml.safe_load(f) or {}
+        services = compose_data.get("services") or {}
+        return service_name in services
+
+    def run_service_once(self, deployment_dir: Path, service_name: str, build: bool = True,
+                         no_deps: bool = True) -> None:
+        """Run a one-shot compose service and remove the container when it exits."""
+        compose_file = deployment_dir / "compose.yaml"
+
+        if not compose_file.exists():
+            raise FileNotFoundError(f"Compose file not found: {compose_file}")
+
+        logger.info(f"Running one-shot service '{service_name}'")
+
+        try:
+            self._validate_compose_file(compose_file)
+        except Exception as e:
+            raise DeploymentError(f"Invalid compose file: {e}", 1)
+
+        flags = ["--rm"]
+        if no_deps:
+            flags.append("--no-deps")
+        if build:
+            flags.append("--build")
+
+        flags_str = " ".join(flags)
+        compose_cmd = f"{self.compose_tool} -f {compose_file} run {flags_str} {service_name}".strip()
+
+        try:
+            stdout, stderr, exit_code = CommandRunner.run_streaming(compose_cmd, cwd=deployment_dir)
+
+            if exit_code != 0:
+                error_msg = f"One-shot service '{service_name}' failed with exit code {exit_code}"
+                if stderr.strip():
+                    error_msg += f"\nError output:\n{stderr}"
+                raise DeploymentError(error_msg, exit_code, stderr)
+
+            logger.info(f"One-shot service '{service_name}' completed successfully")
+        except KeyboardInterrupt:
+            logger.warning("One-shot service interrupted by user")
+            raise
+        except subprocess.SubprocessError as e:
+            raise DeploymentError(f"Failed to run one-shot service: {e}", getattr(e, 'returncode', 1))
     
     def delete_deployment(self, deployment_name: str, remove_images: bool = False, 
                          remove_volumes: bool = False, remove_files: bool = True) -> None:
@@ -170,6 +224,52 @@ class DeploymentManager:
                     logger.warning(f"Could not remove deployment directory: {e}")
         else:
             logger.info(f"Deployment directory does not exist: {deployment_dir}. Cannot take down deployment.")
+
+    def create_deployment_templates(self, base_dir, services, env, name, use_selenium, template_vars=None):
+        template_vars = template_vars or {}
+        template_vars = {k:v for k,v in template_vars.items() if k!='name'}
+        for service in services:
+            chart_dir = Path(base_dir) / "templates" / f"{service}-deployment.yaml"
+            tmpl = env.get_template(str(HELM_PREFIX / service / "deployment.yaml"))  
+            helm_config = tmpl.render(name=name, selenium_scraper=use_selenium, **template_vars) 
+            with open(chart_dir,"w") as f:
+                f.write(helm_config)
+
+    def helm_install(self, name: str, templates_dir: Path, force_reinstall: bool) -> None:
+        """Start the deployment using compose"""
+        
+        name = name.replace("_","-")
+        logger.info(f"Starting helm deployment from templates at  {templates_dir}")
+        logger.info(f"(This might take a minute...)")
+
+        check_existing_command = f"helm status {name} -o json"
+        stdout, stderr, exit_code = CommandRunner.run_simple(check_existing_command)
+        deployment_exists = exit_code == 0
+
+        if deployment_exists and force_reinstall:
+            status_data = json.loads(stdout or "{}")
+
+            helm_uninstall_command = f"helm uninstall {name} --wait"
+            logger.info(f"Uninstalling existing {name} deployment")
+            stdout, stderr, exit_code = CommandRunner.run_simple(helm_uninstall_command)
+            if exit_code != 0:
+                error_msg = f"Helm uninstall failed with exit code {exit_code}"
+                if stderr.strip():
+                    error_msg += f"\nError output:\n{stderr}"
+                raise DeploymentError(error_msg, exit_code, stderr)
+                
+
+        chart_dir = Path(templates_dir) / 'chart'
+        helm_command = f"helm upgrade --install {name} {chart_dir} -f {chart_dir}/values.yaml"
+        
+        logger.info(f"Installing {name} deployment")
+        stdout, stderr, exit_code = CommandRunner.run_simple(helm_command)
+        if exit_code != 0:
+            error_msg = f"Helm installation failed with exit code {exit_code}"
+            if stderr.strip():
+                error_msg += f"\nError output:\n{stderr}"
+            raise DeploymentError(error_msg, exit_code, stderr)
+
     
     def _validate_compose_file(self, compose_file: Path) -> None:
         """Validate compose file syntax"""

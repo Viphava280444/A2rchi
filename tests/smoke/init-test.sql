@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS users (
     theme VARCHAR(20) NOT NULL DEFAULT 'system',
     preferred_model VARCHAR(200),          -- Override global default
     preferred_temperature NUMERIC(3,2),    -- Override global default
+    ab_participation_rate NUMERIC(3,2),    -- Per-user A/B sampling override
     preferred_max_tokens INTEGER,          -- Override global default
     preferred_num_documents INTEGER,       -- Override retrieval count
     preferred_condense_prompt VARCHAR(100), -- Prompt selection
@@ -125,6 +126,7 @@ CREATE TABLE IF NOT EXISTS static_config (
     data_manager_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     archi_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     global_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+    mcp_servers_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     
     -- Timestamps
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -380,7 +382,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     context TEXT NOT NULL DEFAULT '',
     
     ts TIMESTAMP NOT NULL,
-    
+
     conf_id INTEGER REFERENCES configs(config_id)
 );
 
@@ -499,6 +501,36 @@ CREATE INDEX IF NOT EXISTS idx_ab_comparisons_models ON ab_comparisons(model_a, 
 CREATE INDEX IF NOT EXISTS idx_ab_comparisons_preference ON ab_comparisons(preference) WHERE preference IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_ab_comparisons_pending ON ab_comparisons(conversation_id) WHERE preference IS NULL;
 
+CREATE TABLE IF NOT EXISTS ab_agent_specs (
+    spec_id SERIAL PRIMARY KEY,
+    filename VARCHAR(255) NOT NULL UNIQUE,
+    current_name VARCHAR(255) NOT NULL UNIQUE,
+    current_version_id INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    last_saved_by VARCHAR(200)
+);
+
+CREATE TABLE IF NOT EXISTS ab_agent_spec_versions (
+    version_id SERIAL PRIMARY KEY,
+    spec_id INTEGER NOT NULL REFERENCES ab_agent_specs(spec_id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    tools TEXT[] NOT NULL DEFAULT '{}',
+    prompt TEXT NOT NULL,
+    content TEXT NOT NULL,
+    ab_only BOOLEAN NOT NULL DEFAULT FALSE,
+    content_hash VARCHAR(64) NOT NULL,
+    prompt_hash VARCHAR(64) NOT NULL,
+    source_type VARCHAR(50) NOT NULL DEFAULT 'ui',
+    source_path TEXT,
+    created_by VARCHAR(200),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    UNIQUE (spec_id, version_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ab_agent_spec_versions_spec ON ab_agent_spec_versions(spec_id, version_number DESC);
+
 -- ============================================================================
 -- 9. MIGRATION STATE (for resumable migrations)
 -- ============================================================================
@@ -543,6 +575,45 @@ GRANT SELECT ON
     migration_state
 TO grafana;
 
+
+-- ============================================================================
+-- PLAYBOOKS (user-authored playbook library) — mirrors src/cli/templates/init.sql
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS playbooks (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL,
+    description TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    owner_id    VARCHAR(200) NOT NULL,
+    visibility  VARCHAR(10) NOT NULL DEFAULT 'private',
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_playbooks_owner_name ON playbooks(owner_id, name);
+CREATE INDEX IF NOT EXISTS idx_playbooks_owner ON playbooks(owner_id);
+CREATE INDEX IF NOT EXISTS idx_playbooks_public ON playbooks(visibility) WHERE visibility = 'public';
+
+-- ============================================================================
+-- CONVERSATION PLAYBOOK TURNS (per-turn playbook tracking side table)
+-- mirrors src/cli/templates/init.sql
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS conversation_playbook_turns (
+    message_id    INTEGER PRIMARY KEY REFERENCES conversations(message_id) ON DELETE CASCADE,
+    playbook_name VARCHAR(100) NOT NULL,
+    playbook_id   INTEGER,
+    created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS user_enabled_playbooks (
+    user_id     VARCHAR(200) NOT NULL,
+    playbook_id INTEGER NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, playbook_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_enabled_playbooks_user ON user_enabled_playbooks(user_id);
 
 -- ============================================================================
 -- NOTES

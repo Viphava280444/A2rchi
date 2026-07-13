@@ -28,6 +28,7 @@ The primary user-facing service. Provides a web-based chat application for inter
 - Settings panel for model/provider selection
 - [BYOK](models_providers.md#bring-your-own-key-byok) support
 - Conversation history
+- [Service Status Board & Alert Banners](#service-status-board--alert-banners)
 
 ### Configuration
 
@@ -49,6 +50,109 @@ services:
 ```bash
 archi create [...] --services chatbot
 ```
+
+---
+
+## Service Status Board & Alert Banners
+
+The Service Status Board (SSB) is a built-in feature of the Chat Interface that lets designated operators communicate service health, planned downtime, known issues, and general announcements directly to all users — without external tooling.
+
+### How It Works
+
+**Alert banners** appear as colour-coded strips at the top of every page in the chat app. Up to 5 active alerts are displayed at once. Each banner can be individually dismissed by the user client-side. A **details** link redirects to the full status board.
+
+The **Status Board** at `/ssb/status` provides:
+
+- **Active Alerts** — non-expired alerts with severity badges, creator, and timestamp
+- **Expired Alerts** — historical record shown at reduced opacity
+- **Post New Alert form** — visible only to configured alert managers
+
+### Severity Levels
+
+| Severity | Colour | Intended Use |
+|----------|--------|--------------|
+| `alarm` | Red | Service outage or critical failure |
+| `warning` | Amber | Degraded performance, elevated error rate |
+| `news` | Blue | Release notes, planned maintenance |
+| `info` | Slate | General informational notices |
+
+### Creating and Deleting Alerts
+
+Navigate to **Status** in the main chat header (or go to `/ssb/status` directly). The **Post New Alert** form is shown to users who have alert manager access. Fill in:
+
+- **Message** (required) — short text shown in the banner
+- **Severity** (required) — one of `alarm`, `warning`, `news`, `info`
+- **Description** (optional) — longer explanation shown only on the status page
+- **Expires at** (optional) — datetime after which the alert is hidden from banners; expired alerts remain visible in the status board history
+
+To delete an alert, click the **Delete** button on its card on the status board. Deletion is permanent.
+
+Alerts can also be created via the REST API:
+
+```bash
+curl -X POST http://localhost:7861/api/ssb/alerts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "severity": "warning",
+    "message": "Embedding pipeline running — responses may be slower than usual",
+    "description": "Optional longer explanation shown on the status board.",
+    "expires_in_hours": 4
+  }'
+```
+
+Or with an explicit expiry timestamp:
+
+```bash
+curl -X POST http://localhost:7861/api/ssb/alerts \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "severity": "alarm",
+    "message": "Model backend unavailable",
+    "expires_at": "2026-02-21T18:00:00"
+  }'
+```
+
+### API Endpoints
+
+| Method | Route | Auth Required | Description |
+|--------|-------|---------------|-------------|
+| `GET` | `/ssb/status` | Any authenticated user | Render the status board page |
+| `POST` | `/api/ssb/alerts` | Alert managers only | Create a new alert |
+| `DELETE` | `/api/ssb/alerts/<id>` | Alert managers only | Delete an alert by ID |
+
+### Access Control
+
+Alert managers are configured via `services.chat_app.alerts.managers` (username list) or the `alerts:manage` RBAC permission. The rules are:
+
+1. **Auth disabled** → everyone may create and delete alerts.
+2. **Auth enabled** → a user is an alert manager if **either**:
+    - their username is in the `alerts.managers` list, **or**
+    - their session roles grant the `alerts:manage` permission.
+3. **Auth enabled, no username match, no `alerts:manage` permission** → nobody may manage (safe default; a warning is logged).
+
+All users can always *view* alerts and the status board regardless of access level.
+
+```yaml
+# Username-based access (backwards compatible):
+services:
+  chat_app:
+    alerts:
+      managers:
+        - alice
+        - bob
+
+# Role-based access (can be combined with the above):
+services:
+  chat_app:
+    auth:
+      auth_roles:
+        roles:
+          ops-team:
+            permissions:
+              - alerts:manage
+```
+
+See [Configuration → `services.chat_app.alerts`](configuration.md#serviceschat_appalerts) for the full reference.
 
 ---
 
@@ -169,6 +273,57 @@ SENDER_PW=...
 
 ```bash
 archi create [...] --services chatbot,redmine-mailer
+```
+
+---
+
+## Jira Ticket Responder Service
+
+Polls configured Jira projects for recently updated tickets in the configured eligible statuses, answers tickets that do not already contain a comment from the Jira ticket responder account, and posts the answer as a role-restricted Jira comment for operators to approve.
+
+### Configuration
+
+```yaml
+services:
+  jira_ticket_responder:
+    url: https://its.cern.ch/jira/
+    projects:
+      - CMSTZ
+      - CMSDM
+    visible_to_role: Developers
+    poll_interval_minutes: 1  # Optional; defaults to 1.
+    lookback_days: 7          # Optional; defaults to 7.
+    eligible_statuses:        # Optional; defaults to ["Open", "In Progress"].
+      - Open
+      - In Progress
+```
+
+The `jira_ticket_responder` service uses `services.jira_ticket_responder` only. Do not add `enabled`; process enablement is controlled by `--services jira_ticket_responder`.
+
+### Behavior
+
+- Each poll searches configured projects and `eligible_statuses` with a rolling Jira JQL window of `updated >= "-<lookback_days>d"`, so tickets updated while the service was down are still considered while they remain in the configured lookback window.
+- The service checks Jira comments newest-first by author identity and skips the ticket as soon as it finds a comment from the ticket responder account. Existing comments are not included in the Archi prompt at the moment.
+- There is no per-poll answer cap. This MVP is intended for low-volume projects; Jira, Archi, or provider rate failures are logged per ticket and retried only by a later poll while the ticket remains in the configured lookback window and has no comment from the ticket responder account.
+- Jira comments include the Archi answer and, when Archi returns them, capped Jira wiki-rendered `{panel}` sections for reasoning trace and tool calls. The service uses standard Jira wiki panels and `{noformat}` blocks, not collapsible expand macros.
+- The Jira comment is posted before conversation persistence. If posting fails, nothing is persisted; if persistence fails after posting, the Jira comment remains.
+
+### Secrets
+
+```bash
+JIRA_TICKET_RESPONDER_PAT=...
+PG_PASSWORD=...
+# Add the API key required by the resolved Archi provider, such as OPENAI_API_KEY.
+```
+
+`JIRA_PAT` is used by the Jira data source for read-only ingestion. `JIRA_TICKET_RESPONDER_PAT` is used by the ticket responder service to browse issues and add restricted comments. Use distinct Jira accounts for least privilege, and keep the ticket responder token tied to a dedicated account because any comment from that account is treated as an existing responder answer.
+
+Include any provider key required by the resolved Archi provider in the `.env` passed to `archi create` so it is copied into the deployment. Provider key validation is handled by Archi during agent startup.
+
+### Running
+
+```bash
+archi create [...] --services chatbot,jira_ticket_responder
 ```
 
 ---
