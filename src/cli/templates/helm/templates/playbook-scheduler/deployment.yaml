@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ name }}-playbook-scheduler
+  labels:
+    app: {{ name }}-playbook-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ name }}-playbook-scheduler
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: {{ name }}-playbook-scheduler
+      annotations:
+        rollout-timestamp: {{ "{{ now | quote }}" }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: {{ name }}-playbook-scheduler
+          image: {{ "{{ .Values.chat.image }}" }}
+          args: ["bash", "-lc", "python -u src/bin/service_playbook_scheduler.py"]
+          envFrom:
+            - secretRef:
+                name: {{ name }}-secrets
+          env:
+            - name: PGDATABASE
+              value: archi-db
+            - name: PGHOST
+              value: {{ name }}-postgres
+            - name: PGPORT
+              value: "{{ "{{ .Values.postgres.port }}" }}"
+            - name: PGUSER
+              value: archi
+            - name: VERBOSITY
+              value: "{{ "{{ .Values.verbosity }}" }}"
+          volumeMounts:
+            - mountPath: /root/archi/configs
+              name: {{ name }}-chat-config
+      restartPolicy: Always
+      volumes:
+        - configMap:
+            name: {{ name }}-chat-config
+          name: {{ name }}-chat-config
