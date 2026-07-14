@@ -57,7 +57,7 @@ test.describe('Schedules Settings', () => {
           }] },
         });
       }
-      return route.continue();
+      return route.fallback();
     });
     await openSchedules(page);
     await page.locator('[data-action="run"]').click();
