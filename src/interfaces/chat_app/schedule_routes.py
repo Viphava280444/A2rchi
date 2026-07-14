@@ -132,7 +132,9 @@ def update_schedule(schedule_id):
         owner, err = _resolve_owner(data.get("client_id"))
         if err:
             return err
-        fields = {k: v for k, v in data.items() if k != "client_id"}
+        # playbook_id rides along from the editor payload but the binding is
+        # immutable by design — strip it with client_id rather than 400ing.
+        fields = {k: v for k, v in data.items() if k not in ("client_id", "playbook_id")}
         s = _svc().update_schedule(owner, schedule_id, **fields)
         return jsonify({"success": True, "schedule": _serialize(s)}), 200
     except ScheduleNotFoundError as exc:

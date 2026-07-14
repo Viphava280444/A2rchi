@@ -146,6 +146,23 @@ def test_patch_cannot_smuggle_owner_id():
     assert svc.update_schedule.call_args == call("owner-1", 3, owner_id="victim", enabled=False)
 
 
+def test_patch_tolerates_editor_payload_with_playbook_id():
+    # The schedule editor always includes playbook_id in its save payload
+    # (the field is required for create), even in edit mode where the
+    # binding is immutable. The route must strip it like client_id rather
+    # than forwarding it to the service and 400ing on "Unknown fields".
+    svc = MagicMock()
+    svc.update_schedule.return_value = _schedule(name="renamed")
+    client = _make_app(svc=svc).test_client()
+
+    resp = client.patch("/api/schedules/3", json={
+        "client_id": "c1", "playbook_id": 7, "name": "renamed", "cron": "0 8 * * *",
+    })
+
+    assert resp.status_code == 200
+    svc.update_schedule.assert_called_once_with("owner-1", 3, name="renamed", cron="0 8 * * *")
+
+
 def test_delete_schedule_owner_scoped_happy_path():
     svc = MagicMock()
     client = _make_app(svc=svc).test_client()

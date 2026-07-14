@@ -63,4 +63,32 @@ test.describe('Schedules Settings', () => {
     await page.locator('[data-action="run"]').click();
     await expect(page.locator('#schedules-status')).toContainText(/queued/i);
   });
+
+  test('editing a schedule PATCHes without playbook_id rejection', async ({ page }) => {
+    await page.route('**/api/schedules**', (route) => {
+      if (route.request().method() === 'GET' && !route.request().url().includes('/runs')) {
+        return route.fulfill({
+          status: 200,
+          json: { schedules: [{
+            id: 1, name: 'daily-transfers', playbook_id: 7, cron: '0 7 * * *',
+            timezone: 'UTC', mode: 'digest', recipients: ['ops@cern.ch'],
+            enabled: true, consecutive_failures: 0,
+            next_run_at: '2026-07-15T05:00:00+00:00',
+          }] },
+        });
+      }
+      return route.fallback();
+    });
+    await openSchedules(page);
+    await page.locator('[data-action="edit"]').click();
+    await expect(page.locator('.schedule-modal')).toBeVisible();
+    await page.locator('#schedule-name').fill('renamed');
+
+    const [request] = await Promise.all([
+      page.waitForRequest((r) => r.url().includes('/api/schedules/1') && r.method() === 'PATCH'),
+      page.locator('.schedule-save').click(),
+    ]);
+    expect(request.postDataJSON().name).toBe('renamed');
+    await expect(page.locator('.schedule-modal')).toBeHidden();
+  });
 });
