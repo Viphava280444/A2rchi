@@ -7,10 +7,12 @@ import pytest
 from psycopg2 import errors as pg_errors
 
 from src.utils.playbook_schedule_service import (
+    RUN_STATUSES,
     PlaybookSchedule,
     PlaybookScheduleService,
     ScheduleConflictError,
     ScheduleNotFoundError,
+    ScheduleRun,
     ScheduleValidationError,
 )
 
@@ -448,7 +450,6 @@ class TestClaimDue:
         now = datetime(2026, 7, 14, 7, 0, 30, tzinfo=UTC)
         due = self._schedule_row(datetime(2026, 7, 14, 7, 0, tzinfo=UTC))
         cur = FakeCursor(fetchall_values=[[due]], fetchone_values=[due])
-        cur.rowcount = 1
         svc, conn = make_service(cur, monkeypatch)
 
         claimed = svc.claim_due_schedules(now, catchup_window_minutes=60)
@@ -464,7 +465,6 @@ class TestClaimDue:
         now = datetime(2026, 7, 14, 3, 0, tzinfo=UTC)
         due = self._schedule_row(datetime(2026, 7, 14, 7, 0, tzinfo=UTC), manual=True)
         cur = FakeCursor(fetchall_values=[[due]], fetchone_values=[due])
-        cur.rowcount = 1
         svc, _ = make_service(cur, monkeypatch)
 
         claimed = svc.claim_due_schedules(now, catchup_window_minutes=60)
@@ -475,7 +475,6 @@ class TestClaimDue:
         now = datetime(2026, 7, 14, 7, 0, 30, tzinfo=UTC)
         due = self._schedule_row(datetime(2026, 7, 14, 7, 0, tzinfo=UTC))
         cur = FakeCursor(fetchall_values=[[due]], fetchone_values=[])  # UPDATE returns no row
-        cur.rowcount = 0
         svc, _ = make_service(cur, monkeypatch)
 
         assert svc.claim_due_schedules(now, catchup_window_minutes=60) == []
@@ -484,12 +483,27 @@ class TestClaimDue:
         now = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)  # 5h late, window 60min
         due = self._schedule_row(datetime(2026, 7, 14, 7, 0, tzinfo=UTC))
         cur = FakeCursor(fetchall_values=[[due]], fetchone_values=[due])
-        cur.rowcount = 1
         svc, _ = make_service(cur, monkeypatch)
 
         claimed = svc.claim_due_schedules(now, catchup_window_minutes=60)
 
         assert claimed == []  # advanced silently, no run returned
+
+    def test_claim_rolls_back_when_compute_next_run_raises(self, monkeypatch):
+        now = datetime(2026, 7, 14, 7, 0, 30, tzinfo=UTC)
+        bad_tz_row = (
+            1, "owner-1", 7, "daily", "0 7 * * *", "Mars/Olympus", "digest",
+            json.dumps(["a@cern.ch"]), None, None, True, False, 0,
+            None, datetime(2026, 7, 14, 7, 0, tzinfo=UTC), None, None,
+        )
+        cur = FakeCursor(fetchall_values=[[bad_tz_row]])
+        svc, conn = make_service(cur, monkeypatch)
+
+        with pytest.raises(Exception):
+            svc.claim_due_schedules(now, catchup_window_minutes=60)
+
+        assert conn.rolled_back is True
+        assert conn.committed is False
 
 
 class TestRunBookkeeping:
@@ -534,3 +548,78 @@ class TestRunBookkeeping:
         assert n == 2
         sql, _ = cur.statements[-1]
         assert "status = 'failed'" in sql and "status = 'running'" in sql
+
+    # ---- finalize_run ----
+
+    def test_finalize_run_rejects_unknown_status(self, monkeypatch):
+        cur = FakeCursor()
+        svc, _ = make_service(cur, monkeypatch)
+
+        with pytest.raises(ScheduleValidationError):
+            svc.finalize_run(1, status="exploded")
+
+        assert cur.statements == []
+
+    def test_finalize_run_updates_row_with_coalesce_backfill(self, monkeypatch):
+        cur = FakeCursor()
+        svc, conn = make_service(cur, monkeypatch)
+
+        svc.finalize_run(99, status="success", verdict_notify=True, email_sent=True,
+                         conversation_id=42, playbook_name="check-rates")
+
+        sql, params = cur.statements[-1]
+        assert "COALESCE(%s, playbook_name)" in sql
+        assert "finished_at = NOW()" in sql
+        assert "check-rates" in params
+        assert 99 in params
+        assert conn.committed
+
+    def test_finalize_run_accepts_all_run_statuses(self, monkeypatch):
+        for status in RUN_STATUSES:
+            cur = FakeCursor()
+            svc, conn = make_service(cur, monkeypatch)
+
+            svc.finalize_run(1, status=status)
+
+            assert conn.committed
+
+    # ---- list_runs ----
+
+    def test_list_runs_is_owner_scoped_and_capped(self, monkeypatch):
+        cur = FakeCursor()
+        svc, _ = make_service(cur, monkeypatch)
+
+        svc.list_runs("owner-1", 3, limit=500)
+
+        sql, params = cur.statements[0]
+        assert "WHERE schedule_id = %s AND owner_id = %s" in sql
+        assert params == (3, "owner-1", 200)
+
+    def test_list_runs_maps_rows_to_schedule_run(self, monkeypatch):
+        row = (
+            1, 3, "daily", "check-rates", "owner-1", "cron", "success", True,
+            True, None, '["a@cern.ch"]', 42, None, None, None,
+        )
+        cur = FakeCursor(fetchall_values=[[row]])
+        svc, _ = make_service(cur, monkeypatch)
+
+        result = svc.list_runs("owner-1", 3)
+
+        assert len(result) == 1
+        run = result[0]
+        assert isinstance(run, ScheduleRun)
+        assert run.id == 1
+        assert run.schedule_id == 3
+        assert run.schedule_name == "daily"
+        assert run.playbook_name == "check-rates"
+        assert run.owner_id == "owner-1"
+        assert run.trigger == "cron"
+        assert run.status == "success"
+        assert run.verdict_notify is True
+        assert run.email_sent is True
+        assert run.email_error is None
+        assert run.recipients == ["a@cern.ch"]
+        assert run.conversation_id == 42
+        assert run.error is None
+        assert run.started_at is None
+        assert run.finished_at is None

@@ -457,6 +457,9 @@ class PlaybookScheduleService:
                     claimed.append((self._row_to_schedule(won), trigger))
             conn.commit()
             return claimed
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             self._release_connection(conn)
 
