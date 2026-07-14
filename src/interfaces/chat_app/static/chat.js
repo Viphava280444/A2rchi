@@ -5651,11 +5651,13 @@ const Chat = {
       list.innerHTML = '<p class="schedules-empty">No schedules yet. Create one to run a playbook automatically.</p>';
       return;
     }
-    list.innerHTML = this.schedules.map((s) => `
+    list.innerHTML = this.schedules.map((s) => {
+      const modeClass = { digest: 'digest', alert: 'alert' }[s.mode] || 'unknown';
+      return `
       <div class="schedule-card" data-id="${s.id}">
         <div class="schedule-card-main">
           <span class="schedule-card-name">${Utils.escapeHtml(s.name)}</span>
-          <span class="schedule-card-mode schedule-card-mode--${s.mode}">${s.mode}</span>
+          <span class="schedule-card-mode schedule-card-mode--${modeClass}">${Utils.escapeHtml(s.mode)}</span>
           <span class="schedule-card-cron">${Utils.escapeHtml(s.cron)} (${Utils.escapeHtml(s.timezone)})</span>
         </div>
         <div class="schedule-card-meta">
@@ -5671,7 +5673,8 @@ const Chat = {
           <button type="button" data-action="delete">Delete</button>
         </div>
         <div class="schedule-runs" hidden></div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
 
     list.querySelectorAll('.schedule-card').forEach((card) => {
       const id = Number(card.dataset.id);
@@ -5707,14 +5710,17 @@ const Chat = {
     try {
       const data = await API.getScheduleRuns(id);
       const runs = data?.runs || [];
-      drawer.innerHTML = runs.length ? runs.map((r) => `
-        <div class="schedule-run-row schedule-run-row--${r.status}">
+      drawer.innerHTML = runs.length ? runs.map((r) => {
+        const statusClass = ['running', 'success', 'suppressed', 'verdict_unparsed', 'failed', 'skipped_overlap'].includes(r.status) ? r.status : 'unknown';
+        return `
+        <div class="schedule-run-row schedule-run-row--${statusClass}">
           <span>${Utils.escapeHtml(r.started_at || '')}</span>
           <span>${Utils.escapeHtml(r.status)}${r.trigger === 'manual' ? ' (manual)' : ''}</span>
           <span>${r.email_sent ? 'emailed' : (r.status === 'suppressed' ? 'suppressed' : 'no email')}</span>
           ${r.conversation_id ? `<a href="#" data-conversation="${r.conversation_id}">open run</a>` : ''}
-          ${r.error ? `<span class="schedule-run-error" title="${Utils.escapeHtml(r.error)}">error</span>` : ''}
-        </div>`).join('') : '<p class="schedules-empty">No runs yet.</p>';
+          ${r.error ? `<span class="schedule-run-error" title="${Utils.escapeAttr(r.error)}">error</span>` : ''}
+        </div>`;
+      }).join('') : '<p class="schedules-empty">No runs yet.</p>';
       drawer.hidden = false;
       drawer.querySelectorAll('[data-conversation]').forEach((a) => {
         a.addEventListener('click', (e) => {
@@ -5743,7 +5749,8 @@ const Chat = {
         .map((p) => `<option value="${p.id}">${Utils.escapeHtml(p.name)}</option>`)
         .join('');
     } catch (err) {
-      this._scheduleStatus(`Could not load playbooks: ${err.message}`);
+      const editorStatus = document.getElementById('schedule-editor-status');
+      if (editorStatus) editorStatus.textContent = `Could not load playbooks: ${err.message}`;
     }
     document.getElementById('schedule-name').value = schedule?.name || '';
     document.getElementById('schedule-cron').value = schedule?.cron || '0 7 * * *';
