@@ -4,24 +4,36 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+from psycopg2 import errors as pg_errors
 
 from src.utils.playbook_schedule_service import (
     PlaybookSchedule,
     PlaybookScheduleService,
+    ScheduleConflictError,
     ScheduleNotFoundError,
     ScheduleValidationError,
 )
 
 
 class FakeCursor:
-    def __init__(self, fetchone_values=None, fetchall_values=None):
+    def __init__(self, fetchone_values=None, fetchall_values=None, raise_on_sql_prefix=None):
+        """raise_on_sql_prefix: optional (prefix, exception_instance) tuple. When
+        set, execute() raises that exception the first time a normalized SQL
+        statement starts with `prefix` — used to simulate a DB-level error (e.g.
+        a UniqueViolation) on a specific statement without touching real psycopg2."""
         self.statements = []
         self._fetchone = list(fetchone_values or [])
         self._fetchall = list(fetchall_values or [])
         self.rowcount = 1
+        self._raise_on_sql_prefix = raise_on_sql_prefix
 
     def execute(self, sql, params=None):
-        self.statements.append((" ".join(sql.split()), params))
+        normalized = " ".join(sql.split())
+        self.statements.append((normalized, params))
+        if self._raise_on_sql_prefix is not None:
+            prefix, exc = self._raise_on_sql_prefix
+            if normalized.startswith(prefix):
+                raise exc
 
     def fetchone(self):
         return self._fetchone.pop(0) if self._fetchone else None
@@ -200,6 +212,23 @@ class TestCreateSchedule:
         with pytest.raises(ScheduleValidationError, match="Maximum"):
             svc.create_schedule("owner-1", 7, "one-more", "0 7 * * *", "UTC", "digest", ["a@cern.ch"])
 
+    def test_create_schedule_name_conflict_maps_to_conflict_error(self, monkeypatch):
+        cur = FakeCursor(
+            fetchone_values=[(0,)],  # quota count
+            raise_on_sql_prefix=("INSERT INTO playbook_schedules",
+                                 pg_errors.UniqueViolation()),
+        )
+        svc, conn = make_service(cur, monkeypatch)
+
+        with pytest.raises(ScheduleConflictError, match="daily-transfers"):
+            svc.create_schedule(
+                "owner-1", 7, "daily-transfers", "0 7 * * *", "Europe/Zurich",
+                "digest", ["ops@cern.ch"],
+            )
+
+        assert conn.rolled_back
+        assert not conn.committed
+
 
 class TestCrudMethods:
     @staticmethod
@@ -328,6 +357,21 @@ class TestCrudMethods:
         update_sql = next(sql for sql, _ in cur.statements
                            if sql.startswith("UPDATE playbook_schedules"))
         assert "consecutive_failures = 0" in update_sql
+
+    def test_update_schedule_name_conflict_maps_to_conflict_error(self, monkeypatch):
+        current_row = self._row()  # consumed by the internal get_schedule
+        cur = FakeCursor(
+            fetchone_values=[current_row],
+            raise_on_sql_prefix=("UPDATE playbook_schedules",
+                                 pg_errors.UniqueViolation()),
+        )
+        svc, conn = make_service(cur, monkeypatch)
+
+        with pytest.raises(ScheduleConflictError, match="taken-name"):
+            svc.update_schedule("owner-1", 1, name="taken-name")
+
+        assert conn.rolled_back
+        assert not conn.committed
 
     # ---- delete_schedule ----
 
