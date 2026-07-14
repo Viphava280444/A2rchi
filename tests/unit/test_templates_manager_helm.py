@@ -1,9 +1,7 @@
 """_stage_service_artifacts must tolerate services that ship no service.yaml
 (headless workers like playbook-scheduler expose no ports)."""
-from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 from jinja2 import TemplateNotFound
 
 
@@ -34,3 +32,8 @@ def test_scheduler_helm_deployment_template_exists_and_renders():
     assert "demo-playbook-scheduler" in out
     assert "{{ .Values.chat.image }}" in out          # Helm-side reference survives
     assert "service_playbook_scheduler.py" in out
+    # parity mounts: worker runs a full ChatWrapper() and needs the same
+    # agents/skills/prompts/tools ConfigMap volumes as the chatbot Deployment
+    assert "demo-chat-agents" in out
+    assert "demo-chat-skills" in out
+    assert "/root/archi/agents" in out
