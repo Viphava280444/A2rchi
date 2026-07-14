@@ -1,6 +1,4 @@
 """parse_verdict: last fenced JSON block wins; anything malformed → None."""
-import pytest
-
 from src.interfaces.playbook_scheduler.verdict import VERDICT_INSTRUCTION, parse_verdict
 
 
@@ -49,5 +47,17 @@ def test_empty_and_none_inputs():
     assert parse_verdict(None) is None
 
 
+def test_uncoercible_notify_returns_none():
+    for v in ('"banana"', '5', 'null', '[1]'):
+        assert parse_verdict(_wrap('{"notify": ' + v + '}')) is None
+
+
+def test_wrong_typed_or_empty_subject_summary_become_none():
+    v = parse_verdict(_wrap('{"notify": true, "subject": 123, "summary": ""}'))
+    assert v == {"notify": True, "subject": None, "summary": None}
+
+
 def test_instruction_mentions_the_contract():
     assert "```json" in VERDICT_INSTRUCTION and '"notify"' in VERDICT_INSTRUCTION
+    assert "only if the condition" in VERDICT_INSTRUCTION
+    assert "always-send digests" in VERDICT_INSTRUCTION
