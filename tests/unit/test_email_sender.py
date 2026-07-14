@@ -1,6 +1,5 @@
 """EmailSender — mocked smtplib, no network."""
 from email import message_from_string
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -24,6 +23,7 @@ class FakeSMTP:
         self.server, self.port = server, port
         self.sent = []
         self.fail_times = FakeSMTP.fail_times
+        self.quit_called = False
         FakeSMTP.instances.append(self)
 
     fail_times = 0
@@ -42,6 +42,13 @@ class FakeSMTP:
 
     def quit(self):
         pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.quit_called = True
+        return False
 
 
 @pytest.fixture(autouse=True)
@@ -89,3 +96,33 @@ def test_html_render_failure_still_sends_plain(sender, monkeypatch):
     msg = message_from_string(raw)
     parts = {p.get_content_type() for p in msg.walk()}
     assert "text/plain" in parts
+
+
+def test_failed_attempt_still_closes_connection(sender):
+    FakeSMTP.fail_times = 1
+    sender.send(["a@cern.ch"], "s", "body")
+    assert len(FakeSMTP.instances) == 2
+    assert all(instance.quit_called is True for instance in FakeSMTP.instances)
+
+
+def test_subject_crlf_is_collapsed(sender):
+    sender.send(["a@cern.ch"], "hi\r\nBcc: evil@x.com", "body")
+    raw = FakeSMTP.instances[-1].sent[0][2]
+    msg = message_from_string(raw)
+    assert "\r" not in msg["Subject"]
+    assert "\n" not in msg["Subject"]
+    assert msg["Bcc"] is None
+
+
+def test_recipient_with_crlf_is_rejected(sender):
+    from src.utils.email_sender import EmailSendError
+    with pytest.raises(EmailSendError):
+        sender.send(["a@cern.ch\r\nBcc: evil@x.com"], "s", "body")
+    assert FakeSMTP.instances == []
+
+
+def test_empty_recipients_raises_before_smtp(sender):
+    from src.utils.email_sender import EmailSendError
+    with pytest.raises(EmailSendError):
+        sender.send([], "s", "body")
+    assert FakeSMTP.instances == []

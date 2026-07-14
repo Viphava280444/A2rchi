@@ -21,6 +21,11 @@ class EmailSendError(Exception):
     pass
 
 
+def _header_safe(value: str) -> str:
+    """Collapse CR/LF so a dynamic value can never fold into extra MIME headers."""
+    return str(value).replace("\r", " ").replace("\n", " ")
+
+
 def _render_html(markdown_text: str) -> str:
     import markdown  # optional at runtime; images ship it via requirements-base
 
@@ -56,15 +61,14 @@ class EmailSender:
 
         msg = MIMEMultipart("alternative")
         msg["To"] = ", ".join(recipients)
-        msg["Subject"] = subject
+        msg["Subject"] = _header_safe(subject)
         if self.from_display_name:
             from email.utils import formataddr
-            msg["From"] = formataddr((self.from_display_name, self.user))
+            msg["From"] = formataddr((_header_safe(self.from_display_name), self.user))
         if self.reply_to:
             msg.add_header("reply-to", self.reply_to)
         msg.attach(MIMEText(plain, "plain"))
         try:
-            html_body = plain if banner else (body_markdown or "")
             html = _render_html(
                 (f"**{banner}**\n\n" if banner else "") + (body_markdown or "")
                 + (f"\n\n---\n*{footer}*" if footer else "")
@@ -78,15 +82,17 @@ class EmailSender:
              banner: Optional[str] = None, footer: Optional[str] = None) -> None:
         if not recipients:
             raise EmailSendError("No recipients")
+        for addr in recipients:
+            if "\r" in addr or "\n" in addr:
+                raise EmailSendError(f"Invalid recipient address: {addr!r}")
         msg = self._build(recipients, subject, body_markdown, banner, footer)
         last_exc = None
         for attempt in (1, 2):
             try:
-                server = smtplib.SMTP(self.server_name, self.port)
-                server.starttls()
-                server.login(self.user, self.password)
-                server.sendmail(self.user, list(recipients), msg.as_string())
-                server.quit()
+                with smtplib.SMTP(self.server_name, self.port) as server:
+                    server.starttls()
+                    server.login(self.user, self.password)
+                    server.sendmail(self.user, list(recipients), msg.as_string())
                 logger.info("Sent schedule mail to %s (subject: %s)", recipients, subject)
                 return
             except Exception as exc:
