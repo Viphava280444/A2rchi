@@ -199,6 +199,47 @@ PostgreSQL database settings.
 
 ---
 
+## Playbook scheduler
+
+Opt-in service (`--services chatbot,playbook-scheduler`) that runs playbooks on cron
+schedules and emails the results. Requires the `SENDER_SERVER`, `SENDER_PORT`,
+`SENDER_REPLYTO`, `SENDER_USER`, `SENDER_PW` secrets (same SMTP identity as the
+Redmine mailer) and the chatbot service, since it reuses the chat image and pipeline
+in-process (`src/bin/service_playbook_scheduler.py` builds its own `ChatWrapper`).
+
+```yaml
+services:
+  playbook_scheduler:
+    poll_interval_seconds: 30      # how often the worker checks for due schedules
+    run_timeout_seconds: 600       # soft per-run timeout (bookkeeping)
+    catchup_window_minutes: 60     # run a missed fire once if this recent, else skip
+    max_schedules_per_user: 10
+    min_interval_minutes: 5        # cron frequency floor
+    max_consecutive_failures: 3    # auto-disable threshold
+    default_timezone: UTC
+    allowed_recipient_domains: []  # e.g. [cern.ch]; empty allows any domain
+    email_from_display_name: "archi scheduler"
+    chat_base_url: ""              # if set, emails link the run conversation
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `poll_interval_seconds` | int | `30` | How often the worker checks for due schedules |
+| `run_timeout_seconds` | int | `600` | Soft per-run timeout; a run still executing past this is abandoned and marked failed |
+| `catchup_window_minutes` | int | `60` | A missed fire is run once if it is still this recent, otherwise it is skipped |
+| `max_schedules_per_user` | int | `10` | Cap on schedules a single user may create |
+| `min_interval_minutes` | int | `5` | Cron frequency floor — schedules that would fire more often are rejected |
+| `max_consecutive_failures` | int | `3` | Consecutive failed runs before a schedule is auto-disabled |
+| `default_timezone` | string | `UTC` | Timezone used when a schedule does not specify its own |
+| `allowed_recipient_domains` | list | `[]` | Email domain allowlist for recipients (for example `[cern.ch]`); empty allows any domain |
+| `email_from_display_name` | string | `archi scheduler` | Display name on outgoing emails |
+| `chat_base_url` | string | `""` | If set, emails link back to the run's conversation |
+
+Schedules themselves are managed per user in the chat UI (Settings → Schedules) and
+stored in Postgres; each run is saved as a conversation titled `[Scheduled] <name> — <time>`.
+
+---
+
 ## `data_manager`
 
 Controls data ingestion, vectorstore behaviour, and retrieval settings.

@@ -53,6 +53,7 @@ Archi provides these deployable services:
 | `piazza` | Piazza forum integration with Slack | — |
 | `redmine-mailer` | Redmine ticket responses via email | — |
 | `mattermost` | Mattermost channel integration | — |
+| `playbook-scheduler` | Runs playbooks on a cron schedule and emails the results | — |
 | `grafana` | Monitoring dashboard | 3000 |
 | `grader` | Automated grading service | 7862 |
 
@@ -78,6 +79,39 @@ Playbooks are per-user reusable instruction packs — the chat-side analog of ed
 - **Export/import** uses the Agent Skills `<name>/SKILL.md` zip layout, so playbooks are portable to and from claude.ai. Imports always arrive private.
 
 Public playbooks from other users are read-only and their content is fenced before the agent sees it. See the [API reference](api_reference.md#playbooks) for the REST endpoints.
+
+---
+
+## Scheduled Playbooks
+
+The playbook scheduler runs a playbook on a cron schedule and emails the result —
+for recurring digests (a daily MONIT summary) or threshold alerts ("email me only
+if the failure rate crosses 80%"). It's an opt-in service
+(`--services chatbot,playbook-scheduler`); see the
+[Configuration Reference](configuration.md#playbook-scheduler) for deployment setup.
+
+Create one from **Settings → Schedules → New schedule**: pick a playbook, a cron
+expression (or preset) with a timezone, recipient emails, and a mode — **Digest**
+always emails the answer; **Alert** emails only when the run's verdict says to.
+
+Every scheduled turn, either mode, has this instruction appended, requiring the
+final answer to end with a fenced JSON block in exactly this form:
+
+```json
+{"notify": true or false, "subject": "<short email subject>", "summary": "<1-2 sentence summary>"}
+```
+
+Digest ignores `notify` and always sends; alert sends only when `notify` is `true`.
+If an alert run's answer has no parseable verdict block, the scheduler **fails
+open** — it emails the raw output anyway with a banner flagging the unparseable
+verdict, but that run still counts as a failure. After `max_consecutive_failures`
+(default 3) in a row, the schedule auto-disables and its owner gets a one-time
+notice email; re-enable it from **Settings → Schedules** once fixed. Any success or
+suppressed run resets the count.
+
+Each schedule card has **Run now** (queues an immediate run, picked up within one
+poll interval) and **History** (past runs, whether each emailed, and an **open
+run** link straight into that run's conversation with its trace panel).
 
 ---
 
