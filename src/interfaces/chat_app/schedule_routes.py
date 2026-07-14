@@ -77,10 +77,10 @@ def _check_auth():
 
 @schedules_bp.route("/api/schedules", methods=["GET"])
 def list_schedules():
-    owner, err = _resolve_owner(request.args.get("client_id"))
-    if err:
-        return err
     try:
+        owner, err = _resolve_owner(request.args.get("client_id"))
+        if err:
+            return err
         if request.args.get("all") == "true" and _is_admin():
             return jsonify({"schedules": [_serialize_admin(s) for s in _svc().list_all_schedules()]})
         return jsonify({"schedules": [_serialize(s) for s in _svc().list_schedules(owner)]})

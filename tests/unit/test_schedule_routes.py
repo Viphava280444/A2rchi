@@ -1,11 +1,12 @@
 """Unit tests for the schedules REST Blueprint (schedule_routes.py)."""
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import flask
 import pytest
 
 from src.interfaces.chat_app.schedule_routes import register_schedules
+from src.utils.playbook_service import PlaybookNotFoundError
 from src.utils.playbook_schedule_service import (
     PlaybookSchedule,
     ScheduleNotFoundError,
@@ -98,6 +99,21 @@ def test_create_maps_validation_error_to_400():
     assert "bad cron" in resp.get_json()["error"]
 
 
+def test_create_denied_playbook_404s_and_never_creates():
+    svc = MagicMock()
+    playbook_svc = MagicMock()
+    playbook_svc.get_playbook.side_effect = PlaybookNotFoundError("Playbook 7 not found")
+    client = _make_app(svc=svc, playbook_svc=playbook_svc).test_client()
+
+    resp = client.post("/api/schedules", json={
+        "client_id": "c1", "playbook_id": 7, "name": "daily", "cron": "0 7 * * *",
+        "timezone": "UTC", "mode": "digest", "recipients": ["a@cern.ch"],
+    })
+
+    assert resp.status_code == 404
+    svc.create_schedule.assert_not_called()
+
+
 def test_missing_body_is_400():
     client = _make_app().test_client()
     resp = client.post("/api/schedules", data="not json",
@@ -110,6 +126,43 @@ def test_patch_maps_not_found_to_404():
     svc.update_schedule.side_effect = ScheduleNotFoundError("Schedule 9 not found")
     client = _make_app(svc=svc).test_client()
     resp = client.patch("/api/schedules/9", json={"client_id": "c1", "enabled": False})
+    assert resp.status_code == 404
+
+
+def test_patch_cannot_smuggle_owner_id():
+    # The route strips only client_id before forwarding fields to the service;
+    # owner_id would pass through as an ordinary field. The service's
+    # _UPDATABLE allowlist (see playbook_schedule_service.py) rejects it as an
+    # unknown field, so it can never replace the resolved owner argument.
+    svc = MagicMock()
+    svc.update_schedule.side_effect = ScheduleValidationError("Unknown fields: ['owner_id']")
+    client = _make_app(svc=svc).test_client()
+
+    resp = client.patch("/api/schedules/3", json={
+        "client_id": "c1", "owner_id": "victim", "enabled": False,
+    })
+
+    assert resp.status_code == 400
+    assert svc.update_schedule.call_args == call("owner-1", 3, owner_id="victim", enabled=False)
+
+
+def test_delete_schedule_owner_scoped_happy_path():
+    svc = MagicMock()
+    client = _make_app(svc=svc).test_client()
+
+    resp = client.delete("/api/schedules/5", json={"client_id": "c1"})
+
+    assert resp.status_code == 200
+    svc.delete_schedule.assert_called_once_with("owner-1", 5)
+
+
+def test_delete_schedule_not_found_maps_to_404():
+    svc = MagicMock()
+    svc.delete_schedule.side_effect = ScheduleNotFoundError("Schedule 5 not found")
+    client = _make_app(svc=svc).test_client()
+
+    resp = client.delete("/api/schedules/5", json={"client_id": "c1"})
+
     assert resp.status_code == 404
 
 
@@ -143,6 +196,21 @@ def test_owner_resolution_failure_short_circuits():
     )
     resp = app.test_client().get("/api/schedules?client_id=c1")
     assert resp.status_code == 400
+
+
+def test_list_schedules_resolve_owner_crash_maps_to_500():
+    def _raiser(cid):
+        raise RuntimeError("db down")
+
+    app = flask.Flask(__name__)
+    register_schedules(
+        app, auth_enabled=False, require_auth=_passthrough_auth,
+        resolve_owner=_raiser,
+        schedule_svc=MagicMock(), playbook_svc=MagicMock(), is_admin=lambda: False,
+    )
+    resp = app.test_client().get("/api/schedules?client_id=c1")
+    assert resp.status_code == 500
+    assert resp.get_json() == {"error": "Internal server error"}
 
 
 def test_register_schedules_is_per_app():
