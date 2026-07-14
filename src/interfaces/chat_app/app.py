@@ -72,6 +72,7 @@ from src.archi.pipelines.agents.tools.playbook_tools import (
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.playbook_routes import register_playbooks
+from src.interfaces.chat_app.schedule_routes import register_schedules
 from src.interfaces.chat_app.service_alerts import (
     register_service_alerts, get_active_banner_alerts, is_alert_manager,
 )
@@ -310,6 +311,18 @@ def _pooled_playbook_service(pg_config) -> PlaybookService:
     except Exception as exc:
         logger.debug("Pooled PlaybookService unavailable, using direct connections: %s", exc)
     return PlaybookService(pg_config=pg_config)
+
+
+_SCHEDULE_SVC_SINGLETON = None
+
+
+def _pooled_schedule_service(pg_config, limits):
+    """Process-wide PlaybookScheduleService for the REST layer."""
+    global _SCHEDULE_SVC_SINGLETON
+    if _SCHEDULE_SVC_SINGLETON is None:
+        from src.utils.playbook_schedule_service import PlaybookScheduleService
+        _SCHEDULE_SVC_SINGLETON = PlaybookScheduleService(pg_config=pg_config, limits=limits)
+    return _SCHEDULE_SVC_SINGLETON
 
 
 def _query_convo_history_rows(cursor, conversation_id):
@@ -2873,6 +2886,20 @@ class FlaskAppWrapper(object):
             playbook_svc=self._playbook_svc,
         )
 
+        # Playbook schedule endpoints (registered via Blueprint)
+        logger.info("Adding playbook schedule API endpoints")
+        register_schedules(
+            self.app,
+            auth_enabled=self.auth_enabled,
+            require_auth=self.require_auth,
+            resolve_owner=self._resolve_playbook_owner,
+            schedule_svc=self._schedule_svc,
+            playbook_svc=self._playbook_svc,
+            is_admin=self._is_admin_request,
+            default_timezone=(self.chat.services_config.get("playbook_scheduler", {}) or {})
+                .get("default_timezone", "UTC"),
+        )
+
         # Service status board endpoints (registered via Blueprint)
         logger.info("Adding service status board endpoints")
         register_service_alerts(
@@ -4262,6 +4289,16 @@ class FlaskAppWrapper(object):
     def _playbook_svc(self) -> PlaybookService:
         """PlaybookService for the REST/staging paths (pooled when possible)."""
         return _pooled_playbook_service(self.pg_config)
+
+    def _schedule_svc(self):
+        """PlaybookScheduleService for the REST paths."""
+        cfg = (self.chat.services_config or {}).get("playbook_scheduler", {}) or {}
+        limits = {
+            "max_schedules_per_user": cfg.get("max_schedules_per_user", 10),
+            "min_interval_minutes": cfg.get("min_interval_minutes", 5),
+            "allowed_recipient_domains": cfg.get("allowed_recipient_domains", []),
+        }
+        return _pooled_schedule_service(self.chat.pg_config, limits)
 
     def _stage_playbook_for_request(self, client_id, playbook_name) -> None:
         """Stage playbook state for a chat request via per-request ContextVars.

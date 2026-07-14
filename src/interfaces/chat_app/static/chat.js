@@ -56,6 +56,7 @@ const CONFIG = {
     DISLIKE: '/api/dislike',
     TEXT_FEEDBACK: '/api/text_feedback',
     PLAYBOOKS: '/api/playbooks',
+    SCHEDULES: '/api/schedules',
   },
   STREAMING: {
     TIMEOUT: 600000, // 10 minutes
@@ -602,6 +603,48 @@ const API = {
     fd.append('client_id', this.clientId);
     fd.append('on_conflict', onConflict);
     return this.fetchJson(`${CONFIG.ENDPOINTS.PLAYBOOKS}/import`, { method: 'POST', body: fd });
+  },
+
+  async getSchedules() {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}?client_id=${encodeURIComponent(this.clientId)}`);
+  },
+
+  async createSchedule(payload) {
+    return this.fetchJson(CONFIG.ENDPOINTS.SCHEDULES, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, client_id: this.clientId }),
+    });
+  },
+
+  async updateSchedule(id, payload) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, client_id: this.clientId }),
+    });
+  },
+
+  async deleteSchedule(id) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}/${id}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this.clientId }),
+    });
+  },
+
+  async runScheduleNow(id) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}/${id}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this.clientId }),
+    });
+  },
+
+  async getScheduleRuns(id, limit = 20) {
+    return this.fetchJson(
+      `${CONFIG.ENDPOINTS.SCHEDULES}/${id}/runs?client_id=${encodeURIComponent(this.clientId)}&limit=${limit}`
+    );
   },
 
   async getProviderModels(providerType) {
