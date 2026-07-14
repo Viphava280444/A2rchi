@@ -1187,6 +1187,17 @@ const UI = {
       Chat._panelTab = tabBtn.dataset.tab;
       Chat.renderPlaybooksPanel();
     });
+    // Schedules section bindings (hosted in the Settings modal)
+    document.querySelector('.schedules-new')?.addEventListener('click', () => Chat.openScheduleEditor({ mode: 'create' }));
+    document.querySelector('.schedule-close')?.addEventListener('click', () => Chat.closeScheduleEditor());
+    document.querySelector('.schedule-cancel')?.addEventListener('click', () => Chat.closeScheduleEditor());
+    document.querySelector('.schedule-backdrop')?.addEventListener('click', () => Chat.closeScheduleEditor());
+    document.querySelector('.schedule-save')?.addEventListener('click', () => Chat.saveScheduleFromEditor());
+    document.getElementById('schedule-preset')?.addEventListener('change', (e) => {
+      if (e.target.value !== '__custom__') {
+        document.getElementById('schedule-cron').value = e.target.value;
+      }
+    });
     // Resize handle for agent spec modal
     this.initAgentSpecResize();
     
@@ -1296,6 +1307,15 @@ const UI = {
 
     // Close modal on Escape
     document.addEventListener('keydown', (e) => {
+      // Schedule editor stacks over the Settings modal — close it first and stop,
+      // so Escape doesn't also dismiss Settings underneath it.
+      if (e.key === 'Escape') {
+        const scheduleModal = document.querySelector('.schedule-modal');
+        if (scheduleModal && scheduleModal.style.display !== 'none' && scheduleModal.style.display !== '') {
+          Chat.closeScheduleEditor();
+          return;
+        }
+      }
       if (e.key === 'Escape' && this.elements.settingsModal?.style.display !== 'none') {
         this.closeSettings();
       }
@@ -1361,6 +1381,10 @@ const UI = {
 
     if (sectionId === 'playbooks' && typeof Chat !== 'undefined') {
       Chat.enterPlaybooksSection();
+    }
+
+    if (sectionId === 'schedules' && typeof Chat !== 'undefined') {
+      Chat.enterSchedulesSection();
     }
   },
 
@@ -4174,6 +4198,9 @@ const Chat = {
     currentUser: null,
   },
 
+  // Schedules Settings panel — populated by loadSchedulesPanel()
+  schedules: [],
+
   getABPendingLimit() {
     const configured = Number(
       this.state.abPool?.max_pending_comparisons_per_conversation
@@ -5598,6 +5625,170 @@ const Chat = {
       PlaybookMenu.playbooks = [];
     } catch (e) {
       if (status) status.textContent = e.message || 'Could not save playbook.';
+    }
+  },
+
+  async enterSchedulesSection() {
+    await this.loadSchedulesPanel();
+  },
+
+  async loadSchedulesPanel() {
+    const status = document.getElementById('schedules-status');
+    try {
+      const data = await API.getSchedules();
+      this.schedules = data?.schedules || [];
+      this.renderSchedulesPanel();
+      if (status) status.textContent = '';
+    } catch (err) {
+      if (status) status.textContent = `Could not load schedules: ${err.message}`;
+    }
+  },
+
+  renderSchedulesPanel() {
+    const list = document.querySelector('.schedules-list');
+    if (!list) return;
+    if (!this.schedules.length) {
+      list.innerHTML = '<p class="schedules-empty">No schedules yet. Create one to run a playbook automatically.</p>';
+      return;
+    }
+    list.innerHTML = this.schedules.map((s) => `
+      <div class="schedule-card" data-id="${s.id}">
+        <div class="schedule-card-main">
+          <span class="schedule-card-name">${Utils.escapeHtml(s.name)}</span>
+          <span class="schedule-card-mode schedule-card-mode--${s.mode}">${s.mode}</span>
+          <span class="schedule-card-cron">${Utils.escapeHtml(s.cron)} (${Utils.escapeHtml(s.timezone)})</span>
+        </div>
+        <div class="schedule-card-meta">
+          <span>→ ${Utils.escapeHtml((s.recipients || []).join(', '))}</span>
+          <span>next: ${s.enabled ? Utils.escapeHtml(s.next_run_at || '—') : 'disabled'}</span>
+          ${s.consecutive_failures ? `<span class="schedule-card-failures">${s.consecutive_failures} consecutive failures</span>` : ''}
+        </div>
+        <div class="schedule-card-actions">
+          <label class="schedule-toggle"><input type="checkbox" data-action="toggle" ${s.enabled ? 'checked' : ''}/> enabled</label>
+          <button type="button" data-action="run">Run now</button>
+          <button type="button" data-action="history">History</button>
+          <button type="button" data-action="edit">Edit</button>
+          <button type="button" data-action="delete">Delete</button>
+        </div>
+        <div class="schedule-runs" hidden></div>
+      </div>`).join('');
+
+    list.querySelectorAll('.schedule-card').forEach((card) => {
+      const id = Number(card.dataset.id);
+      card.querySelector('[data-action="toggle"]').addEventListener('change', async (e) => {
+        try { await API.updateSchedule(id, { enabled: e.target.checked }); await this.loadSchedulesPanel(); }
+        catch (err) { this._scheduleStatus(err.message); }
+      });
+      card.querySelector('[data-action="run"]').addEventListener('click', async () => {
+        try { await API.runScheduleNow(id); this._scheduleStatus('Queued — the scheduler picks it up within one poll.'); }
+        catch (err) { this._scheduleStatus(err.message); }
+      });
+      card.querySelector('[data-action="history"]').addEventListener('click', () => this.toggleScheduleRuns(id, card));
+      card.querySelector('[data-action="edit"]').addEventListener('click', () => {
+        const schedule = this.schedules.find((s) => s.id === id);
+        this.openScheduleEditor({ mode: 'edit', schedule });
+      });
+      card.querySelector('[data-action="delete"]').addEventListener('click', async () => {
+        if (!window.confirm('Delete this schedule? Its run history is kept.')) return;
+        try { await API.deleteSchedule(id); await this.loadSchedulesPanel(); }
+        catch (err) { this._scheduleStatus(err.message); }
+      });
+    });
+  },
+
+  _scheduleStatus(text) {
+    const status = document.getElementById('schedules-status');
+    if (status) status.textContent = text || '';
+  },
+
+  async toggleScheduleRuns(id, card) {
+    const drawer = card.querySelector('.schedule-runs');
+    if (!drawer.hidden) { drawer.hidden = true; return; }
+    try {
+      const data = await API.getScheduleRuns(id);
+      const runs = data?.runs || [];
+      drawer.innerHTML = runs.length ? runs.map((r) => `
+        <div class="schedule-run-row schedule-run-row--${r.status}">
+          <span>${Utils.escapeHtml(r.started_at || '')}</span>
+          <span>${Utils.escapeHtml(r.status)}${r.trigger === 'manual' ? ' (manual)' : ''}</span>
+          <span>${r.email_sent ? 'emailed' : (r.status === 'suppressed' ? 'suppressed' : 'no email')}</span>
+          ${r.conversation_id ? `<a href="#" data-conversation="${r.conversation_id}">open run</a>` : ''}
+          ${r.error ? `<span class="schedule-run-error" title="${Utils.escapeHtml(r.error)}">error</span>` : ''}
+        </div>`).join('') : '<p class="schedules-empty">No runs yet.</p>';
+      drawer.hidden = false;
+      drawer.querySelectorAll('[data-conversation]').forEach((a) => {
+        a.addEventListener('click', (e) => {
+          e.preventDefault();
+          UI.closeSettings();
+          Chat.loadConversation(Number(a.dataset.conversation));
+        });
+      });
+    } catch (err) {
+      this._scheduleStatus(err.message);
+    }
+  },
+
+  async openScheduleEditor({ mode = 'create', schedule = null } = {}) {
+    const modal = document.querySelector('.schedule-modal');
+    if (!modal) return;
+    this.scheduleEditorMode = mode;
+    this.scheduleEditorId = schedule?.id || null;
+    document.getElementById('schedule-modal-title').textContent =
+      mode === 'edit' ? `Edit schedule: ${schedule.name}` : 'New schedule';
+    // populate the playbook dropdown from the invokable set
+    try {
+      const data = await API.getPlaybooksList();
+      const playbooks = data?.playbooks || [];
+      document.getElementById('schedule-playbook').innerHTML = playbooks
+        .map((p) => `<option value="${p.id}">${Utils.escapeHtml(p.name)}</option>`)
+        .join('');
+    } catch (err) {
+      this._scheduleStatus(`Could not load playbooks: ${err.message}`);
+    }
+    document.getElementById('schedule-name').value = schedule?.name || '';
+    document.getElementById('schedule-cron').value = schedule?.cron || '0 7 * * *';
+    document.getElementById('schedule-timezone').value = schedule?.timezone || 'UTC';
+    document.getElementById('schedule-recipients').value = (schedule?.recipients || []).join(', ');
+    document.getElementById('schedule-subject').value = schedule?.subject_prefix || '';
+    document.getElementById('schedule-instructions').value = schedule?.extra_instructions || '';
+    document.querySelectorAll('input[name="schedule-mode"]').forEach((r) => {
+      r.checked = r.value === (schedule?.mode || 'digest');
+    });
+    if (schedule?.playbook_id) {
+      document.getElementById('schedule-playbook').value = String(schedule.playbook_id);
+    }
+    document.getElementById('schedule-editor-status').textContent = '';
+    modal.style.display = 'flex';
+  },
+
+  closeScheduleEditor() {
+    const modal = document.querySelector('.schedule-modal');
+    if (modal) modal.style.display = 'none';
+  },
+
+  async saveScheduleFromEditor() {
+    const status = document.getElementById('schedule-editor-status');
+    const payload = {
+      name: document.getElementById('schedule-name').value.trim(),
+      playbook_id: Number(document.getElementById('schedule-playbook').value),
+      cron: document.getElementById('schedule-cron').value.trim(),
+      timezone: document.getElementById('schedule-timezone').value.trim() || 'UTC',
+      mode: document.querySelector('input[name="schedule-mode"]:checked')?.value || 'digest',
+      recipients: document.getElementById('schedule-recipients').value
+        .split(',').map((s) => s.trim()).filter(Boolean),
+      subject_prefix: document.getElementById('schedule-subject').value.trim() || null,
+      extra_instructions: document.getElementById('schedule-instructions').value.trim() || null,
+    };
+    try {
+      if (this.scheduleEditorMode === 'edit' && this.scheduleEditorId) {
+        await API.updateSchedule(this.scheduleEditorId, payload);
+      } else {
+        await API.createSchedule(payload);
+      }
+      this.closeScheduleEditor();
+      await this.loadSchedulesPanel();
+    } catch (err) {
+      if (status) status.textContent = err.message;
     }
   },
 };
