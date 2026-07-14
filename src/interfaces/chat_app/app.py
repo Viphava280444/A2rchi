@@ -68,7 +68,7 @@ from src.utils.playbook_service import (
 from src.archi.pipelines.agents.tools.playbook_tools import (
     set_playbook_owner, get_playbook_owner,
     set_pending_playbook, get_pending_playbook, clear_pending_playbook,
-    classify_playbook_tool_result,
+    classify_playbook_tool_result, get_invocation_source,
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.playbook_routes import register_playbooks
@@ -1264,7 +1264,8 @@ class ChatWrapper:
         try:
             self._playbook_svc().record_invocation(
                 getattr(context, "conversation_id", None), message_id,
-                context.playbook_id, context.playbook_name, source="explicit", status="ok")
+                context.playbook_id, context.playbook_name,
+                source=get_invocation_source(), status="ok")
         except Exception as exc:
             logger.warning("Could not record playbook invocation for message %s: %s", message_id, exc)
 

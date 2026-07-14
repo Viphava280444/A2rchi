@@ -686,7 +686,7 @@ CREATE TABLE IF NOT EXISTS playbook_invocations (
     message_id      INTEGER,
     playbook_id     INTEGER,
     playbook_name   VARCHAR(100) NOT NULL,
-    source          TEXT NOT NULL CHECK (source IN ('explicit', 'auto')),
+    source          TEXT NOT NULL CHECK (source IN ('explicit', 'auto', 'scheduled')),
     status          TEXT NOT NULL DEFAULT 'ok'
                     CHECK (status IN ('ok', 'not_found', 'unavailable', 'error')),
     arm             TEXT,
