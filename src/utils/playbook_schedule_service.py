@@ -93,12 +93,17 @@ class ScheduleRun:
 def compute_next_run(cron: str, timezone_name: str, after_utc: datetime) -> datetime:
     """Next cron occurrence strictly after `after_utc`, computed in the schedule's
     IANA timezone (so '0 7 * * *' means 07:00 local across DST), returned as
-    aware UTC."""
+    aware UTC.
+
+    The cron arithmetic runs in NAIVE local wall-clock space: croniter's
+    day-stepping mishandles 23h/25h DST transition days when given aware
+    datetimes (off-by-one-hour on the transition day). Nonexistent/ambiguous
+    wall times on transition days resolve via zoneinfo's fold=0 semantics.
+    """
     tz = ZoneInfo(timezone_name)
-    local_after = after_utc.astimezone(tz)
-    nxt_local = croniter(cron, local_after).get_next(datetime)
-    if nxt_local.tzinfo is None:
-        nxt_local = nxt_local.replace(tzinfo=tz)
+    local_after_naive = after_utc.astimezone(tz).replace(tzinfo=None)
+    nxt_naive = croniter(cron, local_after_naive).get_next(datetime)
+    nxt_local = nxt_naive.replace(tzinfo=tz)
     return nxt_local.astimezone(timezone.utc)
 
 
