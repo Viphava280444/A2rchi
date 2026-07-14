@@ -70,3 +70,36 @@ def test_config_template_renders_scheduler_section():
     assert "playbook_scheduler:" in out
     assert "poll_interval_seconds: 30" in out
     assert "max_consecutive_failures: 3" in out
+
+
+def test_deployment_plan_accepts_playbook_scheduler(tmp_path):
+    """archi create --services chatbot playbook-scheduler must not crash.
+
+    DeploymentPlan hardcodes its known-services dict; a registry entry alone
+    is not enough (reproduced: ValueError 'Unknown service: playbook-scheduler')."""
+    from src.cli.utils.service_builder import ServiceBuilder
+
+    plan = ServiceBuilder.build_compose_config(
+        name="demo",
+        verbosity=3,
+        base_dir=tmp_path,
+        enabled_services=["chatbot", "playbook-scheduler"],
+        secrets={"PG_PASSWORD"},
+        tag="dev",
+    )
+
+    assert set(plan.get_enabled_services()) == {
+        "data-manager",
+        "postgres",
+        "chatbot",
+        "playbook-scheduler",
+    }
+
+    template_vars = plan.to_template_vars()
+    assert template_vars.get("playbook_scheduler_enabled") is True
+    # requires_image=False: the compose block reuses chatbot_image/chatbot_tag
+    # directly, so the scheduler's own image fields stay at their natural
+    # (unset) defaults rather than pointing at a nonexistent per-service image.
+    scheduler_state = plan.get_service("playbook-scheduler")
+    assert scheduler_state.image_name == ""
+    assert scheduler_state.enabled is True
