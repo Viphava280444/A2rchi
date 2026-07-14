@@ -59,14 +59,29 @@ class ScheduleRunner:
                 logger.warning("Schedule %s still running; skipping this fire", schedule.name)
                 self.schedule_svc.record_skipped_overlap(schedule, trigger)
                 continue
-            self._execute(schedule, trigger, now_utc)
-            executed += 1
+            try:
+                self._execute(schedule, trigger, now_utc)
+                executed += 1
+            except Exception as exc:  # noqa: BLE001 — batch isolation
+                logger.error("Schedule %s execution failed at the batch level: %s",
+                             schedule.name, exc, exc_info=True)
         return executed
 
     # ------------------------------------------------------------------ one run
 
     def _execute(self, schedule, trigger: str, now_utc: datetime) -> None:
         run_id = self.schedule_svc.start_run(schedule, trigger)
+        try:
+            self._execute_run(run_id, schedule, trigger, now_utc)
+        except Exception as exc:  # noqa: BLE001 — a run must never escape unfinalized
+            logger.error("Unexpected error running schedule %s: %s", schedule.name, exc,
+                         exc_info=True)
+            try:
+                self._fail(run_id, schedule, f"unexpected error: {exc}")
+            except Exception:  # noqa: BLE001 — best-effort; stale sweep is the backstop
+                logger.exception("Could not finalize failed run %s", run_id)
+
+    def _execute_run(self, run_id, schedule, trigger: str, now_utc: datetime) -> None:
         playbook_name = None
         try:
             playbook = self.playbook_svc.get_playbook(
@@ -215,6 +230,9 @@ class ScheduleRunner:
         )
         if disabled_now:
             try:
+                # Send-time recipient recheck: a de-allowlisted domain must not
+                # receive the disable notice either.
+                self.schedule_svc.validate_recipients(schedule.recipients)
                 self.email.send(
                     schedule.recipients,
                     f"[archi] schedule '{schedule.name}' disabled after {count} failures",

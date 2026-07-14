@@ -135,12 +135,22 @@ def test_send_time_recipient_recheck_blocks_disallowed(deps):
 
 
 def test_auto_disable_sends_notice_to_recipients(deps):
+    from src.utils.playbook_schedule_service import ScheduleValidationError
     runner, ssvc, _, chat, email = deps
     chat.return_value = (None, None, None, {}, 500)
     ssvc.bump_failures.return_value = (3, True)
     _run_one(runner, ssvc, make_schedule("digest"))
     notices = [c for c in email.send.call_args_list if "disabled" in c.args[1].lower()]
     assert len(notices) == 1
+
+    # Finding 2: the disable notice also honours a send-time recipient recheck —
+    # a de-allowlisted domain must not receive the notice either.
+    email.reset_mock()
+    ssvc.validate_recipients.reset_mock()
+    ssvc.validate_recipients.side_effect = ScheduleValidationError("domain not allowed")
+    _run_one(runner, ssvc, make_schedule("digest"))
+    ssvc.validate_recipients.assert_called_once()   # the recheck ran in the notice path
+    email.send.assert_not_called()                  # ...and blocked the notice
 
 
 def test_overlap_skips_without_executing(deps):
@@ -174,3 +184,71 @@ def test_timeout_marks_failed(deps):
     _run_one(runner, ssvc, make_schedule("digest"))
     assert ssvc.finalize_run.call_args.kwargs["status"] == "failed"
     assert "timeout" in (ssvc.finalize_run.call_args.kwargs["error"] or "").lower()
+
+
+def test_unexpected_error_finalizes_failed_and_bumps(deps, monkeypatch):
+    """Finding 1a: an unexpected raise past start_run (here in _owner_user_id)
+    is caught by the _execute guard — the run is finalized failed with an
+    'unexpected error' message, the failure counter is bumped, no email is sent."""
+    runner, ssvc, _, chat, email = deps
+
+    def _boom(self, owner):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(
+        "src.interfaces.playbook_scheduler.runner.ScheduleRunner._owner_user_id",
+        _boom,
+    )
+    _run_one(runner, ssvc, make_schedule("digest"))
+
+    kwargs = ssvc.finalize_run.call_args.kwargs
+    assert kwargs["status"] == "failed"
+    assert "unexpected error" in (kwargs["error"] or "")
+    ssvc.bump_failures.assert_called_once()
+    email.send.assert_not_called()
+
+
+def test_one_bad_schedule_does_not_abort_batch(deps):
+    """Finding 1b: when _execute raises (here start_run fails for the first
+    schedule), the run_pending batch guard logs and keeps going, so the second
+    schedule still runs to completion. Only the second counts as executed."""
+    runner, ssvc, _, chat, email = deps
+    bad = make_schedule("digest", id=1, name="bad")
+    good = make_schedule("digest", id=2, name="good")
+    ssvc.claim_due_schedules.return_value = [(bad, "cron"), (good, "cron")]
+    ssvc.start_run.side_effect = [RuntimeError("boom"), 99]
+
+    n = runner.run_pending(NOW)
+
+    assert n == 1                            # only the good schedule counted as executed
+    assert ssvc.start_run.call_count == 2    # both were attempted — batch not aborted
+    email.send.assert_called_once()          # the good schedule still emailed
+    assert ssvc.finalize_run.call_args.kwargs["status"] == "success"
+
+
+def test_digest_unparseable_verdict_still_success_no_banner(deps):
+    """Digest ignores the verdict entirely: an unparseable answer still emails,
+    with no banner, marks success, and resets the failure counter."""
+    runner, ssvc, _, chat, email = deps
+    chat.return_value = (ANSWER_NO_VERDICT, 123, [11, 12], {}, None)
+    _run_one(runner, ssvc, make_schedule("digest"))
+    email.send.assert_called_once()
+    assert email.send.call_args.kwargs.get("banner") is None
+    kwargs = ssvc.finalize_run.call_args.kwargs
+    assert kwargs["status"] == "success"
+    ssvc.reset_failures.assert_called_once_with(1)
+
+
+def test_anonymous_owner_uses_client_id_identity(deps, monkeypatch):
+    """Anonymous owner (not a row in users): the client_id passed to chat IS the
+    schedule's owner_id, and the user_id kwarg is None."""
+    runner, ssvc, _, chat, email = deps
+    monkeypatch.setattr(
+        "src.interfaces.playbook_scheduler.runner.ScheduleRunner._owner_user_id",
+        lambda self, owner: None,
+    )
+    _run_one(runner, ssvc, make_schedule("digest"))
+    chat.assert_called_once()
+    args, kwargs = chat.call_args
+    assert args[2] == "owner-1"        # client_id positional == owner_id
+    assert kwargs["user_id"] is None
