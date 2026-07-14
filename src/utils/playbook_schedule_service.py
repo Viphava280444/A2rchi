@@ -411,3 +411,211 @@ class PlaybookScheduleService:
             conn.commit()
         finally:
             self._release_connection(conn)
+
+    # ---------------------------------------------------------------- claiming
+
+    def claim_due_schedules(self, now_utc: datetime,
+                            catchup_window_minutes: int):
+        """Atomically claim due schedules. Advancing next_run_at IS the claim:
+        the UPDATE is guarded on the previously-read next_run_at, so a second
+        scheduler instance (or overlapping poll) claims nothing. Overdue cron
+        fires beyond the catch-up window are advanced without executing."""
+        claimed = []
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT {self._SCHEDULE_COLS} FROM playbook_schedules "
+                    "WHERE enabled AND (next_run_at <= %s OR manual_run_requested)",
+                    (now_utc,),
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    sched = self._row_to_schedule(row)
+                    trigger = "manual" if sched.manual_run_requested else "cron"
+                    next_run = compute_next_run(sched.cron, sched.timezone, now_utc)
+                    cursor.execute(
+                        f"""
+                        UPDATE playbook_schedules
+                           SET next_run_at = %s, manual_run_requested = FALSE,
+                               last_run_at = %s, updated_at = NOW()
+                         WHERE id = %s AND enabled AND next_run_at = %s
+                        RETURNING {self._SCHEDULE_COLS}
+                        """,
+                        (next_run, now_utc, sched.id, sched.next_run_at),
+                    )
+                    won = cursor.fetchone()
+                    if won is None:
+                        continue  # lost the optimistic race or edited meanwhile
+                    overdue = now_utc - sched.next_run_at
+                    if trigger == "cron" and overdue > timedelta(minutes=catchup_window_minutes):
+                        logger.warning(
+                            "Schedule %s missed its fire time by %s (> catch-up window); "
+                            "skipping to next occurrence", sched.name, overdue,
+                        )
+                        continue
+                    claimed.append((self._row_to_schedule(won), trigger))
+            conn.commit()
+            return claimed
+        finally:
+            self._release_connection(conn)
+
+    # ---------------------------------------------------------------- run rows
+
+    def start_run(self, schedule: PlaybookSchedule, trigger: str) -> int:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO playbook_schedule_runs
+                        (schedule_id, schedule_name, playbook_name, owner_id,
+                         trigger, status, recipients)
+                    VALUES (%s, %s, %s, %s, %s, 'running', %s)
+                    RETURNING id
+                    """,
+                    (schedule.id, schedule.name, self._playbook_name_snapshot(schedule),
+                     schedule.owner_id, trigger, json.dumps(schedule.recipients)),
+                )
+                (run_id,) = cursor.fetchone()
+            conn.commit()
+            return run_id
+        finally:
+            self._release_connection(conn)
+
+    @staticmethod
+    def _playbook_name_snapshot(schedule: PlaybookSchedule) -> str:
+        # The runner resolves the live playbook; at insert time we only know the
+        # id, so snapshot "id:<n>" and let finalize_run leave it (the runner
+        # passes the resolved name via update when it has one).
+        return getattr(schedule, "playbook_name", None) or f"id:{schedule.playbook_id}"
+
+    def has_recent_running_run(self, schedule_id: int, timeout_seconds: int) -> bool:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM playbook_schedule_runs "
+                    "WHERE schedule_id = %s AND status = 'running' "
+                    "AND started_at > NOW() - (%s * INTERVAL '1 second') LIMIT 1",
+                    (schedule_id, timeout_seconds),
+                )
+                return cursor.fetchone() is not None
+        finally:
+            self._release_connection(conn)
+
+    def finalize_run(self, run_id: int, *, status: str, verdict_notify=None,
+                     email_sent: bool = False, email_error=None,
+                     conversation_id=None, error=None, playbook_name=None) -> None:
+        if status not in RUN_STATUSES:
+            raise ScheduleValidationError(f"Unknown run status: {status!r}")
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE playbook_schedule_runs
+                       SET status = %s, verdict_notify = %s, email_sent = %s,
+                           email_error = %s, conversation_id = %s, error = %s,
+                           playbook_name = COALESCE(%s, playbook_name),
+                           finished_at = NOW()
+                     WHERE id = %s
+                    """,
+                    (status, verdict_notify, email_sent, email_error,
+                     conversation_id, error, playbook_name, run_id),
+                )
+            conn.commit()
+        finally:
+            self._release_connection(conn)
+
+    def record_skipped_overlap(self, schedule: PlaybookSchedule, trigger: str) -> None:
+        run_id = self.start_run(schedule, trigger)
+        self.finalize_run(run_id, status="skipped_overlap",
+                          error="previous run of this schedule still in progress")
+
+    # ---------------------------------------------------------------- failures
+
+    def bump_failures(self, schedule_id: int, max_consecutive: int):
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE playbook_schedules
+                       SET consecutive_failures = consecutive_failures + 1,
+                           enabled = CASE WHEN consecutive_failures + 1 >= %s
+                                          THEN FALSE ELSE enabled END,
+                           updated_at = NOW()
+                     WHERE id = %s
+                    RETURNING consecutive_failures, enabled
+                    """,
+                    (max_consecutive, schedule_id),
+                )
+                row = cursor.fetchone()
+            conn.commit()
+            if row is None:
+                return (0, False)
+            count, still_enabled = row
+            return (count, count >= max_consecutive and not still_enabled)
+        finally:
+            self._release_connection(conn)
+
+    def reset_failures(self, schedule_id: int) -> None:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE playbook_schedules SET consecutive_failures = 0, "
+                    "updated_at = NOW() WHERE id = %s",
+                    (schedule_id,),
+                )
+            conn.commit()
+        finally:
+            self._release_connection(conn)
+
+    # ---------------------------------------------------------------- hygiene
+
+    def sweep_stale_runs(self, timeout_seconds: int) -> int:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE playbook_schedule_runs SET status = 'failed', "
+                    "error = 'stale: scheduler restarted mid-run', finished_at = NOW() "
+                    "WHERE status = 'running' "
+                    "AND started_at < NOW() - (%s * INTERVAL '1 second')",
+                    (timeout_seconds,),
+                )
+                swept = cursor.rowcount
+            conn.commit()
+            return swept
+        finally:
+            self._release_connection(conn)
+
+    def list_runs(self, owner_id: str, schedule_id: int, limit: int = 50) -> List[ScheduleRun]:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, schedule_id, schedule_name, playbook_name, owner_id,
+                           trigger, status, verdict_notify, email_sent, email_error,
+                           recipients, conversation_id, error, started_at, finished_at
+                      FROM playbook_schedule_runs
+                     WHERE schedule_id = %s AND owner_id = %s
+                     ORDER BY started_at DESC LIMIT %s
+                    """,
+                    (schedule_id, owner_id, min(int(limit), 200)),
+                )
+                out = []
+                for r in cursor.fetchall():
+                    recipients = json.loads(r[10]) if isinstance(r[10], str) else r[10]
+                    out.append(ScheduleRun(
+                        id=r[0], schedule_id=r[1], schedule_name=r[2], playbook_name=r[3],
+                        owner_id=r[4], trigger=r[5], status=r[6], verdict_notify=r[7],
+                        email_sent=r[8], email_error=r[9], recipients=recipients,
+                        conversation_id=r[11], error=r[12], started_at=r[13], finished_at=r[14],
+                    ))
+                return out
+        finally:
+            self._release_connection(conn)

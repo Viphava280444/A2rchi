@@ -434,3 +434,103 @@ class TestCrudMethods:
         svc, _ = make_service(cur, monkeypatch, limits={"min_interval_minutes": 5})
 
         svc.validate("ok-name", "*/5 * * * *", "UTC", "digest", ["a@cern.ch"])
+
+
+class TestClaimDue:
+    def _schedule_row(self, next_run, manual=False):
+        return (
+            1, "owner-1", 7, "daily", "0 7 * * *", "UTC", "digest",
+            json.dumps(["a@cern.ch"]), None, None, True, manual, 0,
+            None, next_run, None, None,
+        )
+
+    def test_claims_due_row_and_advances_next_run(self, monkeypatch):
+        now = datetime(2026, 7, 14, 7, 0, 30, tzinfo=UTC)
+        due = self._schedule_row(datetime(2026, 7, 14, 7, 0, tzinfo=UTC))
+        cur = FakeCursor(fetchall_values=[[due]], fetchone_values=[due])
+        cur.rowcount = 1
+        svc, conn = make_service(cur, monkeypatch)
+
+        claimed = svc.claim_due_schedules(now, catchup_window_minutes=60)
+
+        assert len(claimed) == 1
+        schedule, trigger = claimed[0]
+        assert trigger == "cron"
+        update_sqls = [sql for sql, _ in cur.statements if sql.startswith("UPDATE playbook_schedules")]
+        assert any("manual_run_requested = FALSE" in s for s in update_sqls)
+        assert conn.committed
+
+    def test_manual_flag_yields_manual_trigger(self, monkeypatch):
+        now = datetime(2026, 7, 14, 3, 0, tzinfo=UTC)
+        due = self._schedule_row(datetime(2026, 7, 14, 7, 0, tzinfo=UTC), manual=True)
+        cur = FakeCursor(fetchall_values=[[due]], fetchone_values=[due])
+        cur.rowcount = 1
+        svc, _ = make_service(cur, monkeypatch)
+
+        claimed = svc.claim_due_schedules(now, catchup_window_minutes=60)
+
+        assert claimed[0][1] == "manual"
+
+    def test_lost_claim_race_returns_nothing(self, monkeypatch):
+        now = datetime(2026, 7, 14, 7, 0, 30, tzinfo=UTC)
+        due = self._schedule_row(datetime(2026, 7, 14, 7, 0, tzinfo=UTC))
+        cur = FakeCursor(fetchall_values=[[due]], fetchone_values=[])  # UPDATE returns no row
+        cur.rowcount = 0
+        svc, _ = make_service(cur, monkeypatch)
+
+        assert svc.claim_due_schedules(now, catchup_window_minutes=60) == []
+
+    def test_overdue_beyond_catchup_is_advanced_not_run(self, monkeypatch):
+        now = datetime(2026, 7, 14, 12, 0, tzinfo=UTC)  # 5h late, window 60min
+        due = self._schedule_row(datetime(2026, 7, 14, 7, 0, tzinfo=UTC))
+        cur = FakeCursor(fetchall_values=[[due]], fetchone_values=[due])
+        cur.rowcount = 1
+        svc, _ = make_service(cur, monkeypatch)
+
+        claimed = svc.claim_due_schedules(now, catchup_window_minutes=60)
+
+        assert claimed == []  # advanced silently, no run returned
+
+
+class TestRunBookkeeping:
+    def _schedule(self):
+        return PlaybookSchedule(
+            id=1, owner_id="owner-1", playbook_id=7, name="daily", cron="0 7 * * *",
+            timezone="UTC", mode="digest", recipients=["a@cern.ch"], subject_prefix=None,
+            extra_instructions=None, enabled=True, manual_run_requested=False,
+            consecutive_failures=0, last_run_at=None,
+            next_run_at=datetime(2026, 7, 15, 7, 0, tzinfo=UTC), created_at=None, updated_at=None,
+        )
+
+    def test_start_run_inserts_snapshots(self, monkeypatch):
+        cur = FakeCursor(fetchone_values=[(99,)])
+        svc, conn = make_service(cur, monkeypatch)
+
+        run_id = svc.start_run(self._schedule(), "cron")
+
+        assert run_id == 99
+        sql, params = cur.statements[-1]
+        assert sql.startswith("INSERT INTO playbook_schedule_runs")
+        assert "daily" in params and "owner-1" in params
+
+    def test_bump_failures_disables_at_max(self, monkeypatch):
+        cur = FakeCursor(fetchone_values=[(3, False)])
+        cur.rowcount = 1
+        svc, _ = make_service(cur, monkeypatch)
+
+        count, disabled_now = svc.bump_failures(1, max_consecutive=3)
+
+        assert (count, disabled_now) == (3, True)
+        sql, _ = cur.statements[-1]
+        assert "consecutive_failures + 1" in sql and "CASE WHEN" in sql
+
+    def test_sweep_stale_runs_marks_failed(self, monkeypatch):
+        cur = FakeCursor()
+        cur.rowcount = 2
+        svc, conn = make_service(cur, monkeypatch)
+
+        n = svc.sweep_stale_runs(timeout_seconds=600)
+
+        assert n == 2
+        sql, _ = cur.statements[-1]
+        assert "status = 'failed'" in sql and "status = 'running'" in sql
