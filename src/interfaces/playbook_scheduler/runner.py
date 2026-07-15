@@ -21,7 +21,10 @@ from src.archi.pipelines.agents.tools.playbook_tools import (
     set_pending_playbook,
     set_playbook_owner,
 )
-from src.interfaces.playbook_scheduler.verdict import VERDICT_INSTRUCTION, parse_verdict
+from src.interfaces.playbook_scheduler.verdict import (
+    VERDICT_INSTRUCTION,
+    parse_verdict_from_output,
+)
 from src.utils.email_sender import EmailSendError
 from src.utils.logging import get_logger
 from src.utils.playbook_schedule_service import ScheduleValidationError
@@ -156,7 +159,7 @@ class ScheduleRunner:
                        conversation_id=conversation_id, playbook_name=playbook_name)
             return
 
-        verdict = parse_verdict(output)
+        verdict = parse_verdict_from_output(output)
         banner = None
         if schedule.mode == "alert":
             if verdict is None:

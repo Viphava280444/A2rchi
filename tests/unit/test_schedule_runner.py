@@ -239,6 +239,32 @@ def test_digest_unparseable_verdict_still_success_no_banner(deps):
     ssvc.reset_failures.assert_called_once_with(1)
 
 
+def test_alert_html_rendered_verdict_suppresses(deps):
+    """Live-smoke finding: ChatWrapper.__call__ can return the server-side
+    HTML-rendered answer (syntax-highlighted code boxes) instead of raw
+    markdown — the ```json fence never survives rendering, but the JSON
+    text content does, chopped into <span>s with &quot; entities. The
+    runner must still parse the verdict and suppress on notify: false."""
+    runner, ssvc, _, chat, email = deps
+    html_answer = (
+        '<p>Everything checked out fine this run.</p>\n'
+        '<div class="highlight"><pre><span></span><span class="o">{</span>'
+        '<span class="s2">&quot;notify&quot;</span>:<span class="w"> </span>'
+        '<span class="kc">false</span>,<span class="w"> </span>'
+        '<span class="s2">&quot;subject&quot;</span>:<span class="w"> </span>'
+        '<span class="s2">&quot;Scheduler smoke check: all quiet&quot;</span>,'
+        '<span class="w"> </span><span class="s2">&quot;summary&quot;</span>:'
+        '<span class="w"> </span><span class="s2">&quot;No issues detected; '
+        'monitoring indicates normal operation.&quot;</span><span class="o">}</span>\n'
+        '</pre></div>'
+    )
+    chat.return_value = (html_answer, 123, [11, 12], {}, None)
+    _run_one(runner, ssvc, make_schedule("alert"))
+    email.send.assert_not_called()
+    assert ssvc.finalize_run.call_args.kwargs["status"] == "suppressed"
+    ssvc.reset_failures.assert_called_once()
+
+
 def test_anonymous_owner_uses_client_id_identity(deps, monkeypatch):
     """Anonymous owner (not a row in users): the client_id passed to chat IS the
     schedule's owner_id, and the user_id kwarg is None."""

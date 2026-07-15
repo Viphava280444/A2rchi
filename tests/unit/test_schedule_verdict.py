@@ -1,5 +1,9 @@
 """parse_verdict: last fenced JSON block wins; anything malformed → None."""
-from src.interfaces.playbook_scheduler.verdict import VERDICT_INSTRUCTION, parse_verdict
+from src.interfaces.playbook_scheduler.verdict import (
+    VERDICT_INSTRUCTION,
+    parse_verdict,
+    parse_verdict_from_output,
+)
 
 
 def _wrap(payload):
@@ -61,3 +65,62 @@ def test_instruction_mentions_the_contract():
     assert "```json" in VERDICT_INSTRUCTION and '"notify"' in VERDICT_INSTRUCTION
     assert "only if the condition" in VERDICT_INSTRUCTION
     assert "always-send digests" in VERDICT_INSTRUCTION
+
+
+# ---------------------------------------------------------------- live-smoke finding
+# ChatWrapper.__call__ can return the SERVER-SIDE HTML-rendered answer (markdown
+# rendered with syntax-highlighted code boxes), not raw markdown — the ```json
+# fence never survives rendering, but the JSON's characters all survive as HTML
+# text content, chopped into <span>s with &quot; entities.
+
+def _html_wrap(sentence, notify_json_text):
+    """Replicate the live sample's rendering: a <p> sentence, then a
+    Pygments-style highlighted block with the JSON chopped into spans and
+    HTML entities, exactly like the production sample tail."""
+    return (
+        f"<p>{sentence}</p>\n"
+        '<div class="highlight"><pre><span></span><span class="o">{</span>'
+        + notify_json_text +
+        '<span class="o">}</span>\n</pre></div>'
+    )
+
+
+HTML_VERDICT_FALSE = _html_wrap(
+    "Everything checked out fine this run.",
+    '<span class="s2">&quot;notify&quot;</span>:<span class="w"> </span>'
+    '<span class="kc">false</span>,<span class="w"> </span>'
+    '<span class="s2">&quot;subject&quot;</span>:<span class="w"> </span>'
+    '<span class="s2">&quot;Scheduler smoke check: all quiet&quot;</span>,'
+    '<span class="w"> </span><span class="s2">&quot;summary&quot;</span>:'
+    '<span class="w"> </span><span class="s2">&quot;No issues detected; '
+    'monitoring indicates normal operation.&quot;</span>',
+)
+
+
+def test_parses_html_rendered_verdict():
+    v = parse_verdict_from_output(HTML_VERDICT_FALSE)
+    assert v["notify"] is False
+    assert v["subject"] == "Scheduler smoke check: all quiet"
+    assert v["summary"] == (
+        "No issues detected; monitoring indicates normal operation."
+    )
+
+
+def test_flat_object_fallback_last_wins():
+    text = (
+        'Status check one: {"notify": false, "subject": "first"} looks fine.\n'
+        'Status check two: {"notify": true, "subject": "second"} needs attention.'
+    )
+    v = parse_verdict(text)
+    assert v["notify"] is True
+    assert v["subject"] == "second"
+
+
+def test_fenced_path_still_first():
+    text = (
+        _wrap('{"notify": true, "subject": "fenced wins"}')
+        + '\nmore text {"notify": false, "subject": "flat loses"}\n'
+    )
+    v = parse_verdict(text)
+    assert v["notify"] is True
+    assert v["subject"] == "fenced wins"
