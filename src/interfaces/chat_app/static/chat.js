@@ -129,6 +129,17 @@ const Utils = {
   },
 
   /**
+   * Format an ISO timestamp as a localized date + time (e.g. "Jul 15, 2026, 5:00 AM").
+   * Returns '' for falsy/invalid input, matching formatDate.
+   */
+  formatDateTime(isoString) {
+    if (!isoString) return '';
+    const date = new Date(isoString);
+    if (isNaN(date.getTime())) return '';
+    return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+  },
+
+  /**
    * Group conversations by date
    */
   groupByDate(conversations) {
@@ -5633,14 +5644,13 @@ const Chat = {
   },
 
   async loadSchedulesPanel() {
-    const status = document.getElementById('schedules-status');
     try {
       const data = await API.getSchedules();
       this.schedules = data?.schedules || [];
       this.renderSchedulesPanel();
-      if (status) status.textContent = '';
+      this._scheduleStatus('');
     } catch (err) {
-      if (status) status.textContent = `Could not load schedules: ${err.message}`;
+      this._scheduleStatus(`Could not load schedules: ${err.message}`, 'error');
     }
   },
 
@@ -5653,6 +5663,7 @@ const Chat = {
     }
     list.innerHTML = this.schedules.map((s) => {
       const modeClass = { digest: 'digest', alert: 'alert' }[s.mode] || 'unknown';
+      const nextRun = Utils.formatDateTime(s.next_run_at) || '—';
       return `
       <div class="schedule-card" data-id="${s.id}">
         <div class="schedule-card-main">
@@ -5662,11 +5673,11 @@ const Chat = {
         </div>
         <div class="schedule-card-meta">
           <span>→ ${Utils.escapeHtml((s.recipients || []).join(', '))}</span>
-          <span>next: ${s.enabled ? Utils.escapeHtml(s.next_run_at || '—') : 'disabled'}</span>
+          <span>next: ${s.enabled ? Utils.escapeHtml(nextRun) : 'disabled'}</span>
           ${s.consecutive_failures ? `<span class="schedule-card-failures">${s.consecutive_failures} consecutive failures</span>` : ''}
         </div>
         <div class="schedule-card-actions">
-          <label class="schedule-toggle"><input type="checkbox" data-action="toggle" ${s.enabled ? 'checked' : ''}/> enabled</label>
+          <label class="schedule-toggle"><input type="checkbox" data-action="toggle" ${s.enabled ? 'checked' : ''}/><span class="schedule-toggle-slider"></span><span class="schedule-toggle-text">enabled</span></label>
           <button type="button" data-action="run">Run now</button>
           <button type="button" data-action="history">History</button>
           <button type="button" data-action="edit">Edit</button>
@@ -5680,11 +5691,11 @@ const Chat = {
       const id = Number(card.dataset.id);
       card.querySelector('[data-action="toggle"]').addEventListener('change', async (e) => {
         try { await API.updateSchedule(id, { enabled: e.target.checked }); await this.loadSchedulesPanel(); }
-        catch (err) { this._scheduleStatus(err.message); }
+        catch (err) { this._scheduleStatus(err.message, 'error'); }
       });
       card.querySelector('[data-action="run"]').addEventListener('click', async () => {
-        try { await API.runScheduleNow(id); this._scheduleStatus('Queued — the scheduler picks it up within one poll.'); }
-        catch (err) { this._scheduleStatus(err.message); }
+        try { await API.runScheduleNow(id); this._scheduleStatus('Queued — the scheduler picks it up within one poll.', 'success'); }
+        catch (err) { this._scheduleStatus(err.message, 'error'); }
       });
       card.querySelector('[data-action="history"]').addEventListener('click', () => this.toggleScheduleRuns(id, card));
       card.querySelector('[data-action="edit"]').addEventListener('click', () => {
@@ -5694,14 +5705,17 @@ const Chat = {
       card.querySelector('[data-action="delete"]').addEventListener('click', async () => {
         if (!window.confirm('Delete this schedule? Its run history is kept.')) return;
         try { await API.deleteSchedule(id); await this.loadSchedulesPanel(); }
-        catch (err) { this._scheduleStatus(err.message); }
+        catch (err) { this._scheduleStatus(err.message, 'error'); }
       });
     });
   },
 
-  _scheduleStatus(text) {
+  _scheduleStatus(text, type = '') {
     const status = document.getElementById('schedules-status');
-    if (status) status.textContent = text || '';
+    if (!status) return;
+    status.textContent = text || '';
+    status.classList.remove('error', 'success');
+    if (type) status.classList.add(type);
   },
 
   async toggleScheduleRuns(id, card) {
@@ -5714,7 +5728,7 @@ const Chat = {
         const statusClass = ['running', 'success', 'suppressed', 'verdict_unparsed', 'failed', 'skipped_overlap'].includes(r.status) ? r.status : 'unknown';
         return `
         <div class="schedule-run-row schedule-run-row--${statusClass}">
-          <span>${Utils.escapeHtml(r.started_at || '')}</span>
+          <span>${Utils.escapeHtml(Utils.formatDateTime(r.started_at))}</span>
           <span>${Utils.escapeHtml(r.status)}${r.trigger === 'manual' ? ' (manual)' : ''}</span>
           <span>${r.email_sent ? 'emailed' : (r.status === 'suppressed' ? 'suppressed' : 'no email')}</span>
           ${r.conversation_id ? `<a href="#" data-conversation="${r.conversation_id}">open run</a>` : ''}
@@ -5730,7 +5744,7 @@ const Chat = {
         });
       });
     } catch (err) {
-      this._scheduleStatus(err.message);
+      this._scheduleStatus(err.message, 'error');
     }
   },
 
@@ -5750,7 +5764,10 @@ const Chat = {
         .join('');
     } catch (err) {
       const editorStatus = document.getElementById('schedule-editor-status');
-      if (editorStatus) editorStatus.textContent = `Could not load playbooks: ${err.message}`;
+      if (editorStatus) {
+        editorStatus.textContent = `Could not load playbooks: ${err.message}`;
+        editorStatus.classList.add('error');
+      }
     }
     document.getElementById('schedule-name').value = schedule?.name || '';
     document.getElementById('schedule-cron').value = schedule?.cron || '0 7 * * *';
@@ -5764,7 +5781,9 @@ const Chat = {
     if (schedule?.playbook_id) {
       document.getElementById('schedule-playbook').value = String(schedule.playbook_id);
     }
-    document.getElementById('schedule-editor-status').textContent = '';
+    const editorStatus = document.getElementById('schedule-editor-status');
+    editorStatus.textContent = '';
+    editorStatus.classList.remove('error', 'success');
     modal.style.display = 'flex';
   },
 
@@ -5795,7 +5814,10 @@ const Chat = {
       this.closeScheduleEditor();
       await this.loadSchedulesPanel();
     } catch (err) {
-      if (status) status.textContent = err.message;
+      if (status) {
+        status.textContent = err.message;
+        status.classList.add('error');
+      }
     }
   },
 };
