@@ -623,3 +623,46 @@ class TestRunBookkeeping:
         assert run.error is None
         assert run.started_at is None
         assert run.finished_at is None
+
+
+class TestPreviewNextRuns:
+    def _svc(self):
+        return PlaybookScheduleService(pg_config={"dummy": True})
+
+    def test_preview_returns_utc_instants_in_schedule_zone(self):
+        # 07:00 Europe/Zurich in July = 05:00 UTC (CEST, UTC+2)
+        after = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        out = self._svc().preview_next_runs("0 7 * * *", "Europe/Zurich", after_utc=after)
+        assert out == [
+            datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
+            datetime(2026, 7, 22, 5, 0, tzinfo=timezone.utc),
+            datetime(2026, 7, 23, 5, 0, tzinfo=timezone.utc),
+        ]
+
+    def test_preview_crosses_dst_boundary(self):
+        # US DST ends Sun 2026-11-01: 07:00 America/Chicago moves 12:00Z -> 13:00Z
+        after = datetime(2026, 10, 31, 14, 0, tzinfo=timezone.utc)
+        out = self._svc().preview_next_runs("0 7 * * *", "America/Chicago",
+                                            count=2, after_utc=after)
+        assert out == [
+            datetime(2026, 11, 1, 13, 0, tzinfo=timezone.utc),
+            datetime(2026, 11, 2, 13, 0, tzinfo=timezone.utc),
+        ]
+
+    def test_preview_respects_count(self):
+        after = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        out = self._svc().preview_next_runs("0 7 * * *", "UTC", count=5, after_utc=after)
+        assert len(out) == 5
+        assert out == sorted(out)
+
+    def test_preview_rejects_four_field_cron(self):
+        with pytest.raises(ScheduleValidationError, match="Invalid cron expression"):
+            self._svc().preview_next_runs("14 10 * *", "UTC")
+
+    def test_preview_rejects_sub_floor_interval(self):
+        with pytest.raises(ScheduleValidationError, match="every 5 minutes"):
+            self._svc().preview_next_runs("*/2 * * * *", "UTC")
+
+    def test_preview_rejects_unknown_timezone(self):
+        with pytest.raises(ScheduleValidationError, match="Unknown IANA timezone"):
+            self._svc().preview_next_runs("0 7 * * *", "America/Chicgo")

@@ -193,12 +193,8 @@ class PlaybookScheduleService:
 
     # ---------------------------------------------------------------- validation
 
-    def validate(self, name: str, cron: str, timezone_name: str, mode: str,
-                 recipients: List[str]) -> None:
-        if not name or not isinstance(name, str) or len(name) > 100:
-            raise ScheduleValidationError("Schedule name must be 1-100 characters")
-        if mode not in MODES:
-            raise ScheduleValidationError(f"mode must be one of {MODES}")
+    def validate_cron_timezone(self, cron: str, timezone_name: str) -> None:
+        """Cron + timezone subset of validate() — shared with the preview path."""
         try:
             ZoneInfo(timezone_name)
         except Exception:
@@ -214,6 +210,29 @@ class PlaybookScheduleService:
             raise ScheduleValidationError(
                 f"Schedule fires more often than every {floor} minutes"
             )
+
+    def preview_next_runs(self, cron: str, timezone_name: str, count: int = 3,
+                          after_utc: Optional[datetime] = None) -> List[datetime]:
+        """Next `count` fire instants (UTC) for a candidate cron + timezone.
+
+        Uses the same validation and compute_next_run() arithmetic as real
+        scheduling, so a UI preview can never disagree with the worker.
+        """
+        self.validate_cron_timezone(cron, timezone_name)
+        after = after_utc or datetime.now(timezone.utc)
+        instants: List[datetime] = []
+        for _ in range(count):
+            after = compute_next_run(cron, timezone_name, after)
+            instants.append(after)
+        return instants
+
+    def validate(self, name: str, cron: str, timezone_name: str, mode: str,
+                 recipients: List[str]) -> None:
+        if not name or not isinstance(name, str) or len(name) > 100:
+            raise ScheduleValidationError("Schedule name must be 1-100 characters")
+        if mode not in MODES:
+            raise ScheduleValidationError(f"mode must be one of {MODES}")
+        self.validate_cron_timezone(cron, timezone_name)
         self.validate_recipients(recipients)
 
     def validate_recipients(self, recipients: List[str]) -> None:
