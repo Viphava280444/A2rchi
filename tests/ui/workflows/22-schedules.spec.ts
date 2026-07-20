@@ -186,4 +186,49 @@ test.describe('Schedules Settings', () => {
     await expect(page.locator('#schedule-preview')).toContainText("Can't compute preview right now");
     await expect(page.locator('.schedule-save')).toBeEnabled();
   });
+
+  test('cards humanize builder crons and keep exotic ones raw', async ({ page }) => {
+    await page.route('**/api/schedules**', (route) => {
+      if (route.request().method() === 'GET' && !route.request().url().includes('/runs')) {
+        return route.fulfill({ status: 200, json: { schedules: [
+          { id: 1, name: 'daily-digest', playbook_id: 7, cron: '0 7 * * *',
+            timezone: 'UTC', mode: 'digest', recipients: ['ops@cern.ch'],
+            enabled: true, consecutive_failures: 0, next_run_at: '2026-07-21T07:00:00+00:00' },
+          { id: 2, name: 'first-tuesday', playbook_id: 7, cron: '15 6 * * 2#1',
+            timezone: 'Europe/Zurich', mode: 'digest', recipients: ['ops@cern.ch'],
+            enabled: true, consecutive_failures: 0, next_run_at: '2026-08-04T04:15:00+00:00' },
+        ] } });
+      }
+      return route.fallback();
+    });
+    await openSchedules(page);
+    const cards = page.locator('.schedule-card');
+    await expect(cards.nth(0).locator('.schedule-card-cron')).toHaveText('every day at 07:00 (UTC)');
+    await expect(cards.nth(1).locator('.schedule-card-cron')).toHaveText('15 6 * * 2#1 (Europe/Zurich)');
+  });
+});
+
+test.describe('your-time labels', () => {
+  test.use({ timezoneId: 'America/Chicago' });
+
+  test('next-run gets the your-time hint when zones differ', async ({ page }) => {
+    await setupBasicMocks(page);
+    await page.route('**/api/schedules/preview', (route) => route.fulfill({
+      status: 200, json: { next: [] },
+    }));
+    await page.route('**/api/schedules**', (route) => {
+      if (route.request().method() === 'GET' && !route.request().url().includes('/runs')) {
+        return route.fulfill({ status: 200, json: { schedules: [{
+          id: 1, name: 'zurich-daily', playbook_id: 7, cron: '0 7 * * *',
+          timezone: 'Europe/Zurich', mode: 'digest', recipients: ['ops@cern.ch'],
+          enabled: true, consecutive_failures: 0, next_run_at: '2026-07-21T05:00:00+00:00',
+        }] } });
+      }
+      return route.fallback();
+    });
+    await page.goto('/chat');
+    await page.getByRole('button', { name: /settings/i }).click();
+    await page.getByRole('button', { name: 'Schedules' }).click();
+    await expect(page.locator('.schedule-card-meta')).toContainText('your time');
+  });
 });

@@ -5768,16 +5768,19 @@ const Chat = {
     list.innerHTML = this.schedules.map((s) => {
       const modeClass = { digest: 'digest', alert: 'alert' }[s.mode] || 'unknown';
       const nextRun = Utils.formatDateTime(s.next_run_at) || '—';
+      const human = ScheduleCron.describe(s.cron) || s.cron;
+      const viewerZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const zoneHint = (s.timezone !== viewerZone) ? ' · your time' : '';
       return `
       <div class="schedule-card" data-id="${s.id}">
         <div class="schedule-card-main">
           <span class="schedule-card-name">${Utils.escapeHtml(s.name)}</span>
           <span class="schedule-card-mode schedule-card-mode--${modeClass}">${Utils.escapeHtml(s.mode)}</span>
-          <span class="schedule-card-cron">${Utils.escapeHtml(s.cron)} (${Utils.escapeHtml(s.timezone)})</span>
+          <span class="schedule-card-cron">${Utils.escapeHtml(human)} (${Utils.escapeHtml(s.timezone)})</span>
         </div>
         <div class="schedule-card-meta">
           <span>→ ${Utils.escapeHtml((s.recipients || []).join(', '))}</span>
-          <span>next: ${s.enabled ? Utils.escapeHtml(nextRun) : 'disabled'}</span>
+          <span>next: ${s.enabled ? Utils.escapeHtml(nextRun) + Utils.escapeHtml(zoneHint) : 'disabled'}</span>
           ${s.consecutive_failures ? `<span class="schedule-card-failures">${s.consecutive_failures} consecutive failures</span>` : ''}
         </div>
         <div class="schedule-card-actions">
@@ -5828,11 +5831,14 @@ const Chat = {
     try {
       const data = await API.getScheduleRuns(id);
       const runs = data?.runs || [];
+      const schedule = this.schedules.find((s) => s.id === id);
+      const viewerZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const runZoneHint = (schedule && schedule.timezone !== viewerZone) ? ' · your time' : '';
       drawer.innerHTML = runs.length ? runs.map((r) => {
         const statusClass = ['running', 'success', 'suppressed', 'verdict_unparsed', 'failed', 'skipped_overlap'].includes(r.status) ? r.status : 'unknown';
         return `
         <div class="schedule-run-row schedule-run-row--${statusClass}">
-          <span>${Utils.escapeHtml(Utils.formatDateTime(r.started_at))}</span>
+          <span>${Utils.escapeHtml(Utils.formatDateTime(r.started_at) + runZoneHint)}</span>
           <span>${Utils.escapeHtml(r.status)}${r.trigger === 'manual' ? ' (manual)' : ''}</span>
           <span>${r.email_sent ? 'emailed' : (r.status === 'suppressed' ? 'suppressed' : 'no email')}</span>
           ${r.conversation_id ? `<a href="#" data-conversation="${r.conversation_id}">open run</a>` : ''}
