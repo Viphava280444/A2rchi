@@ -185,6 +185,97 @@ const Utils = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Schedule "When" builder — pure cron compile/recognize helpers.
+// The builder writes THROUGH #schedule-cron, so the save path never changes.
+const SCHEDULE_INTERVAL_MINUTES = [5, 10, 15, 20, 30];
+const SCHEDULE_INTERVAL_HOURS = [1, 2, 3, 4, 6, 8, 12];
+const SCHEDULE_FALLBACK_ZONES = ['UTC', 'Europe/Zurich', 'Europe/Paris',
+  'America/New_York', 'America/Chicago', 'Asia/Bangkok'];
+
+const ScheduleCron = {
+  DAY_NAMES: { 0: 'Sun', 1: 'Mon', 2: 'Tue', 3: 'Wed', 4: 'Thu', 5: 'Fri', 6: 'Sat' },
+
+  _hm(state) {
+    const [h, m] = (state.time || '07:00').split(':').map(Number);
+    return { h, m };
+  },
+
+  compile(state) {
+    if (!state) return null;
+    const { h, m } = this._hm(state);
+    switch (state.pattern) {
+      case 'daily': return `${m} ${h} * * *`;
+      case 'weekdays': return `${m} ${h} * * 1-5`;
+      case 'weekly': {
+        const days = [...new Set(state.days || [])].sort((a, b) => a - b);
+        if (!days.length) return null;
+        return `${m} ${h} * * ${days.join(',')}`;
+      }
+      case 'interval':
+        return state.unit === 'hours' ? `0 */${state.every} * * *` : `*/${state.every} * * * *`;
+      case 'monthly': return `${m} ${h} ${state.monthday} * *`;
+      default: return null;
+    }
+  },
+
+  _timed(pattern, m) {
+    const minute = Number(m[1]);
+    const hour = Number(m[2]);
+    if (minute > 59 || hour > 23) return null;
+    return {
+      pattern,
+      time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+    };
+  },
+
+  // Conservative: only the exact shapes compile() emits; anything else -> null.
+  recognize(cron) {
+    const c = (cron || '').trim();
+    let m;
+    if ((m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* \*$/))) return this._timed('daily', m);
+    if ((m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* 1-5$/))) return this._timed('weekdays', m);
+    if ((m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* ([0-6](?:,[0-6])*)$/))) {
+      const days = m[3].split(',').map(Number);
+      if (new Set(days).size !== days.length) return null;
+      const base = this._timed('weekly', m);
+      return base && { ...base, days };
+    }
+    if ((m = c.match(/^\*\/(\d{1,2}) \* \* \* \*$/))) {
+      const every = Number(m[1]);
+      return SCHEDULE_INTERVAL_MINUTES.includes(every)
+        ? { pattern: 'interval', every, unit: 'minutes' } : null;
+    }
+    if ((m = c.match(/^0 \*\/(\d{1,2}) \* \* \*$/))) {
+      const every = Number(m[1]);
+      return SCHEDULE_INTERVAL_HOURS.includes(every)
+        ? { pattern: 'interval', every, unit: 'hours' } : null;
+    }
+    if ((m = c.match(/^(\d{1,2}) (\d{1,2}) (\d{1,2}) \* \*$/))) {
+      const monthday = Number(m[3]);
+      if (monthday < 1 || monthday > 31) return null;
+      const base = this._timed('monthly', m);
+      return base && { ...base, monthday };
+    }
+    return null;
+  },
+
+  describe(cron) {
+    const s = this.recognize(cron);
+    if (!s) return null;
+    switch (s.pattern) {
+      case 'daily': return `every day at ${s.time}`;
+      case 'weekdays': return `weekdays at ${s.time}`;
+      case 'weekly':
+        return `every ${s.days.map((d) => this.DAY_NAMES[d]).join(', ')} at ${s.time}`;
+      case 'interval': return `every ${s.every} ${s.unit}`;
+      case 'monthly': return `monthly on day ${s.monthday} at ${s.time}`;
+      default: return null;
+    }
+  },
+};
+window.ScheduleCron = ScheduleCron;
+
 // =============================================================================
 // Storage Manager
 // =============================================================================
