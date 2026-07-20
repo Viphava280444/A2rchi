@@ -5873,7 +5873,7 @@ const Chat = {
     if (advBtn) advBtn.textContent = '▸ Advanced: edit as cron';
     this._populateIntervalChoices();
     this._populateMonthdayChoices();
-    this._populateTimezoneSelect(schedule?.timezone || 'UTC');
+    this._populateTimezoneSelect(schedule?.timezone || null);
     this._applyBuilderState(ScheduleCron.recognize(cron));
     this.refreshSchedulePreview();
     document.getElementById('schedule-recipients').value = (schedule?.recipients || []).join(', ');
@@ -5987,11 +5987,17 @@ const Chat = {
   _populateTimezoneSelect(selected) {
     const sel = document.getElementById('schedule-timezone');
     if (!sel) return;
-    const zones = new Set(SCHEDULE_FALLBACK_ZONES);
-    if (selected) zones.add(selected);
-    sel.innerHTML = [...zones].map((z) =>
-      `<option value="${Utils.escapeAttr(z)}">${Utils.escapeHtml(z)}</option>`).join('');
-    sel.value = selected || 'UTC';
+    const detected = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    const zones = (typeof Intl.supportedValuesOf === 'function')
+      ? Intl.supportedValuesOf('timeZone') : [...SCHEDULE_FALLBACK_ZONES];
+    const all = new Set(zones);
+    all.add('UTC');
+    all.add(detected);
+    if (selected) all.add(selected);
+    sel.innerHTML = [...all].sort().map((z) =>
+      `<option value="${Utils.escapeAttr(z)}">${Utils.escapeHtml(z)}${z === detected ? ' · detected' : ''}</option>`
+    ).join('');
+    sel.value = selected || detected;
   },
 
   _applyBuilderState(state) {

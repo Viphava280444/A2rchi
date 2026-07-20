@@ -59,3 +59,39 @@ test.describe('ScheduleCron pure functions', () => {
     }
   });
 });
+
+for (const zone of ['Asia/Bangkok', 'Europe/Zurich', 'America/Chicago']) {
+  test.describe(`timezone detection — ${zone}`, () => {
+    test.use({ timezoneId: zone });
+
+    test('a new schedule defaults to the browser zone, labeled detected', async ({ page }) => {
+      await setupBasicMocks(page);
+      await page.goto('/chat');
+      await page.getByRole('button', { name: /settings/i }).click();
+      await page.getByRole('button', { name: 'Schedules' }).click();
+      await page.locator('.schedules-new').click();
+      await expect(page.locator('#schedule-timezone')).toHaveValue(zone);
+      await expect(page.locator('#schedule-timezone option:checked')).toContainText('detected');
+    });
+
+    test('editing keeps the schedule own zone, not the browser zone', async ({ page }) => {
+      await setupBasicMocks(page);
+      await page.route('**/api/schedules**', (route) => {
+        if (route.request().method() === 'GET' && !route.request().url().includes('/runs')) {
+          return route.fulfill({ status: 200, json: { schedules: [{
+            id: 1, name: 'zurich-daily', playbook_id: 7, cron: '0 7 * * *',
+            timezone: 'Europe/Paris', mode: 'digest', recipients: ['ops@cern.ch'],
+            enabled: true, consecutive_failures: 0,
+            next_run_at: '2026-07-21T05:00:00+00:00',
+          }] } });
+        }
+        return route.fallback();
+      });
+      await page.goto('/chat');
+      await page.getByRole('button', { name: /settings/i }).click();
+      await page.getByRole('button', { name: 'Schedules' }).click();
+      await page.locator('[data-action="edit"]').click();
+      await expect(page.locator('#schedule-timezone')).toHaveValue('Europe/Paris');
+    });
+  });
+}
