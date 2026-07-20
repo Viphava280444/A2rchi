@@ -749,6 +749,14 @@ const API = {
     );
   },
 
+  async previewSchedule(payload) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, client_id: this.clientId }),
+    });
+  },
+
   async getProviderModels(providerType) {
     const url = `${CONFIG.ENDPOINTS.PROVIDER_MODELS}?provider=${encodeURIComponent(providerType)}`;
     return this.fetchJson(url);
@@ -6046,7 +6054,40 @@ const Chat = {
   },
 
   refreshSchedulePreview() {
-    // Filled in by the live-preview task; the stub keeps builder wiring testable alone.
+    if (!this._schedulePreviewDebounced) {
+      this._schedulePreviewDebounced = Utils.debounce(() => this._fetchSchedulePreview(), 300);
+    }
+    this._schedulePreviewDebounced();
+  },
+
+  async _fetchSchedulePreview() {
+    const el = document.getElementById('schedule-preview');
+    if (!el) return;
+    const state = this._scheduleBuilderState();
+    if (state.pattern === 'weekly' && !state.days.length) {
+      el.classList.add('error');
+      el.textContent = 'Pick at least one day.';
+      return;
+    }
+    const cron = document.getElementById('schedule-cron').value.trim();
+    const tz = document.getElementById('schedule-timezone').value;
+    try {
+      const data = await API.previewSchedule({ cron, timezone: tz });
+      const fmt = { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+      const times = (data?.next || []).map((iso) => new Date(iso));
+      const viewerZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      let text = `⏱ Next: ${times.map((d) => d.toLocaleString([], fmt)).join(' · ')} — your local time`;
+      if (times.length && tz !== viewerZone) {
+        text += ` (first run: ${times[0].toLocaleString([], { ...fmt, timeZone: tz })} in ${tz})`;
+      }
+      el.classList.remove('error');
+      el.textContent = text;
+    } catch (err) {
+      el.classList.add('error');
+      el.textContent = (err instanceof TypeError)
+        ? "Can't compute preview right now."
+        : err.message;
+    }
   },
 };
 

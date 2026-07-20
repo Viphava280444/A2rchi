@@ -6,6 +6,10 @@ import { test, expect, setupBasicMocks } from '../fixtures';
 test.describe('Schedules Settings', () => {
   test.beforeEach(async ({ page }) => {
     await setupBasicMocks(page);
+    await page.route('**/api/schedules/preview', (route) => route.fulfill({
+      status: 200,
+      json: { next: ['2026-07-21T12:00:00+00:00', '2026-07-22T12:00:00+00:00', '2026-07-23T12:00:00+00:00'] },
+    }));
   });
 
   async function openSchedules(page: import('@playwright/test').Page) {
@@ -155,5 +159,31 @@ test.describe('Schedules Settings', () => {
     await expect(page.locator('#schedule-repeats')).toHaveValue('custom');
     await expect(page.locator('#schedule-advanced-body')).toBeVisible();
     await expect(page.locator('#schedule-cron')).toHaveValue('15 6 * * 2#1');
+  });
+
+  test('editor renders the live next-runs preview', async ({ page }) => {
+    await openSchedules(page);
+    await page.locator('.schedules-new').click();
+    await expect(page.locator('#schedule-preview')).toContainText('Next:');
+    await expect(page.locator('#schedule-preview')).toContainText('your local time');
+  });
+
+  test('preview validation errors show inline', async ({ page }) => {
+    await page.unroute('**/api/schedules/preview');
+    await page.route('**/api/schedules/preview', (route) => route.fulfill({
+      status: 400, json: { error: "Invalid cron expression: '14 10 * *'" },
+    }));
+    await openSchedules(page);
+    await page.locator('.schedules-new').click();
+    await expect(page.locator('#schedule-preview')).toContainText('Invalid cron expression');
+  });
+
+  test('unreachable preview shows the fallback text, save stays possible', async ({ page }) => {
+    await page.unroute('**/api/schedules/preview');
+    await page.route('**/api/schedules/preview', (route) => route.abort());
+    await openSchedules(page);
+    await page.locator('.schedules-new').click();
+    await expect(page.locator('#schedule-preview')).toContainText("Can't compute preview right now");
+    await expect(page.locator('.schedule-save')).toBeEnabled();
   });
 });

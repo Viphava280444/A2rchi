@@ -66,6 +66,10 @@ for (const zone of ['Asia/Bangkok', 'Europe/Zurich', 'America/Chicago']) {
 
     test('a new schedule defaults to the browser zone, labeled detected', async ({ page }) => {
       await setupBasicMocks(page);
+      await page.route('**/api/schedules/preview', (route) => route.fulfill({
+        status: 200,
+        json: { next: ['2026-07-21T12:00:00+00:00', '2026-07-22T12:00:00+00:00', '2026-07-23T12:00:00+00:00'] },
+      }));
       await page.goto('/chat');
       await page.getByRole('button', { name: /settings/i }).click();
       await page.getByRole('button', { name: 'Schedules' }).click();
@@ -76,6 +80,10 @@ for (const zone of ['Asia/Bangkok', 'Europe/Zurich', 'America/Chicago']) {
 
     test('editing keeps the schedule own zone, not the browser zone', async ({ page }) => {
       await setupBasicMocks(page);
+      await page.route('**/api/schedules/preview', (route) => route.fulfill({
+        status: 200,
+        json: { next: ['2026-07-21T12:00:00+00:00', '2026-07-22T12:00:00+00:00', '2026-07-23T12:00:00+00:00'] },
+      }));
       await page.route('**/api/schedules**', (route) => {
         if (route.request().method() === 'GET' && !route.request().url().includes('/runs')) {
           return route.fulfill({ status: 200, json: { schedules: [{
