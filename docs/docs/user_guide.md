@@ -90,9 +90,23 @@ if the failure rate crosses 80%"). It's an opt-in service
 (`--services chatbot,playbook-scheduler`); see the
 [Configuration Reference](configuration.md#playbook-scheduler) for deployment setup.
 
-Create one from **Settings → Schedules → New schedule**: pick a playbook, a cron
-expression (or preset) with a timezone, recipient emails, and a mode — **Digest**
-always emails the answer; **Alert** emails only when the run's verdict says to.
+Create one from **Settings → Schedules → New schedule**: pick a playbook,
+recipient emails, and a mode — **Digest** always emails the answer; **Alert**
+emails only when the run's verdict says to.
+
+When creating a schedule, pick a repeat pattern (**Every day**, **Weekdays**,
+**Weekly** with day-of-week chips, **Every N minutes/hours**, or **Monthly**)
+and a time — the cron expression is generated for you. Power users can click
+**Advanced: edit as cron** to type a raw 5-field cron; anything the builder
+can't express (e.g. `2#1` = "first Tuesday") stays editable there.
+
+The **Timezone** defaults to your browser's detected zone, so "07:00" means
+7 AM *your* time; change it if the schedule should follow another region's
+clock. As you edit, a live **Next runs** preview (computed server-side with
+the exact same code the scheduler uses) shows the upcoming fire times in
+your local time — if the preview looks wrong, the schedule *is* wrong, fix
+it before saving. Schedules that would fire more often than every 5 minutes
+are rejected.
 
 Every scheduled turn, either mode, has this instruction appended, requiring the
 final answer to end with a fenced JSON block in exactly this form:
