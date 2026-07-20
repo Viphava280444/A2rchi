@@ -194,6 +194,28 @@ def list_schedule_runs(schedule_id):
         return jsonify({"error": "Internal server error"}), 500
 
 
+@schedules_bp.route("/api/schedules/preview", methods=["POST"])
+def preview_schedule():
+    """Next fire instants for a candidate cron+timezone. Read-only: no DB writes."""
+    try:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+        owner, err = _resolve_owner(data.get("client_id"))
+        if err:
+            return err
+        instants = _svc().preview_next_runs(
+            data.get("cron", ""),
+            data.get("timezone") or _state().get("default_timezone", "UTC"),
+        )
+        return jsonify({"next": [t.isoformat() for t in instants]})
+    except ScheduleValidationError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logger.error(f"Error previewing schedule: {exc}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 def register_schedules(app, *, auth_enabled, require_auth, resolve_owner,
                        schedule_svc, playbook_svc, is_admin,
                        default_timezone: str = "UTC") -> None:

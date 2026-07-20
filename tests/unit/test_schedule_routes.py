@@ -31,13 +31,13 @@ def _schedule(**over):
     return PlaybookSchedule(**base)
 
 
-def _make_app(owner="owner-1", svc=None, playbook_svc=None, admin=False):
+def _make_app(owner="owner-1", svc=None, playbook_svc=None, admin=False, resolve=None):
     app = flask.Flask(__name__)
     register_schedules(
         app,
         auth_enabled=False,
         require_auth=_passthrough_auth,
-        resolve_owner=lambda cid: (owner, None),
+        resolve_owner=resolve if resolve is not None else (lambda cid: (owner, None)),
         schedule_svc=lambda: svc if svc is not None else MagicMock(),
         playbook_svc=lambda: playbook_svc if playbook_svc is not None else MagicMock(),
         is_admin=lambda: admin,
@@ -246,3 +246,58 @@ def test_register_schedules_is_per_app():
     assert app1.config["SCHEDULES_BLUEPRINT_STATE"]["resolve_owner"]("c1")[0] == "owner-1"
     assert app2.config["SCHEDULES_BLUEPRINT_STATE"]["resolve_owner"]("c1")[0] == "owner-2"
     assert app1.config["SCHEDULES_BLUEPRINT_STATE"] is not app2.config["SCHEDULES_BLUEPRINT_STATE"]
+
+
+def test_preview_returns_next_instants():
+    svc = MagicMock()
+    svc.preview_next_runs.return_value = [
+        datetime(2026, 7, 21, 5, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 22, 5, 0, tzinfo=timezone.utc),
+        datetime(2026, 7, 23, 5, 0, tzinfo=timezone.utc),
+    ]
+    client = _make_app(svc=svc).test_client()
+
+    resp = client.post("/api/schedules/preview", json={
+        "client_id": "c1", "cron": "0 7 * * *", "timezone": "Europe/Zurich",
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert len(data["next"]) == 3
+    assert data["next"][0] == "2026-07-21T05:00:00+00:00"
+    svc.preview_next_runs.assert_called_once_with("0 7 * * *", "Europe/Zurich")
+
+
+def test_preview_maps_validation_error_to_400():
+    svc = MagicMock()
+    svc.preview_next_runs.side_effect = ScheduleValidationError("Invalid cron expression: '14 10 * *'")
+    client = _make_app(svc=svc).test_client()
+    resp = client.post("/api/schedules/preview", json={
+        "client_id": "c1", "cron": "14 10 * *", "timezone": "UTC",
+    })
+    assert resp.status_code == 400
+    assert "Invalid cron expression" in resp.get_json()["error"]
+
+
+def test_preview_requires_json_body():
+    client = _make_app().test_client()
+    resp = client.post("/api/schedules/preview", data="not json",
+                       content_type="text/plain")
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "Request body must be valid JSON"
+
+
+def test_preview_defaults_timezone_from_blueprint_state():
+    svc = MagicMock()
+    svc.preview_next_runs.return_value = []
+    client = _make_app(svc=svc).test_client()
+    client.post("/api/schedules/preview", json={"client_id": "c1", "cron": "0 7 * * *"})
+    svc.preview_next_runs.assert_called_once_with("0 7 * * *", "UTC")
+
+
+def test_preview_owner_resolution_failure_short_circuits():
+    svc = MagicMock()
+    client = _make_app(svc=svc, resolve=lambda cid: (None, ({"error": "denied"}, 401))).test_client()
+    resp = client.post("/api/schedules/preview", json={"client_id": "bad", "cron": "0 7 * * *"})
+    assert resp.status_code == 401
+    svc.preview_next_runs.assert_not_called()
