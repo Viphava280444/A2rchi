@@ -1295,11 +1295,16 @@ const UI = {
     document.querySelector('.schedule-cancel')?.addEventListener('click', () => Chat.closeScheduleEditor());
     document.querySelector('.schedule-backdrop')?.addEventListener('click', () => Chat.closeScheduleEditor());
     document.querySelector('.schedule-save')?.addEventListener('click', () => Chat.saveScheduleFromEditor());
-    document.getElementById('schedule-preset')?.addEventListener('change', (e) => {
-      if (e.target.value !== '__custom__') {
-        document.getElementById('schedule-cron').value = e.target.value;
-      }
+    ['schedule-repeats', 'schedule-time', 'schedule-every-n',
+     'schedule-monthday', 'schedule-timezone'].forEach((id) => {
+      document.getElementById(id)?.addEventListener('change', () => Chat.onScheduleBuilderChange());
     });
+    document.getElementById('schedule-every-unit')?.addEventListener('change', () => {
+      Chat._populateIntervalChoices();
+      Chat.onScheduleBuilderChange();
+    });
+    document.getElementById('schedule-cron')?.addEventListener('input', () => Chat.onScheduleCronEdited());
+    document.getElementById('schedule-advanced-toggle')?.addEventListener('click', () => Chat.toggleScheduleAdvanced());
     // Resize handle for agent spec modal
     this.initAgentSpecResize();
     
@@ -5861,8 +5866,16 @@ const Chat = {
       }
     }
     document.getElementById('schedule-name').value = schedule?.name || '';
-    document.getElementById('schedule-cron').value = schedule?.cron || '0 7 * * *';
-    document.getElementById('schedule-timezone').value = schedule?.timezone || 'UTC';
+    const cron = schedule?.cron || '0 7 * * *';
+    document.getElementById('schedule-cron').value = cron;
+    this._scheduleAdvancedOpen = false;
+    const advBtn = document.getElementById('schedule-advanced-toggle');
+    if (advBtn) advBtn.textContent = '▸ Advanced: edit as cron';
+    this._populateIntervalChoices();
+    this._populateMonthdayChoices();
+    this._populateTimezoneSelect(schedule?.timezone || 'UTC');
+    this._applyBuilderState(ScheduleCron.recognize(cron));
+    this.refreshSchedulePreview();
     document.getElementById('schedule-recipients').value = (schedule?.recipients || []).join(', ');
     document.getElementById('schedule-subject').value = schedule?.subject_prefix || '';
     document.getElementById('schedule-instructions').value = schedule?.extra_instructions || '';
@@ -5910,6 +5923,124 @@ const Chat = {
         status.classList.add('error');
       }
     }
+  },
+
+  _scheduleAdvancedOpen: false,
+
+  _scheduleBuilderState() {
+    return {
+      pattern: document.getElementById('schedule-repeats').value,
+      time: document.getElementById('schedule-time').value || '07:00',
+      days: [...document.querySelectorAll('#schedule-days .schedule-day-chip.on')]
+        .map((b) => Number(b.dataset.day)),
+      every: Number(document.getElementById('schedule-every-n').value),
+      unit: document.getElementById('schedule-every-unit').value,
+      monthday: Number(document.getElementById('schedule-monthday').value),
+    };
+  },
+
+  _syncScheduleBuilderVisibility() {
+    const p = document.getElementById('schedule-repeats').value;
+    document.getElementById('schedule-time-field').hidden = (p === 'interval' || p === 'custom');
+    document.getElementById('schedule-days-field').hidden = (p !== 'weekly');
+    document.getElementById('schedule-interval-field').hidden = (p !== 'interval');
+    document.getElementById('schedule-monthday-field').hidden = (p !== 'monthly');
+    const state = this._scheduleBuilderState();
+    document.getElementById('schedule-monthday-note').hidden = !(p === 'monthly' && state.monthday >= 29);
+    document.getElementById('schedule-advanced-body').hidden = !(p === 'custom' || this._scheduleAdvancedOpen);
+  },
+
+  _renderScheduleDayChips(selected = []) {
+    const wrap = document.getElementById('schedule-days');
+    if (!wrap) return;
+    const order = [1, 2, 3, 4, 5, 6, 0]; // Monday-first, cron day numbers
+    wrap.innerHTML = order.map((d) =>
+      `<button type="button" class="schedule-day-chip${selected.includes(d) ? ' on' : ''}" data-day="${d}">${ScheduleCron.DAY_NAMES[d]}</button>`
+    ).join('');
+    wrap.querySelectorAll('.schedule-day-chip').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        btn.classList.toggle('on');
+        Chat.onScheduleBuilderChange();
+      });
+    });
+  },
+
+  _populateIntervalChoices() {
+    const unit = document.getElementById('schedule-every-unit').value;
+    const list = unit === 'hours' ? SCHEDULE_INTERVAL_HOURS : SCHEDULE_INTERVAL_MINUTES;
+    const sel = document.getElementById('schedule-every-n');
+    const prev = Number(sel.value);
+    sel.innerHTML = list.map((n) => `<option value="${n}">${n}</option>`).join('');
+    sel.value = String(list.includes(prev) ? prev : list[0]);
+    // Deliberately no onScheduleBuilderChange() here: openScheduleEditor calls this
+    // BEFORE restoring the saved cron, and a compile from stale controls would
+    // clobber an exotic schedule's cron. The unit-change listener triggers the
+    // rebuild+compile pair explicitly.
+  },
+
+  _populateMonthdayChoices() {
+    const sel = document.getElementById('schedule-monthday');
+    if (sel.options.length) return;
+    sel.innerHTML = Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}">${i + 1}</option>`).join('');
+  },
+
+  _populateTimezoneSelect(selected) {
+    const sel = document.getElementById('schedule-timezone');
+    if (!sel) return;
+    const zones = new Set(SCHEDULE_FALLBACK_ZONES);
+    if (selected) zones.add(selected);
+    sel.innerHTML = [...zones].map((z) =>
+      `<option value="${Utils.escapeAttr(z)}">${Utils.escapeHtml(z)}</option>`).join('');
+    sel.value = selected || 'UTC';
+  },
+
+  _applyBuilderState(state) {
+    const s = state || { pattern: 'custom' };
+    document.getElementById('schedule-repeats').value = s.pattern;
+    if (s.time) document.getElementById('schedule-time').value = s.time;
+    if (s.pattern === 'interval') {
+      document.getElementById('schedule-every-unit').value = s.unit;
+      this._populateIntervalChoices();
+      document.getElementById('schedule-every-n').value = String(s.every);
+    }
+    if (s.pattern === 'monthly') {
+      document.getElementById('schedule-monthday').value = String(s.monthday);
+    }
+    this._renderScheduleDayChips(s.pattern === 'weekly' ? s.days : [1]);
+    this._syncScheduleBuilderVisibility();
+  },
+
+  onScheduleBuilderChange() {
+    this._syncScheduleBuilderVisibility();
+    const state = this._scheduleBuilderState();
+    if (state.pattern !== 'custom') {
+      const cron = ScheduleCron.compile(state);
+      if (cron) document.getElementById('schedule-cron').value = cron;
+    }
+    this.refreshSchedulePreview();
+  },
+
+  onScheduleCronEdited() {
+    const raw = document.getElementById('schedule-cron').value.trim();
+    const recognized = ScheduleCron.recognize(raw);
+    if (recognized) {
+      this._applyBuilderState(recognized);
+    } else {
+      document.getElementById('schedule-repeats').value = 'custom';
+      this._syncScheduleBuilderVisibility();
+    }
+    this.refreshSchedulePreview();
+  },
+
+  toggleScheduleAdvanced() {
+    this._scheduleAdvancedOpen = !this._scheduleAdvancedOpen;
+    const btn = document.getElementById('schedule-advanced-toggle');
+    if (btn) btn.textContent = `${this._scheduleAdvancedOpen ? '▾' : '▸'} Advanced: edit as cron`;
+    this._syncScheduleBuilderVisibility();
+  },
+
+  refreshSchedulePreview() {
+    // Filled in by the live-preview task; the stub keeps builder wiring testable alone.
   },
 };
 
