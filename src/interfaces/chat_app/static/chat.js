@@ -5912,6 +5912,14 @@ const Chat = {
 
   async saveScheduleFromEditor() {
     const status = document.getElementById('schedule-editor-status');
+    const builderState = this._scheduleBuilderState();
+    if (builderState.pattern === 'weekly' && !builderState.days.length) {
+      if (status) {
+        status.textContent = 'Pick at least one day of the week.';
+        status.classList.add('error');
+      }
+      return;
+    }
     const payload = {
       name: document.getElementById('schedule-name').value.trim(),
       playbook_id: Number(document.getElementById('schedule-playbook').value),

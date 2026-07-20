@@ -4595,6 +4595,12 @@ body {
   flex: 1;
 }
 
+/* [hidden] alone is defeated by the author display rules above; restore it. */
+.schedule-field[hidden],
+.schedule-field-row > div[hidden] {
+  display: none;
+}
+
 .schedule-label {
   font-size: var(--text-sm);
   font-weight: 600;

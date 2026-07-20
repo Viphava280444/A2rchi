@@ -32,6 +32,11 @@ test.describe('Schedules Settings', () => {
     await expect(page.locator('#schedule-time')).toHaveValue('07:00');
     await expect(page.locator('#schedule-cron')).toHaveValue('0 7 * * *'); // hidden but synced
     await expect(page.locator('#schedule-advanced-body')).toBeHidden();
+    // daily mode: only the time field is active; interval/monthday/days stay hidden
+    await expect(page.locator('#schedule-time-field')).toBeVisible();
+    await expect(page.locator('#schedule-interval-field')).toBeHidden();
+    await expect(page.locator('#schedule-monthday-field')).toBeHidden();
+    await expect(page.locator('#schedule-days-field')).toBeHidden();
   });
 
   test('saving a schedule POSTs the form payload', async ({ page }) => {
@@ -105,6 +110,9 @@ test.describe('Schedules Settings', () => {
     await page.locator('#schedule-name').fill('weekly-report');
     await page.locator('#schedule-recipients').fill('ops@cern.ch');
     await page.locator('#schedule-repeats').selectOption('weekly');
+    // weekly mode reveals the day chips and hides the interval field
+    await expect(page.locator('#schedule-days-field')).toBeVisible();
+    await expect(page.locator('#schedule-interval-field')).toBeHidden();
     await page.locator('#schedule-time').fill('09:00');
     // Mon is preselected; add Thu
     await page.locator('#schedule-days [data-day="4"]').click();
@@ -113,6 +121,26 @@ test.describe('Schedules Settings', () => {
       page.locator('.schedule-save').click(),
     ]);
     expect(request.postDataJSON().cron).toBe('0 9 * * 1,4');
+  });
+
+  test('weekly with zero days blocks save with an inline nudge, no POST', async ({ page }) => {
+    await openSchedules(page);
+    await page.locator('.schedules-new').click();
+    await page.locator('#schedule-name').fill('weekly-report');
+    await page.locator('#schedule-recipients').fill('ops@cern.ch');
+    await page.locator('#schedule-repeats').selectOption('weekly');
+    // Monday is preselected by default; deselecting it leaves zero days
+    await page.locator('#schedule-days [data-day="1"]').click();
+
+    let posted = false;
+    page.on('request', (r) => {
+      if (r.url().endsWith('/api/schedules') && r.method() === 'POST') posted = true;
+    });
+
+    await page.locator('.schedule-save').click();
+    await expect(page.locator('#schedule-editor-status')).toContainText('Pick at least one day', { timeout: 5000 });
+    await expect(page.locator('.schedule-modal')).toBeVisible(); // editor stays open
+    expect(posted).toBe(false);
   });
 
   test('editing a builder-shaped schedule restores the builder state', async ({ page }) => {
