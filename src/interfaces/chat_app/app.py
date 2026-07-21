@@ -52,8 +52,10 @@ from src.utils.config_service import ConfigService, StaticConfig
 from src.utils.sql import (
     SQL_INSERT_CONVO, SQL_INSERT_FEEDBACK, SQL_INSERT_TIMING, SQL_QUERY_CONVO,
     SQL_CREATE_CONVERSATION, SQL_UPDATE_CONVERSATION_TIMESTAMP,
-    SQL_LIST_CONVERSATIONS, SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION,
-    SQL_LIST_CONVERSATIONS_BY_USER, SQL_GET_CONVERSATION_METADATA_BY_USER,
+    SQL_LIST_CONVERSATIONS, SQL_LIST_CONVERSATIONS_NO_SCHEDULES,
+    SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION,
+    SQL_LIST_CONVERSATIONS_BY_USER, SQL_LIST_CONVERSATIONS_BY_USER_NO_SCHEDULES,
+    SQL_GET_CONVERSATION_METADATA_BY_USER,
     SQL_DELETE_CONVERSATION_BY_USER, SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER,
     SQL_INSERT_TOOL_CALLS, SQL_QUERY_CONVO_WITH_FEEDBACK,
     SQL_QUERY_CONVO_WITH_FEEDBACK_NO_PLAYBOOKS, SQL_DELETE_REACTION_FEEDBACK,
@@ -342,6 +344,25 @@ def _query_convo_history_rows(cursor, conversation_id):
             conversation_id,
         )
         cursor.execute(SQL_QUERY_CONVO_WITH_FEEDBACK_NO_PLAYBOOKS, (conversation_id,))
+    return cursor.fetchall()
+
+
+def _list_conversation_rows(cursor, primary_sql, fallback_sql, params):
+    """Conversation rows (conversation_id, title, created_at, last_message_at,
+    is_scheduled) for the sidebar list.
+
+    Falls back to the no-schedules variant when playbook_schedule_runs is missing
+    (chat-only deployments never run the scheduler service that creates it):
+    is_scheduled degrades to False instead of the whole list returning 500.
+    """
+    try:
+        cursor.execute(primary_sql, params)
+    except psycopg2.errors.UndefinedTable:
+        cursor.connection.rollback()  # leave the aborted transaction before retrying
+        logger.warning(
+            "playbook_schedule_runs missing; listing conversations without the scheduled flag"
+        )
+        cursor.execute(fallback_sql, params)
     return cursor.fetchall()
 
 
@@ -5254,7 +5275,9 @@ class FlaskAppWrapper(object):
         - limit (optional): Number of conversations to return (default: 50, max: 500)
 
         Returns:
-            JSON with list of conversations with fields: (conversation_id, title, created_at, last_message_at).
+            JSON with list of conversations with fields: (conversation_id, title,
+            created_at, last_message_at, is_scheduled). is_scheduled is True when a
+            playbook schedule run created the conversation.
         """
         try:
             client_id = request.args.get('client_id')
@@ -5267,10 +5290,17 @@ class FlaskAppWrapper(object):
             conn = psycopg2.connect(**self.pg_config)
             cursor = conn.cursor()
             if user_id:
-                cursor.execute(SQL_LIST_CONVERSATIONS_BY_USER, (user_id, client_id, limit))
+                rows = _list_conversation_rows(
+                    cursor, SQL_LIST_CONVERSATIONS_BY_USER,
+                    SQL_LIST_CONVERSATIONS_BY_USER_NO_SCHEDULES,
+                    (user_id, client_id, limit),
+                )
             else:
-                cursor.execute(SQL_LIST_CONVERSATIONS, (client_id, limit))
-            rows = cursor.fetchall()
+                rows = _list_conversation_rows(
+                    cursor, SQL_LIST_CONVERSATIONS,
+                    SQL_LIST_CONVERSATIONS_NO_SCHEDULES,
+                    (client_id, limit),
+                )
 
             conversations = []
             for row in rows:
@@ -5279,6 +5309,7 @@ class FlaskAppWrapper(object):
                     'title': row[1] or "New Chat",
                     'created_at': row[2].isoformat() if row[2] else None,
                     'last_message_at': row[3].isoformat() if row[3] else None,
+                    'is_scheduled': bool(row[4]),
                 })
 
             # clean up database connection state

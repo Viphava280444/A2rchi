@@ -85,6 +85,8 @@ def test_ensure_schema_creates_both_tables_and_indexes(monkeypatch):
     assert "CREATE TABLE IF NOT EXISTS playbook_schedule_runs" in joined
     assert "idx_playbook_schedules_due" in joined
     assert "idx_playbook_schedule_runs_sched" in joined
+    # Index backing the sidebar is_scheduled EXISTS (conversation_id correlation).
+    assert "idx_playbook_schedule_runs_conversation" in joined
     assert conn.committed
 
 

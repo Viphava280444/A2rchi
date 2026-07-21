@@ -127,6 +127,13 @@ Each schedule card has **Run now** (queues an immediate run, picked up within on
 poll interval) and **History** (past runs, whether each emailed, and an **open
 run** link straight into that run's conversation with its trace panel).
 
+Because every scheduled run is a real conversation, they could otherwise bury your
+personal chats in the sidebar. Instead they are folded into a single **Scheduled
+runs (N)** group at the bottom of the chat history, collapsed by default (click to
+expand; the state is remembered per browser). Conversations inside behave exactly
+like any other — open them, delete them, and the active one stays highlighted —
+and new runs land in the group automatically as the list refreshes.
+
 ---
 
 ## Models & Providers

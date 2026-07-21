@@ -187,6 +187,13 @@ class PlaybookScheduleService:
                     "CREATE INDEX IF NOT EXISTS idx_playbook_schedule_runs_sched "
                     "ON playbook_schedule_runs(schedule_id, started_at DESC)"
                 )
+                # Supports the is_scheduled EXISTS in the sidebar conversation list
+                # (chat_app list_conversations), which correlates on conversation_id.
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_playbook_schedule_runs_conversation "
+                    "ON playbook_schedule_runs(conversation_id) "
+                    "WHERE conversation_id IS NOT NULL"
+                )
             conn.commit()
         finally:
             self._release_connection(conn)

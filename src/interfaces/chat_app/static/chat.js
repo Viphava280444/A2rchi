@@ -19,6 +19,7 @@ const CONFIG = {
     SELECTED_PROVIDER: 'archi_selected_provider',
     SELECTED_MODEL: 'archi_selected_model',
     SELECTED_MODEL_CUSTOM: 'archi_selected_model_custom',
+    SCHEDULED_GROUP_COLLAPSED: 'archi_scheduled_group_collapsed',
   },
   ENDPOINTS: {
     STREAM: '/api/get_chat_response_stream',
@@ -301,6 +302,16 @@ const Storage = {
     } else {
       localStorage.setItem(CONFIG.STORAGE_KEYS.ACTIVE_CONVERSATION, String(id));
     }
+  },
+
+  // Sidebar "Scheduled runs" group — collapsed by default (nothing stored).
+  isScheduledGroupCollapsed() {
+    return localStorage.getItem(CONFIG.STORAGE_KEYS.SCHEDULED_GROUP_COLLAPSED) !== 'false';
+  },
+
+  setScheduledGroupCollapsed(collapsed) {
+    localStorage.setItem(
+      CONFIG.STORAGE_KEYS.SCHEDULED_GROUP_COLLAPSED, collapsed ? 'true' : 'false');
   },
 };
 
@@ -2371,6 +2382,24 @@ const UI = {
     });
   },
 
+  _conversationItemHtml(conv, activeId) {
+    const isActive = conv.conversation_id === activeId;
+    const title = Utils.escapeHtml(conv.title || `Conversation ${conv.conversation_id}`);
+    return `
+          <div class="conversation-item ${isActive ? 'active' : ''}"
+               data-id="${conv.conversation_id}">
+            <svg class="conversation-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <span class="conversation-item-title">${title}</span>
+            <button class="conversation-item-delete" data-id="${conv.conversation_id}" aria-label="Delete conversation" title="Delete conversation">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+              </svg>
+            </button>
+          </div>`;
+  },
+
   renderConversations(conversations, activeId) {
     const list = this.elements.conversationList;
     if (!list) return;
@@ -2383,38 +2412,61 @@ const UI = {
       return;
     }
 
-    const groups = Utils.groupByDate(conversations);
+    // Scheduled runs create real conversations; keep personal chats where they
+    // are and fold every scheduled one into a single collapsible group below.
+    const personal = conversations.filter((conv) => !conv.is_scheduled);
+    const scheduled = conversations.filter((conv) => conv.is_scheduled);
+
     let html = '';
 
+    const groups = Utils.groupByDate(personal);
     for (const [label, items] of Object.entries(groups)) {
       if (!items.length) continue;
-      
+
       html += `<div class="conversation-group">
         <div class="conversation-group-label">${label}</div>`;
-      
+
       for (const conv of items) {
-        const isActive = conv.conversation_id === activeId;
-        const title = Utils.escapeHtml(conv.title || `Conversation ${conv.conversation_id}`);
-        
-        html += `
-          <div class="conversation-item ${isActive ? 'active' : ''}" 
-               data-id="${conv.conversation_id}">
-            <svg class="conversation-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-            </svg>
-            <span class="conversation-item-title">${title}</span>
-            <button class="conversation-item-delete" data-id="${conv.conversation_id}" aria-label="Delete conversation" title="Delete conversation">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-              </svg>
-            </button>
-          </div>`;
+        html += this._conversationItemHtml(conv, activeId);
       }
-      
+
       html += '</div>';
     }
 
+    // A single "Scheduled runs (N)" section: hidden entirely when empty,
+    // collapsed by default, with expand/collapse state persisted in localStorage.
+    // It sits below the personal list so automated runs never bury personal chats.
+    if (scheduled.length) {
+      const collapsed = Storage.isScheduledGroupCollapsed();
+      let body = '';
+      for (const conv of scheduled) {
+        body += this._conversationItemHtml(conv, activeId);
+      }
+      html += `<div class="conversation-group conversation-group-scheduled" data-collapsed="${collapsed}">
+        <button type="button" class="conversation-group-toggle" aria-expanded="${!collapsed}" aria-controls="scheduled-runs-body">
+          <svg class="conversation-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M9 18l6-6-6-6"></path>
+          </svg>
+          <span class="conversation-group-label">Scheduled runs</span>
+          <span class="conversation-group-count">${scheduled.length}</span>
+        </button>
+        <div class="conversation-group-body" id="scheduled-runs-body">${body}</div>
+      </div>`;
+    }
+
     list.innerHTML = html;
+
+    // Collapse/expand the scheduled group in place (state persisted; no re-render).
+    const toggle = list.querySelector('.conversation-group-toggle');
+    if (toggle) {
+      toggle.addEventListener('click', () => {
+        const group = toggle.closest('.conversation-group-scheduled');
+        const nowCollapsed = group.dataset.collapsed !== 'true';
+        group.dataset.collapsed = String(nowCollapsed);
+        toggle.setAttribute('aria-expanded', String(!nowCollapsed));
+        Storage.setScheduledGroupCollapsed(nowCollapsed);
+      });
+    }
 
     // Bind click events
     list.querySelectorAll('.conversation-item').forEach((item) => {

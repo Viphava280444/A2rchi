@@ -409,6 +409,52 @@ body {
   letter-spacing: 0.05em;
 }
 
+/* Collapsible "Scheduled runs" group -------------------------------------- */
+.conversation-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 12px 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.conversation-group-toggle:hover {
+  color: var(--text-secondary);
+}
+
+.conversation-group-chevron {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  transition: transform var(--transition-fast);
+}
+
+.conversation-group-scheduled:not([data-collapsed="true"]) .conversation-group-chevron {
+  transform: rotate(90deg);
+}
+
+.conversation-group-toggle .conversation-group-label {
+  padding: 0;
+}
+
+.conversation-group-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+
+.conversation-group-scheduled[data-collapsed="true"] .conversation-group-body {
+  display: none;
+}
+
 .conversation-item {
   display: flex;
   align-items: center;

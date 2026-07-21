@@ -148,8 +148,28 @@ SET last_message_at = %s
 WHERE conversation_id = %s AND client_id = %s;
 """
 
+# is_scheduled marks conversations that a playbook schedule run created (source of
+# truth: playbook_schedule_runs.conversation_id, NOT the user-editable "[Scheduled]"
+# title prefix). The EXISTS is evaluated only for the LIMIT-bounded result rows.
 SQL_LIST_CONVERSATIONS = """
-SELECT conversation_id, title, created_at, last_message_at
+SELECT conversation_id, title, created_at, last_message_at,
+       EXISTS (
+           SELECT 1 FROM playbook_schedule_runs psr
+           WHERE psr.conversation_id = conversation_metadata.conversation_id
+       ) AS is_scheduled
+FROM conversation_metadata
+WHERE client_id = %s
+ORDER BY last_message_at DESC
+LIMIT %s;
+"""
+
+# Fallback for deployments without the scheduler service, where
+# playbook_schedule_runs was never created: same column shape (is_scheduled
+# last, constant FALSE) so the conversation list degrades to un-grouped instead
+# of erroring. Keep the SELECT lists of the two variants in sync.
+SQL_LIST_CONVERSATIONS_NO_SCHEDULES = """
+SELECT conversation_id, title, created_at, last_message_at,
+       FALSE AS is_scheduled
 FROM conversation_metadata
 WHERE client_id = %s
 ORDER BY last_message_at DESC
@@ -171,7 +191,21 @@ WHERE conversation_id = %s AND client_id = %s;
 # Each query also falls back to client_id so that conversations created before
 # user_id was populated remain accessible.
 SQL_LIST_CONVERSATIONS_BY_USER = """
-SELECT conversation_id, title, created_at, last_message_at
+SELECT conversation_id, title, created_at, last_message_at,
+       EXISTS (
+           SELECT 1 FROM playbook_schedule_runs psr
+           WHERE psr.conversation_id = conversation_metadata.conversation_id
+       ) AS is_scheduled
+FROM conversation_metadata
+WHERE user_id = %s OR client_id = %s
+ORDER BY last_message_at DESC
+LIMIT %s;
+"""
+
+# Fallback variant (see SQL_LIST_CONVERSATIONS_NO_SCHEDULES) for the by-user path.
+SQL_LIST_CONVERSATIONS_BY_USER_NO_SCHEDULES = """
+SELECT conversation_id, title, created_at, last_message_at,
+       FALSE AS is_scheduled
 FROM conversation_metadata
 WHERE user_id = %s OR client_id = %s
 ORDER BY last_message_at DESC
