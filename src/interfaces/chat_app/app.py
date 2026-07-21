@@ -1433,6 +1433,119 @@ class ChatWrapper:
                 logger.warning(
                     "Could not record auto playbook invocation for message %s: %s", message_id, exc)
 
+    # Parity with the streaming formatter's default max_step_chars: tool output is
+    # truncated to this many chars in the trace events so the persisted JSON stays
+    # bounded and the panel renders the same shape it does for streamed traces.
+    _TRACE_TOOL_OUTPUT_MAX_CHARS = 800
+
+    def _build_nonstreaming_trace_events(
+        self, result: PipelineOutput, conversation_id: int, timestamp: str
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Synthesize the agent-activity events for a non-streaming response.
+
+        The streaming path emits these live through PipelineEventFormatter; here we
+        reconstruct the same ``tool_start`` + ``tool_output`` pair per tool call from
+        the final PipelineOutput's message history (``extract_tool_calls()``), matching
+        the exact field shapes ``renderHistoricalTrace`` reads. No tool calls -> an
+        empty list (a zero-tool run, e.g. a classic QA pipeline, still gets a trace row
+        with ``events == []`` — parity with streaming, which always creates the trace).
+
+        Returns ``(events, tool_count)``.
+        """
+        events: List[Dict[str, Any]] = []
+        tool_calls = result.extract_tool_calls() if result else []
+        for i, tc in enumerate(tool_calls):
+            # A truthy id is required for the renderer to key/count the step; synthesize
+            # a per-trace-unique fallback for the rare tool call that carries none.
+            tc_id = tc.get("id") or f"nonstream_tool_{i}"
+            tool_name = tc.get("name") or "unknown"
+            tool_args = tc.get("args") or {}
+            raw_result = tc.get("result", "")
+            if not isinstance(raw_result, str):
+                raw_result = json.dumps(raw_result, default=str)
+
+            events.append({
+                "type": "tool_start",
+                "tool_call_id": tc_id,
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "timestamp": timestamp,
+                "conversation_id": conversation_id,
+            })
+
+            max_chars = self._TRACE_TOOL_OUTPUT_MAX_CHARS
+            if max_chars and len(raw_result) > max_chars:
+                display = raw_result[: max_chars - 3].rstrip() + "..."
+                truncated, full_length = True, len(raw_result)
+            else:
+                display, truncated, full_length = raw_result, False, None
+            out_evt: Dict[str, Any] = {
+                "type": "tool_output",
+                "tool_call_id": tc_id,
+                "output": display,
+                "truncated": truncated,
+                "timestamp": timestamp,
+                "conversation_id": conversation_id,
+            }
+            if full_length is not None:
+                out_evt["full_length"] = full_length
+            events.append(out_evt)
+
+        return events, len(tool_calls)
+
+    def _persist_nonstreaming_trace(
+        self,
+        result: PipelineOutput,
+        context: "ChatRequestContext",
+        message_ids: Optional[List[int]],
+        timestamps: Dict[str, datetime],
+    ) -> Optional[str]:
+        """Create + finalize exactly one ``agent_traces`` row for a non-streaming
+        (``__call__``) response, post-hoc from the final PipelineOutput.
+
+        ``stream()`` builds its trace live; this is the analog for the shared
+        non-streaming path (playbook scheduler + plain REST chat), which otherwise
+        left the UI activity panel with nothing to show. The archi (assistant)
+        message id is wired as ``message_id`` so ``load_conversation`` links the trace
+        to the message; the user message id is known here, so it is set at creation
+        too (streaming leaves it NULL).
+
+        Best-effort: the response is already persisted by the time this runs, so a
+        trace-store failure is logged and swallowed rather than surfaced as a 500.
+        """
+        try:
+            archi_message_id = message_ids[-1] if message_ids else None
+            user_message_id = (
+                message_ids[0] if message_ids and len(message_ids) > 1 else None)
+            timestamp = datetime.now(timezone.utc).isoformat()
+            events, tool_count = self._build_nonstreaming_trace_events(
+                result, context.conversation_id, timestamp)
+
+            trace_id = self.create_agent_trace(
+                conversation_id=context.conversation_id,
+                user_message_id=user_message_id,
+                config_id=None,  # legacy field, no longer used
+                pipeline_name=getattr(self.archi, "pipeline_name", None),
+            )
+
+            start_ts = timestamps.get("lock_acquisition_ts")
+            end_ts = timestamps.get("chain_finished_ts") or datetime.now(timezone.utc)
+            total_duration_ms = (
+                int((end_ts - start_ts).total_seconds() * 1000) if start_ts else None)
+
+            self.update_agent_trace(
+                trace_id=trace_id,
+                events=events,
+                status="completed",
+                message_id=archi_message_id,
+                total_tool_calls=tool_count,
+                total_duration_ms=total_duration_ms,
+            )
+            return trace_id
+        except Exception as exc:
+            logger.warning("Could not persist non-streaming agent trace: %s", exc)
+            return None
+
     def _init_timestamps(self) -> Dict[str, datetime]:
         return {
             "lock_acquisition_ts": datetime.now(timezone.utc),
@@ -2373,6 +2486,12 @@ class ChatWrapper:
                 server_received_msg_ts=server_received_msg_ts,
                 timestamps=timestamps,
             )
+
+            # Persist the agent-activity trace for this non-streaming response so the
+            # UI panel has tool activity to show (scheduled runs drive this path). The
+            # streaming path builds its own trace live and never reaches here, so no
+            # request gets a double trace. Best-effort inside the helper.
+            self._persist_nonstreaming_trace(result, context, message_ids, timestamps)
 
         except ConversationAccessError as e:
             logger.warning(f"Unauthorized conversation access attempt: {e}")
