@@ -87,7 +87,11 @@ async def initialize_mcp_client() -> Tuple[Optional[MultiServerMCPClient], List[
 
     for name in client_configs.keys():
         try:
-            tools = await client.get_tools(server_name=name)
+            session_ctx = client.session(name)
+            session = await session_ctx.__aenter__()
+            client._sessions = getattr(client, '_sessions', {})
+            client._sessions[name] = session_ctx  
+            tools = await load_mcp_tools(session)
             for tool in tools:
                 # Return error messages to the LLM instead of crashing the agent chain.
                 tool.handle_tool_error = True
