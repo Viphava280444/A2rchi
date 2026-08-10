@@ -69,6 +69,7 @@ class DeploymentPlan:
             "grader": ServiceState(),
             "piazza": ServiceState(),
             "mattermost": ServiceState(),
+            "playbook-scheduler": ServiceState(),
             "redmine-mailer": ServiceState(),
             "jira_ticket_responder": ServiceState(),
             "benchmarking": ServiceState(),

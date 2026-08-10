@@ -513,6 +513,44 @@ export async function setupBasicMocks(page: Page) {
       },
     });
   });
+
+  // Playbooks list, as consumed by the schedule editor's playbook dropdown.
+  await page.route('**/api/playbooks**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      json: { playbooks: [{ id: 7, name: 'check-rates', description: '', visibility: 'private' }] },
+    });
+  });
+
+  // Playbook schedules. Playwright runs matching routes in reverse registration
+  // order (last registered wins), so the generic list/create/update route is
+  // registered first here and the more specific /run and /runs routes are
+  // registered after it so they take priority for their narrower paths.
+  await page.route('**/api/schedules**', async (route) => {
+    if (route.request().method() === 'POST') {
+      await route.fulfill({
+        status: 200,
+        json: { success: true, schedule: { id: 1, name: 'daily-transfers' } },
+      });
+      return;
+    }
+    if (route.request().method() === 'PATCH') {
+      await route.fulfill({
+        status: 200,
+        json: { success: true, schedule: { id: 1, name: 'renamed' } },
+      });
+      return;
+    }
+    await route.fulfill({ status: 200, json: { schedules: [] } });
+  });
+
+  await page.route('**/api/schedules/*/run', async (route) => {
+    await route.fulfill({ status: 200, json: { success: true, queued: true } });
+  });
+
+  await page.route('**/api/schedules/*/runs**', async (route) => {
+    await route.fulfill({ status: 200, json: { runs: [] } });
+  });
 }
 
 export async function setupABDecisionMock(page: Page, overrides: Record<string, any> = {}) {

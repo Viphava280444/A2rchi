@@ -52,8 +52,10 @@ from src.utils.config_service import ConfigService, StaticConfig
 from src.utils.sql import (
     SQL_INSERT_CONVO, SQL_INSERT_FEEDBACK, SQL_INSERT_TIMING, SQL_QUERY_CONVO,
     SQL_CREATE_CONVERSATION, SQL_UPDATE_CONVERSATION_TIMESTAMP,
-    SQL_LIST_CONVERSATIONS, SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION,
-    SQL_LIST_CONVERSATIONS_BY_USER, SQL_GET_CONVERSATION_METADATA_BY_USER,
+    SQL_LIST_CONVERSATIONS, SQL_LIST_CONVERSATIONS_NO_SCHEDULES,
+    SQL_GET_CONVERSATION_METADATA, SQL_DELETE_CONVERSATION,
+    SQL_LIST_CONVERSATIONS_BY_USER, SQL_LIST_CONVERSATIONS_BY_USER_NO_SCHEDULES,
+    SQL_GET_CONVERSATION_METADATA_BY_USER,
     SQL_DELETE_CONVERSATION_BY_USER, SQL_UPDATE_CONVERSATION_TIMESTAMP_BY_USER,
     SQL_INSERT_TOOL_CALLS, SQL_QUERY_CONVO_WITH_FEEDBACK,
     SQL_QUERY_CONVO_WITH_FEEDBACK_NO_PLAYBOOKS, SQL_DELETE_REACTION_FEEDBACK,
@@ -68,10 +70,11 @@ from src.utils.playbook_service import (
 from src.archi.pipelines.agents.tools.playbook_tools import (
     set_playbook_owner, get_playbook_owner,
     set_pending_playbook, get_pending_playbook, clear_pending_playbook,
-    classify_playbook_tool_result,
+    classify_playbook_tool_result, get_invocation_source,
 )
 from src.interfaces.chat_app.document_utils import *
 from src.interfaces.chat_app.playbook_routes import register_playbooks
+from src.interfaces.chat_app.schedule_routes import register_schedules
 from src.interfaces.chat_app.service_alerts import (
     register_service_alerts, get_active_banner_alerts, is_alert_manager,
 )
@@ -312,6 +315,18 @@ def _pooled_playbook_service(pg_config) -> PlaybookService:
     return PlaybookService(pg_config=pg_config)
 
 
+_SCHEDULE_SVC_SINGLETON = None
+
+
+def _pooled_schedule_service(pg_config, limits):
+    """Process-wide PlaybookScheduleService for the REST layer."""
+    global _SCHEDULE_SVC_SINGLETON
+    if _SCHEDULE_SVC_SINGLETON is None:
+        from src.utils.playbook_schedule_service import PlaybookScheduleService
+        _SCHEDULE_SVC_SINGLETON = PlaybookScheduleService(pg_config=pg_config, limits=limits)
+    return _SCHEDULE_SVC_SINGLETON
+
+
 def _query_convo_history_rows(cursor, conversation_id):
     """History rows (sender, content, message_id, feedback, comment_count,
     model_used, playbook_name) for one conversation.
@@ -329,6 +344,25 @@ def _query_convo_history_rows(cursor, conversation_id):
             conversation_id,
         )
         cursor.execute(SQL_QUERY_CONVO_WITH_FEEDBACK_NO_PLAYBOOKS, (conversation_id,))
+    return cursor.fetchall()
+
+
+def _list_conversation_rows(cursor, primary_sql, fallback_sql, params):
+    """Conversation rows (conversation_id, title, created_at, last_message_at,
+    is_scheduled) for the sidebar list.
+
+    Falls back to the no-schedules variant when playbook_schedule_runs is missing
+    (chat-only deployments never run the scheduler service that creates it):
+    is_scheduled degrades to False instead of the whole list returning 500.
+    """
+    try:
+        cursor.execute(primary_sql, params)
+    except psycopg2.errors.UndefinedTable:
+        cursor.connection.rollback()  # leave the aborted transaction before retrying
+        logger.warning(
+            "playbook_schedule_runs missing; listing conversations without the scheduled flag"
+        )
+        cursor.execute(fallback_sql, params)
     return cursor.fetchall()
 
 
@@ -1264,7 +1298,8 @@ class ChatWrapper:
         try:
             self._playbook_svc().record_invocation(
                 getattr(context, "conversation_id", None), message_id,
-                context.playbook_id, context.playbook_name, source="explicit", status="ok")
+                context.playbook_id, context.playbook_name,
+                source=get_invocation_source(), status="ok")
         except Exception as exc:
             logger.warning("Could not record playbook invocation for message %s: %s", message_id, exc)
 
@@ -1418,6 +1453,119 @@ class ChatWrapper:
             except Exception as exc:
                 logger.warning(
                     "Could not record auto playbook invocation for message %s: %s", message_id, exc)
+
+    # Parity with the streaming formatter's default max_step_chars: tool output is
+    # truncated to this many chars in the trace events so the persisted JSON stays
+    # bounded and the panel renders the same shape it does for streamed traces.
+    _TRACE_TOOL_OUTPUT_MAX_CHARS = 800
+
+    def _build_nonstreaming_trace_events(
+        self, result: PipelineOutput, conversation_id: int, timestamp: str
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Synthesize the agent-activity events for a non-streaming response.
+
+        The streaming path emits these live through PipelineEventFormatter; here we
+        reconstruct the same ``tool_start`` + ``tool_output`` pair per tool call from
+        the final PipelineOutput's message history (``extract_tool_calls()``), matching
+        the exact field shapes ``renderHistoricalTrace`` reads. No tool calls -> an
+        empty list (a zero-tool run, e.g. a classic QA pipeline, still gets a trace row
+        with ``events == []`` — parity with streaming, which always creates the trace).
+
+        Returns ``(events, tool_count)``.
+        """
+        events: List[Dict[str, Any]] = []
+        tool_calls = result.extract_tool_calls() if result else []
+        for i, tc in enumerate(tool_calls):
+            # A truthy id is required for the renderer to key/count the step; synthesize
+            # a per-trace-unique fallback for the rare tool call that carries none.
+            tc_id = tc.get("id") or f"nonstream_tool_{i}"
+            tool_name = tc.get("name") or "unknown"
+            tool_args = tc.get("args") or {}
+            raw_result = tc.get("result", "")
+            if not isinstance(raw_result, str):
+                raw_result = json.dumps(raw_result, default=str)
+
+            events.append({
+                "type": "tool_start",
+                "tool_call_id": tc_id,
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "timestamp": timestamp,
+                "conversation_id": conversation_id,
+            })
+
+            max_chars = self._TRACE_TOOL_OUTPUT_MAX_CHARS
+            if max_chars and len(raw_result) > max_chars:
+                display = raw_result[: max_chars - 3].rstrip() + "..."
+                truncated, full_length = True, len(raw_result)
+            else:
+                display, truncated, full_length = raw_result, False, None
+            out_evt: Dict[str, Any] = {
+                "type": "tool_output",
+                "tool_call_id": tc_id,
+                "output": display,
+                "truncated": truncated,
+                "timestamp": timestamp,
+                "conversation_id": conversation_id,
+            }
+            if full_length is not None:
+                out_evt["full_length"] = full_length
+            events.append(out_evt)
+
+        return events, len(tool_calls)
+
+    def _persist_nonstreaming_trace(
+        self,
+        result: PipelineOutput,
+        context: "ChatRequestContext",
+        message_ids: Optional[List[int]],
+        timestamps: Dict[str, datetime],
+    ) -> Optional[str]:
+        """Create + finalize exactly one ``agent_traces`` row for a non-streaming
+        (``__call__``) response, post-hoc from the final PipelineOutput.
+
+        ``stream()`` builds its trace live; this is the analog for the shared
+        non-streaming path (playbook scheduler + plain REST chat), which otherwise
+        left the UI activity panel with nothing to show. The archi (assistant)
+        message id is wired as ``message_id`` so ``load_conversation`` links the trace
+        to the message; the user message id is known here, so it is set at creation
+        too (streaming leaves it NULL).
+
+        Best-effort: the response is already persisted by the time this runs, so a
+        trace-store failure is logged and swallowed rather than surfaced as a 500.
+        """
+        try:
+            archi_message_id = message_ids[-1] if message_ids else None
+            user_message_id = (
+                message_ids[0] if message_ids and len(message_ids) > 1 else None)
+            timestamp = datetime.now(timezone.utc).isoformat()
+            events, tool_count = self._build_nonstreaming_trace_events(
+                result, context.conversation_id, timestamp)
+
+            trace_id = self.create_agent_trace(
+                conversation_id=context.conversation_id,
+                user_message_id=user_message_id,
+                config_id=None,  # legacy field, no longer used
+                pipeline_name=getattr(self.archi, "pipeline_name", None),
+            )
+
+            start_ts = timestamps.get("lock_acquisition_ts")
+            end_ts = timestamps.get("chain_finished_ts") or datetime.now(timezone.utc)
+            total_duration_ms = (
+                int((end_ts - start_ts).total_seconds() * 1000) if start_ts else None)
+
+            self.update_agent_trace(
+                trace_id=trace_id,
+                events=events,
+                status="completed",
+                message_id=archi_message_id,
+                total_tool_calls=tool_count,
+                total_duration_ms=total_duration_ms,
+            )
+            return trace_id
+        except Exception as exc:
+            logger.warning("Could not persist non-streaming agent trace: %s", exc)
+            return None
 
     def _init_timestamps(self) -> Dict[str, datetime]:
         return {
@@ -2360,6 +2508,12 @@ class ChatWrapper:
                 timestamps=timestamps,
             )
 
+            # Persist the agent-activity trace for this non-streaming response so the
+            # UI panel has tool activity to show (scheduled runs drive this path). The
+            # streaming path builds its own trace live and never reaches here, so no
+            # request gets a double trace. Best-effort inside the helper.
+            self._persist_nonstreaming_trace(result, context, message_ids, timestamps)
+
         except ConversationAccessError as e:
             logger.warning(f"Unauthorized conversation access attempt: {e}")
             return None, None, None, timestamps, 403
@@ -2870,6 +3024,20 @@ class FlaskAppWrapper(object):
             require_auth=self.require_auth,
             resolve_owner=self._resolve_playbook_owner,
             playbook_svc=self._playbook_svc,
+        )
+
+        # Playbook schedule endpoints (registered via Blueprint)
+        logger.info("Adding playbook schedule API endpoints")
+        register_schedules(
+            self.app,
+            auth_enabled=self.auth_enabled,
+            require_auth=self.require_auth,
+            resolve_owner=self._resolve_playbook_owner,
+            schedule_svc=self._schedule_svc,
+            playbook_svc=self._playbook_svc,
+            is_admin=self._is_admin_request,
+            default_timezone=(self.chat.services_config.get("playbook_scheduler", {}) or {})
+                .get("default_timezone", "UTC"),
         )
 
         # Service status board endpoints (registered via Blueprint)
@@ -4262,6 +4430,16 @@ class FlaskAppWrapper(object):
         """PlaybookService for the REST/staging paths (pooled when possible)."""
         return _pooled_playbook_service(self.pg_config)
 
+    def _schedule_svc(self):
+        """PlaybookScheduleService for the REST paths."""
+        cfg = (self.chat.services_config or {}).get("playbook_scheduler", {}) or {}
+        limits = {
+            "max_schedules_per_user": cfg.get("max_schedules_per_user", 10),
+            "min_interval_minutes": cfg.get("min_interval_minutes", 5),
+            "allowed_recipient_domains": cfg.get("allowed_recipient_domains", []),
+        }
+        return _pooled_schedule_service(self.chat.pg_config, limits)
+
     def _stage_playbook_for_request(self, client_id, playbook_name) -> None:
         """Stage playbook state for a chat request via per-request ContextVars.
 
@@ -5097,7 +5275,9 @@ class FlaskAppWrapper(object):
         - limit (optional): Number of conversations to return (default: 50, max: 500)
 
         Returns:
-            JSON with list of conversations with fields: (conversation_id, title, created_at, last_message_at).
+            JSON with list of conversations with fields: (conversation_id, title,
+            created_at, last_message_at, is_scheduled). is_scheduled is True when a
+            playbook schedule run created the conversation.
         """
         try:
             client_id = request.args.get('client_id')
@@ -5110,10 +5290,17 @@ class FlaskAppWrapper(object):
             conn = psycopg2.connect(**self.pg_config)
             cursor = conn.cursor()
             if user_id:
-                cursor.execute(SQL_LIST_CONVERSATIONS_BY_USER, (user_id, client_id, limit))
+                rows = _list_conversation_rows(
+                    cursor, SQL_LIST_CONVERSATIONS_BY_USER,
+                    SQL_LIST_CONVERSATIONS_BY_USER_NO_SCHEDULES,
+                    (user_id, client_id, limit),
+                )
             else:
-                cursor.execute(SQL_LIST_CONVERSATIONS, (client_id, limit))
-            rows = cursor.fetchall()
+                rows = _list_conversation_rows(
+                    cursor, SQL_LIST_CONVERSATIONS,
+                    SQL_LIST_CONVERSATIONS_NO_SCHEDULES,
+                    (client_id, limit),
+                )
 
             conversations = []
             for row in rows:
@@ -5122,6 +5309,7 @@ class FlaskAppWrapper(object):
                     'title': row[1] or "New Chat",
                     'created_at': row[2].isoformat() if row[2] else None,
                     'last_message_at': row[3].isoformat() if row[3] else None,
+                    'is_scheduled': bool(row[4]),
                 })
 
             # clean up database connection state

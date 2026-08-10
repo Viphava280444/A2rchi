@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ name }}-playbook-scheduler
+  labels:
+    app: {{ name }}-playbook-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ name }}-playbook-scheduler
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: {{ name }}-playbook-scheduler
+      annotations:
+        rollout-timestamp: {{ "{{ now | quote }}" }}
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: {{ name }}-playbook-scheduler
+          image: {{ "{{ .Values.chat.image }}" }}
+          args: ["bash", "-lc", "python -u src/bin/service_playbook_scheduler.py"]
+          envFrom:
+            - secretRef:
+                name: {{ name }}-secrets
+          env:
+            - name: PGDATABASE
+              value: archi-db
+            - name: PGHOST
+              value: {{ name }}-postgres
+            - name: PGPORT
+              value: "{{ "{{ .Values.postgres.port }}" }}"
+            - name: PGUSER
+              value: archi
+            - name: VERBOSITY
+              value: "{{ "{{ .Values.verbosity }}" }}"
+          volumeMounts:
+            - mountPath: /root/archi/configs
+              name: {{ name }}-chat-config
+            - mountPath: /root/archi/data/prompts/chat
+              name: {{ name }}-chat-prompts
+            - mountPath: /root/archi/data/prompts/condense
+              name: {{ name }}-condense-prompts
+            - mountPath: /root/archi/data/prompts/system
+              name: {{ name }}-system-prompts
+            - name: {{ name }}-chat-agents
+              mountPath: /root/archi/agents
+            - name: {{ name }}-chat-agents
+              mountPath: /root/archi/src/archi/pipelines/extra_agents
+            - name: {{ name }}-chat-tools
+              mountPath: /root/archi/src/archi/pipelines/agents/tools/extra_tools
+            - name: {{ name }}-chat-skills
+              mountPath: /root/archi/skills
+      restartPolicy: Always
+      volumes:
+        - configMap:
+            name: {{ name }}-chat-config
+          name: {{ name }}-chat-config
+        - name: {{ name }}-condense-prompts
+          configMap:
+            name: {{ name }}-condense-prompts
+            optional: true
+        - name: {{ name }}-chat-prompts
+          configMap:
+            name: {{ name }}-chat-prompts
+            optional: true
+        - name: {{ name }}-system-prompts
+          configMap:
+            name: {{ name }}-system-prompts
+            optional: true
+        - configMap:
+            name: {{ name }}-chat-agents
+            optional: true
+          name: {{ name }}-chat-agents
+        - configMap:
+            name: {{ name }}-chat-skills
+            optional: true
+          name: {{ name }}-chat-skills
+        - configMap:
+            name: {{ name }}-chat-tools
+            optional: true
+          name: {{ name }}-chat-tools

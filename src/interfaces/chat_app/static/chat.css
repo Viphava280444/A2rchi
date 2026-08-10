@@ -409,6 +409,52 @@ body {
   letter-spacing: 0.05em;
 }
 
+/* Collapsible "Scheduled runs" group -------------------------------------- */
+.conversation-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 12px 4px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.conversation-group-toggle:hover {
+  color: var(--text-secondary);
+}
+
+.conversation-group-chevron {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  transition: transform var(--transition-fast);
+}
+
+.conversation-group-scheduled:not([data-collapsed="true"]) .conversation-group-chevron {
+  transform: rotate(90deg);
+}
+
+.conversation-group-toggle .conversation-group-label {
+  padding: 0;
+}
+
+.conversation-group-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+
+.conversation-group-scheduled[data-collapsed="true"] .conversation-group-body {
+  display: none;
+}
+
 .conversation-item {
   display: flex;
   align-items: center;
@@ -4274,6 +4320,483 @@ body {
 
 .playbook-delete:hover {
   opacity: 0.8;
+}
+
+/* -----------------------------------------------------------------------------
+   Schedules (Settings section)
+   ----------------------------------------------------------------------------- */
+
+.schedules-panel {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  overflow: hidden;
+  margin-top: 12px;
+}
+
+.schedules-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 20px 0;
+}
+
+.schedules-empty {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.schedule-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+}
+
+.schedule-card-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.schedule-card-name {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* filled chip, mirrors .playbook-badge; mode differentiated by token colour */
+.schedule-card-mode {
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+.schedule-card-mode--digest {
+  color: var(--accent);
+}
+
+.schedule-card-mode--alert {
+  color: var(--warning-color);
+}
+
+.schedule-card-cron {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.schedule-card-meta {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  margin-top: 6px;
+}
+
+.schedule-card-failures {
+  color: var(--danger-color);
+}
+
+.schedule-card-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.schedule-card-actions button {
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  font-size: var(--text-xs);
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: opacity var(--transition-fast), background var(--transition-fast);
+}
+
+.schedule-card-actions button:hover {
+  background: var(--bg-hover);
+}
+
+.schedule-card-actions button[data-action="delete"] {
+  background: var(--error-bg, #fef2f2);
+  color: var(--error-text);
+}
+
+.schedule-card-actions button[data-action="delete"]:hover {
+  opacity: 0.8;
+  background: var(--error-bg, #fef2f2);
+}
+
+/* enabled switch — mirrors .settings-toggle-compact pill/thumb */
+.schedule-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.schedule-toggle input {
+  display: none;
+}
+
+.schedule-toggle-slider {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-full);
+  transition: background var(--transition-fast);
+}
+
+.schedule-toggle-slider::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  background: white;
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  transition: transform var(--transition-fast);
+}
+
+.schedule-toggle input:checked + .schedule-toggle-slider {
+  background: var(--accent);
+}
+
+.schedule-toggle input:checked + .schedule-toggle-slider::after {
+  transform: translateX(18px);
+}
+
+.schedule-runs {
+  margin-top: 8px;
+  border-top: 1px dashed var(--border-color);
+  padding-top: 6px;
+}
+
+.schedule-run-row {
+  display: flex;
+  gap: 12px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  padding: 2px 0;
+  flex-wrap: wrap;
+}
+
+.schedule-run-row--running {
+  color: var(--text-secondary);
+}
+
+.schedule-run-row--success {
+  color: var(--success-color);
+}
+
+.schedule-run-row--suppressed {
+  color: var(--text-tertiary);
+}
+
+.schedule-run-row--verdict_unparsed,
+.schedule-run-row--skipped_overlap {
+  color: var(--warning-color);
+}
+
+.schedule-run-row--failed {
+  color: var(--danger-color);
+}
+
+.schedule-run-error {
+  color: var(--danger-color);
+  text-decoration: underline dotted;
+  cursor: help;
+}
+
+.schedules-status {
+  padding: 8px 20px 12px;
+}
+
+.schedules-footer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border-color);
+}
+
+.schedules-new {
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 7px 14px;
+  font-size: var(--text-sm);
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  transition: opacity var(--transition-fast);
+}
+
+.schedules-new:hover {
+  opacity: 0.88;
+}
+
+/* -----------------------------------------------------------------------------
+   Schedule editor modal — mirrors .agent-spec-modal
+   ----------------------------------------------------------------------------- */
+.schedule-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.schedule-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(4px);
+}
+
+.schedule-panel {
+  position: relative;
+  width: 92%;
+  max-width: 640px;
+  max-height: 85vh;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 16px;
+  box-shadow: 0 24px 50px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.schedule-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.schedule-header h3 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.schedule-close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.schedule-close:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.schedule-body {
+  padding: 16px 20px 20px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.schedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.schedule-field-row {
+  flex-direction: row;
+  gap: 12px;
+}
+
+.schedule-field-row > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+}
+
+/* [hidden] alone is defeated by the author display rules above; restore it. */
+.schedule-field[hidden],
+.schedule-field-row > div[hidden] {
+  display: none;
+}
+
+.schedule-label {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.schedule-field input[type="text"],
+.schedule-field select,
+.schedule-field textarea {
+  width: 100%;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color var(--transition-fast);
+  box-sizing: border-box;
+}
+
+.schedule-field textarea {
+  resize: vertical;
+}
+
+.schedule-field input[type="text"]:focus,
+.schedule-field select:focus,
+.schedule-field textarea:focus {
+  border-color: var(--accent);
+}
+
+/* radio rows for the digest/alert mode choice (classless labels only) */
+.schedule-field > label:not(.schedule-label) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.schedule-field > label:not(.schedule-label) input[type="radio"] {
+  accent-color: var(--accent);
+}
+
+.schedule-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.schedule-save,
+.schedule-cancel {
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 7px 14px;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: opacity var(--transition-fast), background var(--transition-fast);
+}
+
+.schedule-save {
+  background: var(--accent);
+  color: white;
+}
+
+.schedule-save:hover {
+  opacity: 0.88;
+}
+
+.schedule-cancel {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.schedule-cancel:hover {
+  background: var(--bg-hover);
+}
+
+/* status lines — neutral by default, semantic on .error / .success */
+.schedules-status,
+.schedule-status {
+  min-height: 16px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.schedules-status.error,
+.schedule-status.error {
+  color: var(--error-text);
+}
+
+.schedules-status.success,
+.schedule-status.success {
+  color: var(--accent);
+}
+
+.schedule-day-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.schedule-day-chip {
+  border: 1px solid var(--border-color, rgba(128, 128, 128, 0.4));
+  border-radius: 999px;
+  padding: 4px 12px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.schedule-day-chip.on {
+  border-color: var(--accent-color, #4f8ef7);
+  color: var(--text-primary, inherit);
+  font-weight: 600;
+}
+
+.schedule-interval-pair {
+  display: flex;
+  gap: 6px;
+}
+
+.schedule-advanced-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.schedule-hint {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.schedule-preview {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  border-left: 3px solid var(--accent-color, #4f8ef7);
+  padding: 6px 10px;
+  min-height: 1.2em;
+}
+
+.schedule-preview.error {
+  border-left-color: var(--error-text, #e05050);
 }
 
 /* -----------------------------------------------------------------------------

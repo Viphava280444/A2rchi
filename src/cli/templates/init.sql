@@ -686,7 +686,7 @@ CREATE TABLE IF NOT EXISTS playbook_invocations (
     message_id      INTEGER,
     playbook_id     INTEGER,
     playbook_name   VARCHAR(100) NOT NULL,
-    source          TEXT NOT NULL CHECK (source IN ('explicit', 'auto')),
+    source          TEXT NOT NULL CHECK (source IN ('explicit', 'auto', 'scheduled')),
     status          TEXT NOT NULL DEFAULT 'ok'
                     CHECK (status IN ('ok', 'not_found', 'unavailable', 'error')),
     arm             TEXT,
@@ -699,6 +699,55 @@ CREATE INDEX IF NOT EXISTS idx_playbook_invocations_name_ts ON playbook_invocati
 {% if use_grafana %}
 GRANT SELECT ON playbook_invocations TO grafana;
 {% endif %}
+
+-- ============================================================================
+-- 15. PLAYBOOK SCHEDULES (cron-driven playbook runs with email delivery)
+-- ============================================================================
+-- Keep this DDL textually identical to PlaybookScheduleService.ensure_schema.
+-- playbook_schedule_runs keeps snapshot columns and NO FK to the schedule so
+-- the "what was emailed to whom" audit survives schedule deletion.
+CREATE TABLE IF NOT EXISTS playbook_schedules (
+    id                   SERIAL PRIMARY KEY,
+    owner_id             VARCHAR(200) NOT NULL,
+    playbook_id          INTEGER NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+    name                 VARCHAR(100) NOT NULL,
+    cron                 VARCHAR(100) NOT NULL,
+    timezone             VARCHAR(64)  NOT NULL DEFAULT 'UTC',
+    mode                 VARCHAR(10)  NOT NULL CHECK (mode IN ('digest','alert')),
+    recipients           JSONB NOT NULL,
+    subject_prefix       VARCHAR(200),
+    extra_instructions   TEXT,
+    enabled              BOOLEAN NOT NULL DEFAULT TRUE,
+    manual_run_requested BOOLEAN NOT NULL DEFAULT FALSE,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_run_at          TIMESTAMPTZ,
+    next_run_at          TIMESTAMPTZ NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (owner_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_playbook_schedules_due ON playbook_schedules(next_run_at) WHERE enabled;
+
+CREATE TABLE IF NOT EXISTS playbook_schedule_runs (
+    id              SERIAL PRIMARY KEY,
+    schedule_id     INTEGER,
+    schedule_name   VARCHAR(100) NOT NULL,
+    playbook_name   VARCHAR(100) NOT NULL,
+    owner_id        VARCHAR(200) NOT NULL,
+    trigger         TEXT NOT NULL DEFAULT 'cron' CHECK (trigger IN ('cron','manual')),
+    status          TEXT NOT NULL DEFAULT 'running'
+                    CHECK (status IN ('running','success','suppressed',
+                                      'verdict_unparsed','failed','skipped_overlap')),
+    verdict_notify  BOOLEAN,
+    email_sent      BOOLEAN NOT NULL DEFAULT FALSE,
+    email_error     TEXT,
+    recipients      JSONB,
+    conversation_id INTEGER,
+    error           TEXT,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_playbook_schedule_runs_sched ON playbook_schedule_runs(schedule_id, started_at DESC);
 
 -- ============================================================================
 -- NOTES

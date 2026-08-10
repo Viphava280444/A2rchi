@@ -53,6 +53,7 @@ Archi provides these deployable services:
 | `piazza` | Piazza forum integration with Slack | — |
 | `redmine-mailer` | Redmine ticket responses via email | — |
 | `mattermost` | Mattermost channel integration | — |
+| `playbook-scheduler` | Runs playbooks on a cron schedule and emails the results | — |
 | `grafana` | Monitoring dashboard | 3000 |
 | `grader` | Automated grading service | 7862 |
 
@@ -78,6 +79,60 @@ Playbooks are per-user reusable instruction packs — the chat-side analog of ed
 - **Export/import** uses the Agent Skills `<name>/SKILL.md` zip layout, so playbooks are portable to and from claude.ai. Imports always arrive private.
 
 Public playbooks from other users are read-only and their content is fenced before the agent sees it. See the [API reference](api_reference.md#playbooks) for the REST endpoints.
+
+---
+
+## Scheduled Playbooks
+
+The playbook scheduler runs a playbook on a cron schedule and emails the result —
+for recurring digests (a daily MONIT summary) or threshold alerts ("email me only
+if the failure rate crosses 80%"). It's an opt-in service
+(`--services chatbot,playbook-scheduler`); see the
+[Configuration Reference](configuration.md#playbook-scheduler) for deployment setup.
+
+Create one from **Settings → Schedules → New schedule**: pick a playbook,
+recipient emails, and a mode — **Digest** always emails the answer; **Alert**
+emails only when the run's verdict says to.
+
+When creating a schedule, pick a repeat pattern (**Every day**, **Weekdays**,
+**Weekly** with day-of-week chips, **Every N minutes/hours**, or **Monthly**)
+and a time — the cron expression is generated for you. Power users can click
+**Advanced: edit as cron** to type a raw 5-field cron; anything the builder
+can't express (e.g. `2#1` = "first Tuesday") stays editable there.
+
+The **Timezone** defaults to your browser's detected zone, so "07:00" means
+7 AM *your* time; change it if the schedule should follow another region's
+clock. As you edit, a live **Next runs** preview (computed server-side with
+the exact same code the scheduler uses) shows the upcoming fire times in
+your local time — if the preview looks wrong, the schedule *is* wrong, fix
+it before saving. Schedules that would fire more often than every 5 minutes
+are rejected.
+
+Every scheduled turn, either mode, has this instruction appended, requiring the
+final answer to end with a fenced JSON block in exactly this form:
+
+```json
+{"notify": true or false, "subject": "<short email subject>", "summary": "<1-2 sentence summary>"}
+```
+
+Digest ignores `notify` and always sends; alert sends only when `notify` is `true`.
+If an alert run's answer has no parseable verdict block, the scheduler **fails
+open** — it emails the raw output anyway with a banner flagging the unparseable
+verdict, but that run still counts as a failure. After `max_consecutive_failures`
+(default 3) in a row, the schedule auto-disables and its owner gets a one-time
+notice email; re-enable it from **Settings → Schedules** once fixed. Any success or
+suppressed run resets the count.
+
+Each schedule card has **Run now** (queues an immediate run, picked up within one
+poll interval) and **History** (past runs, whether each emailed, and an **open
+run** link straight into that run's conversation with its trace panel).
+
+Because every scheduled run is a real conversation, they could otherwise bury your
+personal chats in the sidebar. Instead they are folded into a single **Scheduled
+runs (N)** group at the bottom of the chat history, collapsed by default (click to
+expand; the state is remembered per browser). Conversations inside behave exactly
+like any other — open them, delete them, and the active one stays highlighted —
+and new runs land in the group automatically as the list refreshes.
 
 ---
 

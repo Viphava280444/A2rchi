@@ -66,6 +66,25 @@ def clear_pending_playbook():
     _PENDING_PLAYBOOK.set(None)
 
 
+# How the current turn's playbook use should be recorded in the unified
+# playbook_invocations ledger. The chat app never sets this (default "explicit"
+# keeps its behavior byte-identical); the playbook-scheduler service sets
+# "scheduled" once per run so headless runs stay honest in analytics.
+_INVOCATION_SOURCE: contextvars.ContextVar = contextvars.ContextVar(
+    "invocation_source", default="explicit"
+)
+
+
+def set_invocation_source(source):
+    """Set the ledger source for the current context ('explicit'|'auto'|'scheduled')."""
+    _INVOCATION_SOURCE.set(source)
+
+
+def get_invocation_source():
+    """Read the ledger source for the current context (defaults to 'explicit')."""
+    return _INVOCATION_SOURCE.get()
+
+
 # Preamble copied verbatim from Claude Code's skill listing injection.
 PLAYBOOK_LISTING_PREAMBLE = "The following playbooks are available for use with the Playbook tool:"
 

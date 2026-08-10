@@ -537,7 +537,7 @@ class PlaybookService:
                         message_id      INTEGER,
                         playbook_id     INTEGER,
                         playbook_name   VARCHAR(100) NOT NULL,
-                        source          TEXT NOT NULL CHECK (source IN ('explicit', 'auto')),
+                        source          TEXT NOT NULL CHECK (source IN ('explicit', 'auto', 'scheduled')),
                         status          TEXT NOT NULL DEFAULT 'ok'
                                         CHECK (status IN ('ok', 'not_found', 'unavailable', 'error')),
                         arm             TEXT,
@@ -548,6 +548,18 @@ class PlaybookService:
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_playbook_invocations_name_ts "
                     "ON playbook_invocations(playbook_name, ts)"
+                )
+                # Widen the ledger source CHECK to include 'scheduled' (idempotent:
+                # drop-if-exists + re-add; CREATE IF NOT EXISTS alone never updates
+                # a constraint on an existing deployment).
+                cursor.execute(
+                    "ALTER TABLE playbook_invocations "
+                    "DROP CONSTRAINT IF EXISTS playbook_invocations_source_check"
+                )
+                cursor.execute(
+                    "ALTER TABLE playbook_invocations "
+                    "ADD CONSTRAINT playbook_invocations_source_check "
+                    "CHECK (source IN ('explicit', 'auto', 'scheduled'))"
                 )
             conn.commit()
         finally:

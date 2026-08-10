@@ -141,6 +141,17 @@ class ServiceRegistry:
         ))
         
         self.register(ServiceDefinition(
+            name='playbook-scheduler',
+            description='Runs playbooks on cron schedules and emails the results',
+            category='integration',
+            requires_image=False,   # reuses the chatbot image with a command override
+            depends_on=['postgres'],
+            requires_services=['chatbot', 'postgres'],
+            required_secrets=['SENDER_SERVER', 'SENDER_PORT', 'SENDER_REPLYTO',
+                            'SENDER_USER', 'SENDER_PW']
+        ))
+
+        self.register(ServiceDefinition(
             name='redmine-mailer',
             description='Email processing and Cleo/Redmine ticket management',
             category='integration',

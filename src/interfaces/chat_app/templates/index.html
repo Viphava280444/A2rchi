@@ -215,6 +215,9 @@
               </svg>
               <span>Playbooks</span>
             </button>
+            <button class="settings-nav-item" data-section="schedules" aria-selected="false">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg><span>Schedules</span>
+            </button>
           </nav>
           
           <!-- Settings Body -->
@@ -353,6 +356,19 @@
                 </div>
               </div>
             </section>
+
+            <!-- Schedules Section -->
+            <section class="settings-section" id="settings-schedules" aria-labelledby="schedules-heading" hidden>
+              <h4 class="settings-section-title" id="schedules-heading">Schedules</h4>
+              <p class="settings-description">Run a playbook automatically on a schedule and email the result. Digest schedules always send; alert schedules send only when the run's verdict says notify.</p>
+              <div class="schedules-panel">
+                <div class="schedules-list" aria-live="polite"></div>
+                <div class="schedules-status" id="schedules-status" role="alert"></div>
+                <div class="schedules-footer">
+                  <button class="schedules-new" type="button">New schedule</button>
+                </div>
+              </div>
+            </section>
           </div>
         </div>
       </div>
@@ -414,6 +430,101 @@
           </div>
         </div>
         <div class="agent-spec-resize-handle" aria-hidden="true"></div>
+      </div>
+    </div>
+
+    <!-- Schedule Editor Modal -->
+    <div class="schedule-modal" style="display: none;">
+      <div class="schedule-backdrop"></div>
+      <div class="schedule-panel" role="dialog" aria-modal="true" aria-labelledby="schedule-modal-title">
+        <div class="schedule-header">
+          <h3 id="schedule-modal-title">New schedule</h3>
+          <button class="schedule-close" aria-label="Close schedule editor" type="button">&times;</button>
+        </div>
+        <div class="schedule-body">
+          <div class="schedule-field">
+            <label class="schedule-label" for="schedule-name">Name</label>
+            <input id="schedule-name" type="text" maxlength="100" placeholder="e.g. failure-rate-morning" />
+          </div>
+          <div class="schedule-field">
+            <label class="schedule-label" for="schedule-playbook">Playbook</label>
+            <select id="schedule-playbook" aria-label="Playbook to run"></select>
+          </div>
+          <div class="schedule-field schedule-field-row">
+            <div>
+              <label class="schedule-label" for="schedule-repeats">Repeats</label>
+              <select id="schedule-repeats">
+                <option value="daily">Every day</option>
+                <option value="weekdays">Weekdays (Mon–Fri)</option>
+                <option value="weekly">Weekly</option>
+                <option value="interval">Every…</option>
+                <option value="monthly">Monthly</option>
+                <option value="custom">Custom (cron)</option>
+              </select>
+            </div>
+            <div id="schedule-time-field">
+              <label class="schedule-label" for="schedule-time">At time</label>
+              <input id="schedule-time" type="time" value="07:00" />
+            </div>
+            <div id="schedule-interval-field" hidden>
+              <label class="schedule-label" for="schedule-every-n">Interval</label>
+              <span class="schedule-interval-pair">
+                <select id="schedule-every-n"></select>
+                <select id="schedule-every-unit">
+                  <option value="minutes">minutes</option>
+                  <option value="hours">hours</option>
+                </select>
+              </span>
+            </div>
+            <div id="schedule-monthday-field" hidden>
+              <label class="schedule-label" for="schedule-monthday">On day</label>
+              <select id="schedule-monthday"></select>
+            </div>
+            <div>
+              <label class="schedule-label" for="schedule-timezone">Timezone</label>
+              <select id="schedule-timezone"></select>
+            </div>
+          </div>
+          <div class="schedule-field" id="schedule-days-field" hidden>
+            <span class="schedule-label">On days</span>
+            <div id="schedule-days" class="schedule-day-chips"></div>
+          </div>
+          <div class="schedule-field" id="schedule-monthday-note" hidden>
+            <span class="schedule-hint">Months without this day are skipped.</span>
+          </div>
+          <div class="schedule-field schedule-advanced">
+            <button type="button" id="schedule-advanced-toggle" class="schedule-advanced-toggle">▸ Advanced: edit as cron</button>
+            <div id="schedule-advanced-body" hidden>
+              <label class="schedule-label" for="schedule-cron">Cron (5 fields)</label>
+              <input id="schedule-cron" type="text" value="0 7 * * *" />
+            </div>
+          </div>
+          <div class="schedule-field">
+            <div id="schedule-preview" class="schedule-preview" aria-live="polite"></div>
+          </div>
+          <div class="schedule-field">
+            <span class="schedule-label">Mode</span>
+            <label><input type="radio" name="schedule-mode" value="digest" checked /> Digest — always email the result</label>
+            <label><input type="radio" name="schedule-mode" value="alert" /> Alert — email only when the verdict says notify</label>
+          </div>
+          <div class="schedule-field">
+            <label class="schedule-label" for="schedule-recipients">Recipients (comma-separated emails)</label>
+            <input id="schedule-recipients" type="text" placeholder="ops@cern.ch, team@cern.ch" />
+          </div>
+          <div class="schedule-field">
+            <label class="schedule-label" for="schedule-subject">Subject prefix (optional)</label>
+            <input id="schedule-subject" type="text" maxlength="200" />
+          </div>
+          <div class="schedule-field">
+            <label class="schedule-label" for="schedule-instructions">Extra instructions (optional; e.g. "alert threshold: 80%")</label>
+            <textarea id="schedule-instructions" rows="3"></textarea>
+          </div>
+          <div class="schedule-status" id="schedule-editor-status" role="alert"></div>
+          <div class="schedule-actions">
+            <button class="schedule-cancel" type="button">Cancel</button>
+            <button class="schedule-save" type="button">Save</button>
+          </div>
+        </div>
       </div>
     </div>
 

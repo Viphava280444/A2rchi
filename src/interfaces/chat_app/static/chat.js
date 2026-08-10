@@ -19,6 +19,7 @@ const CONFIG = {
     SELECTED_PROVIDER: 'archi_selected_provider',
     SELECTED_MODEL: 'archi_selected_model',
     SELECTED_MODEL_CUSTOM: 'archi_selected_model_custom',
+    SCHEDULED_GROUP_COLLAPSED: 'archi_scheduled_group_collapsed',
   },
   ENDPOINTS: {
     STREAM: '/api/get_chat_response_stream',
@@ -56,6 +57,7 @@ const CONFIG = {
     DISLIKE: '/api/dislike',
     TEXT_FEEDBACK: '/api/text_feedback',
     PLAYBOOKS: '/api/playbooks',
+    SCHEDULES: '/api/schedules',
   },
   STREAMING: {
     TIMEOUT: 600000, // 10 minutes
@@ -128,6 +130,17 @@ const Utils = {
   },
 
   /**
+   * Format an ISO timestamp as a localized date + time (e.g. "Jul 15, 2026, 5:00 AM").
+   * Returns '' for falsy/invalid input, matching formatDate.
+   */
+  formatDateTime(isoString) {
+    if (!isoString) return '';
+    const date = new Date(isoString);
+    if (isNaN(date.getTime())) return '';
+    return date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+  },
+
+  /**
    * Group conversations by date
    */
   groupByDate(conversations) {
@@ -173,6 +186,97 @@ const Utils = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Schedule "When" builder — pure cron compile/recognize helpers.
+// The builder writes THROUGH #schedule-cron, so the save path never changes.
+const SCHEDULE_INTERVAL_MINUTES = [5, 10, 15, 20, 30];
+const SCHEDULE_INTERVAL_HOURS = [1, 2, 3, 4, 6, 8, 12];
+const SCHEDULE_FALLBACK_ZONES = ['UTC', 'Europe/Zurich', 'Europe/Paris',
+  'America/New_York', 'America/Chicago', 'Asia/Bangkok'];
+
+const ScheduleCron = {
+  DAY_NAMES: { 0: 'Sun', 1: 'Mon', 2: 'Tue', 3: 'Wed', 4: 'Thu', 5: 'Fri', 6: 'Sat' },
+
+  _hm(state) {
+    const [h, m] = (state.time || '07:00').split(':').map(Number);
+    return { h, m };
+  },
+
+  compile(state) {
+    if (!state) return null;
+    const { h, m } = this._hm(state);
+    switch (state.pattern) {
+      case 'daily': return `${m} ${h} * * *`;
+      case 'weekdays': return `${m} ${h} * * 1-5`;
+      case 'weekly': {
+        const days = [...new Set(state.days || [])].sort((a, b) => a - b);
+        if (!days.length) return null;
+        return `${m} ${h} * * ${days.join(',')}`;
+      }
+      case 'interval':
+        return state.unit === 'hours' ? `0 */${state.every} * * *` : `*/${state.every} * * * *`;
+      case 'monthly': return `${m} ${h} ${state.monthday} * *`;
+      default: return null;
+    }
+  },
+
+  _timed(pattern, m) {
+    const minute = Number(m[1]);
+    const hour = Number(m[2]);
+    if (minute > 59 || hour > 23) return null;
+    return {
+      pattern,
+      time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+    };
+  },
+
+  // Conservative: only the exact shapes compile() emits; anything else -> null.
+  recognize(cron) {
+    const c = (cron || '').trim();
+    let m;
+    if ((m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* \*$/))) return this._timed('daily', m);
+    if ((m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* 1-5$/))) return this._timed('weekdays', m);
+    if ((m = c.match(/^(\d{1,2}) (\d{1,2}) \* \* ([0-6](?:,[0-6])*)$/))) {
+      const days = m[3].split(',').map(Number);
+      if (new Set(days).size !== days.length) return null;
+      const base = this._timed('weekly', m);
+      return base && { ...base, days };
+    }
+    if ((m = c.match(/^\*\/(\d{1,2}) \* \* \* \*$/))) {
+      const every = Number(m[1]);
+      return SCHEDULE_INTERVAL_MINUTES.includes(every)
+        ? { pattern: 'interval', every, unit: 'minutes' } : null;
+    }
+    if ((m = c.match(/^0 \*\/(\d{1,2}) \* \* \*$/))) {
+      const every = Number(m[1]);
+      return SCHEDULE_INTERVAL_HOURS.includes(every)
+        ? { pattern: 'interval', every, unit: 'hours' } : null;
+    }
+    if ((m = c.match(/^(\d{1,2}) (\d{1,2}) (\d{1,2}) \* \*$/))) {
+      const monthday = Number(m[3]);
+      if (monthday < 1 || monthday > 31) return null;
+      const base = this._timed('monthly', m);
+      return base && { ...base, monthday };
+    }
+    return null;
+  },
+
+  describe(cron) {
+    const s = this.recognize(cron);
+    if (!s) return null;
+    switch (s.pattern) {
+      case 'daily': return `every day at ${s.time}`;
+      case 'weekdays': return `weekdays at ${s.time}`;
+      case 'weekly':
+        return `every ${s.days.map((d) => this.DAY_NAMES[d]).join(', ')} at ${s.time}`;
+      case 'interval': return `every ${s.every} ${s.unit}`;
+      case 'monthly': return `monthly on day ${s.monthday} at ${s.time}`;
+      default: return null;
+    }
+  },
+};
+window.ScheduleCron = ScheduleCron;
+
 // =============================================================================
 // Storage Manager
 // =============================================================================
@@ -198,6 +302,16 @@ const Storage = {
     } else {
       localStorage.setItem(CONFIG.STORAGE_KEYS.ACTIVE_CONVERSATION, String(id));
     }
+  },
+
+  // Sidebar "Scheduled runs" group — collapsed by default (nothing stored).
+  isScheduledGroupCollapsed() {
+    return localStorage.getItem(CONFIG.STORAGE_KEYS.SCHEDULED_GROUP_COLLAPSED) !== 'false';
+  },
+
+  setScheduledGroupCollapsed(collapsed) {
+    localStorage.setItem(
+      CONFIG.STORAGE_KEYS.SCHEDULED_GROUP_COLLAPSED, collapsed ? 'true' : 'false');
   },
 };
 
@@ -602,6 +716,56 @@ const API = {
     fd.append('client_id', this.clientId);
     fd.append('on_conflict', onConflict);
     return this.fetchJson(`${CONFIG.ENDPOINTS.PLAYBOOKS}/import`, { method: 'POST', body: fd });
+  },
+
+  async getSchedules() {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}?client_id=${encodeURIComponent(this.clientId)}`);
+  },
+
+  async createSchedule(payload) {
+    return this.fetchJson(CONFIG.ENDPOINTS.SCHEDULES, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, client_id: this.clientId }),
+    });
+  },
+
+  async updateSchedule(id, payload) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, client_id: this.clientId }),
+    });
+  },
+
+  async deleteSchedule(id) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}/${id}`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this.clientId }),
+    });
+  },
+
+  async runScheduleNow(id) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}/${id}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this.clientId }),
+    });
+  },
+
+  async getScheduleRuns(id, limit = 20) {
+    return this.fetchJson(
+      `${CONFIG.ENDPOINTS.SCHEDULES}/${id}/runs?client_id=${encodeURIComponent(this.clientId)}&limit=${limit}`
+    );
+  },
+
+  async previewSchedule(payload) {
+    return this.fetchJson(`${CONFIG.ENDPOINTS.SCHEDULES}/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...payload, client_id: this.clientId }),
+    });
   },
 
   async getProviderModels(providerType) {
@@ -1144,6 +1308,22 @@ const UI = {
       Chat._panelTab = tabBtn.dataset.tab;
       Chat.renderPlaybooksPanel();
     });
+    // Schedules section bindings (hosted in the Settings modal)
+    document.querySelector('.schedules-new')?.addEventListener('click', () => Chat.openScheduleEditor({ mode: 'create' }));
+    document.querySelector('.schedule-close')?.addEventListener('click', () => Chat.closeScheduleEditor());
+    document.querySelector('.schedule-cancel')?.addEventListener('click', () => Chat.closeScheduleEditor());
+    document.querySelector('.schedule-backdrop')?.addEventListener('click', () => Chat.closeScheduleEditor());
+    document.querySelector('.schedule-save')?.addEventListener('click', () => Chat.saveScheduleFromEditor());
+    ['schedule-repeats', 'schedule-time', 'schedule-every-n',
+     'schedule-monthday', 'schedule-timezone'].forEach((id) => {
+      document.getElementById(id)?.addEventListener('change', () => Chat.onScheduleBuilderChange());
+    });
+    document.getElementById('schedule-every-unit')?.addEventListener('change', () => {
+      Chat._populateIntervalChoices();
+      Chat.onScheduleBuilderChange();
+    });
+    document.getElementById('schedule-cron')?.addEventListener('input', () => Chat.onScheduleCronEdited());
+    document.getElementById('schedule-advanced-toggle')?.addEventListener('click', () => Chat.toggleScheduleAdvanced());
     // Resize handle for agent spec modal
     this.initAgentSpecResize();
     
@@ -1253,6 +1433,15 @@ const UI = {
 
     // Close modal on Escape
     document.addEventListener('keydown', (e) => {
+      // Schedule editor stacks over the Settings modal — close it first and stop,
+      // so Escape doesn't also dismiss Settings underneath it.
+      if (e.key === 'Escape') {
+        const scheduleModal = document.querySelector('.schedule-modal');
+        if (scheduleModal && scheduleModal.style.display !== 'none' && scheduleModal.style.display !== '') {
+          Chat.closeScheduleEditor();
+          return;
+        }
+      }
       if (e.key === 'Escape' && this.elements.settingsModal?.style.display !== 'none') {
         this.closeSettings();
       }
@@ -1318,6 +1507,10 @@ const UI = {
 
     if (sectionId === 'playbooks' && typeof Chat !== 'undefined') {
       Chat.enterPlaybooksSection();
+    }
+
+    if (sectionId === 'schedules' && typeof Chat !== 'undefined') {
+      Chat.enterSchedulesSection();
     }
   },
 
@@ -2191,6 +2384,24 @@ const UI = {
     });
   },
 
+  _conversationItemHtml(conv, activeId) {
+    const isActive = conv.conversation_id === activeId;
+    const title = Utils.escapeHtml(conv.title || `Conversation ${conv.conversation_id}`);
+    return `
+          <div class="conversation-item ${isActive ? 'active' : ''}"
+               data-id="${conv.conversation_id}">
+            <svg class="conversation-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <span class="conversation-item-title">${title}</span>
+            <button class="conversation-item-delete" data-id="${conv.conversation_id}" aria-label="Delete conversation" title="Delete conversation">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+              </svg>
+            </button>
+          </div>`;
+  },
+
   renderConversations(conversations, activeId) {
     const list = this.elements.conversationList;
     if (!list) return;
@@ -2203,38 +2414,61 @@ const UI = {
       return;
     }
 
-    const groups = Utils.groupByDate(conversations);
+    // Scheduled runs create real conversations; keep personal chats where they
+    // are and fold every scheduled one into a single collapsible group below.
+    const personal = conversations.filter((conv) => !conv.is_scheduled);
+    const scheduled = conversations.filter((conv) => conv.is_scheduled);
+
     let html = '';
 
+    const groups = Utils.groupByDate(personal);
     for (const [label, items] of Object.entries(groups)) {
       if (!items.length) continue;
-      
+
       html += `<div class="conversation-group">
         <div class="conversation-group-label">${label}</div>`;
-      
+
       for (const conv of items) {
-        const isActive = conv.conversation_id === activeId;
-        const title = Utils.escapeHtml(conv.title || `Conversation ${conv.conversation_id}`);
-        
-        html += `
-          <div class="conversation-item ${isActive ? 'active' : ''}" 
-               data-id="${conv.conversation_id}">
-            <svg class="conversation-item-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-            </svg>
-            <span class="conversation-item-title">${title}</span>
-            <button class="conversation-item-delete" data-id="${conv.conversation_id}" aria-label="Delete conversation" title="Delete conversation">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
-                <path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-              </svg>
-            </button>
-          </div>`;
+        html += this._conversationItemHtml(conv, activeId);
       }
-      
+
       html += '</div>';
     }
 
+    // A single "Scheduled runs (N)" section: hidden entirely when empty,
+    // collapsed by default, with expand/collapse state persisted in localStorage.
+    // It sits below the personal list so automated runs never bury personal chats.
+    if (scheduled.length) {
+      const collapsed = Storage.isScheduledGroupCollapsed();
+      let body = '';
+      for (const conv of scheduled) {
+        body += this._conversationItemHtml(conv, activeId);
+      }
+      html += `<div class="conversation-group conversation-group-scheduled" data-collapsed="${collapsed}">
+        <button type="button" class="conversation-group-toggle" aria-expanded="${!collapsed}" aria-controls="scheduled-runs-body">
+          <svg class="conversation-group-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M9 18l6-6-6-6"></path>
+          </svg>
+          <span class="conversation-group-label">Scheduled runs</span>
+          <span class="conversation-group-count">${scheduled.length}</span>
+        </button>
+        <div class="conversation-group-body" id="scheduled-runs-body">${body}</div>
+      </div>`;
+    }
+
     list.innerHTML = html;
+
+    // Collapse/expand the scheduled group in place (state persisted; no re-render).
+    const toggle = list.querySelector('.conversation-group-toggle');
+    if (toggle) {
+      toggle.addEventListener('click', () => {
+        const group = toggle.closest('.conversation-group-scheduled');
+        const nowCollapsed = group.dataset.collapsed !== 'true';
+        group.dataset.collapsed = String(nowCollapsed);
+        toggle.setAttribute('aria-expanded', String(!nowCollapsed));
+        Storage.setScheduledGroupCollapsed(nowCollapsed);
+      });
+    }
 
     // Bind click events
     list.querySelectorAll('.conversation-item').forEach((item) => {
@@ -4133,6 +4367,9 @@ const Chat = {
     currentUser: null,
   },
 
+  // Schedules Settings panel — populated by loadSchedulesPanel()
+  schedules: [],
+
   getABPendingLimit() {
     const configured = Number(
       this.state.abPool?.max_pending_comparisons_per_conversation
@@ -5557,6 +5794,367 @@ const Chat = {
       PlaybookMenu.playbooks = [];
     } catch (e) {
       if (status) status.textContent = e.message || 'Could not save playbook.';
+    }
+  },
+
+  async enterSchedulesSection() {
+    await this.loadSchedulesPanel();
+  },
+
+  async loadSchedulesPanel() {
+    try {
+      const data = await API.getSchedules();
+      this.schedules = data?.schedules || [];
+      this.renderSchedulesPanel();
+      this._scheduleStatus('');
+    } catch (err) {
+      this._scheduleStatus(`Could not load schedules: ${err.message}`, 'error');
+    }
+  },
+
+  renderSchedulesPanel() {
+    const list = document.querySelector('.schedules-list');
+    if (!list) return;
+    if (!this.schedules.length) {
+      list.innerHTML = '<p class="schedules-empty">No schedules yet. Create one to run a playbook automatically.</p>';
+      return;
+    }
+    list.innerHTML = this.schedules.map((s) => {
+      const modeClass = { digest: 'digest', alert: 'alert' }[s.mode] || 'unknown';
+      const nextRun = Utils.formatDateTime(s.next_run_at) || '—';
+      const human = ScheduleCron.describe(s.cron) || s.cron;
+      const viewerZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const zoneHint = (s.timezone !== viewerZone) ? ' · your time' : '';
+      return `
+      <div class="schedule-card" data-id="${s.id}">
+        <div class="schedule-card-main">
+          <span class="schedule-card-name">${Utils.escapeHtml(s.name)}</span>
+          <span class="schedule-card-mode schedule-card-mode--${modeClass}">${Utils.escapeHtml(s.mode)}</span>
+          <span class="schedule-card-cron">${Utils.escapeHtml(human)} (${Utils.escapeHtml(s.timezone)})</span>
+        </div>
+        <div class="schedule-card-meta">
+          <span>→ ${Utils.escapeHtml((s.recipients || []).join(', '))}</span>
+          <span>next: ${s.enabled ? Utils.escapeHtml(nextRun) + Utils.escapeHtml(zoneHint) : 'disabled'}</span>
+          ${s.consecutive_failures ? `<span class="schedule-card-failures">${s.consecutive_failures} consecutive failures</span>` : ''}
+        </div>
+        <div class="schedule-card-actions">
+          <label class="schedule-toggle"><input type="checkbox" data-action="toggle" ${s.enabled ? 'checked' : ''}/><span class="schedule-toggle-slider"></span><span class="schedule-toggle-text">enabled</span></label>
+          <button type="button" data-action="run">Run now</button>
+          <button type="button" data-action="history">History</button>
+          <button type="button" data-action="edit">Edit</button>
+          <button type="button" data-action="delete">Delete</button>
+        </div>
+        <div class="schedule-runs" hidden></div>
+      </div>`;
+    }).join('');
+
+    list.querySelectorAll('.schedule-card').forEach((card) => {
+      const id = Number(card.dataset.id);
+      card.querySelector('[data-action="toggle"]').addEventListener('change', async (e) => {
+        try { await API.updateSchedule(id, { enabled: e.target.checked }); await this.loadSchedulesPanel(); }
+        catch (err) { this._scheduleStatus(err.message, 'error'); }
+      });
+      card.querySelector('[data-action="run"]').addEventListener('click', async () => {
+        try { await API.runScheduleNow(id); this._scheduleStatus('Queued — the scheduler picks it up within one poll.', 'success'); }
+        catch (err) { this._scheduleStatus(err.message, 'error'); }
+      });
+      card.querySelector('[data-action="history"]').addEventListener('click', () => this.toggleScheduleRuns(id, card));
+      card.querySelector('[data-action="edit"]').addEventListener('click', () => {
+        const schedule = this.schedules.find((s) => s.id === id);
+        this.openScheduleEditor({ mode: 'edit', schedule });
+      });
+      card.querySelector('[data-action="delete"]').addEventListener('click', async () => {
+        if (!window.confirm('Delete this schedule? Its run history is kept.')) return;
+        try { await API.deleteSchedule(id); await this.loadSchedulesPanel(); }
+        catch (err) { this._scheduleStatus(err.message, 'error'); }
+      });
+    });
+  },
+
+  _scheduleStatus(text, type = '') {
+    const status = document.getElementById('schedules-status');
+    if (!status) return;
+    status.textContent = text || '';
+    status.classList.remove('error', 'success');
+    if (type) status.classList.add(type);
+  },
+
+  async toggleScheduleRuns(id, card) {
+    const drawer = card.querySelector('.schedule-runs');
+    if (!drawer.hidden) { drawer.hidden = true; return; }
+    try {
+      const data = await API.getScheduleRuns(id);
+      const runs = data?.runs || [];
+      const schedule = this.schedules.find((s) => s.id === id);
+      const viewerZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const runZoneHint = (schedule && schedule.timezone !== viewerZone) ? ' · your time' : '';
+      drawer.innerHTML = runs.length ? runs.map((r) => {
+        const statusClass = ['running', 'success', 'suppressed', 'verdict_unparsed', 'failed', 'skipped_overlap'].includes(r.status) ? r.status : 'unknown';
+        return `
+        <div class="schedule-run-row schedule-run-row--${statusClass}">
+          <span>${Utils.escapeHtml(Utils.formatDateTime(r.started_at) + runZoneHint)}</span>
+          <span>${Utils.escapeHtml(r.status)}${r.trigger === 'manual' ? ' (manual)' : ''}</span>
+          <span>${r.email_sent ? 'emailed' : (r.status === 'suppressed' ? 'suppressed' : 'no email')}</span>
+          ${r.conversation_id ? `<a href="#" data-conversation="${r.conversation_id}">open run</a>` : ''}
+          ${r.error ? `<span class="schedule-run-error" title="${Utils.escapeAttr(r.error)}">error</span>` : ''}
+        </div>`;
+      }).join('') : '<p class="schedules-empty">No runs yet.</p>';
+      drawer.hidden = false;
+      drawer.querySelectorAll('[data-conversation]').forEach((a) => {
+        a.addEventListener('click', (e) => {
+          e.preventDefault();
+          UI.closeSettings();
+          Chat.loadConversation(Number(a.dataset.conversation));
+        });
+      });
+    } catch (err) {
+      this._scheduleStatus(err.message, 'error');
+    }
+  },
+
+  async openScheduleEditor({ mode = 'create', schedule = null } = {}) {
+    const modal = document.querySelector('.schedule-modal');
+    if (!modal) return;
+    this.scheduleEditorMode = mode;
+    this.scheduleEditorId = schedule?.id || null;
+    document.getElementById('schedule-modal-title').textContent =
+      mode === 'edit' ? `Edit schedule: ${schedule.name}` : 'New schedule';
+    // populate the playbook dropdown from the invokable set
+    try {
+      const data = await API.getPlaybooksList();
+      const playbooks = data?.playbooks || [];
+      document.getElementById('schedule-playbook').innerHTML = playbooks
+        .map((p) => `<option value="${p.id}">${Utils.escapeHtml(p.name)}</option>`)
+        .join('');
+    } catch (err) {
+      const editorStatus = document.getElementById('schedule-editor-status');
+      if (editorStatus) {
+        editorStatus.textContent = `Could not load playbooks: ${err.message}`;
+        editorStatus.classList.add('error');
+      }
+    }
+    document.getElementById('schedule-name').value = schedule?.name || '';
+    const cron = schedule?.cron || '0 7 * * *';
+    document.getElementById('schedule-cron').value = cron;
+    this._scheduleAdvancedOpen = false;
+    const advBtn = document.getElementById('schedule-advanced-toggle');
+    if (advBtn) advBtn.textContent = '▸ Advanced: edit as cron';
+    this._populateIntervalChoices();
+    this._populateMonthdayChoices();
+    this._populateTimezoneSelect(schedule?.timezone || null);
+    this._applyBuilderState(ScheduleCron.recognize(cron));
+    this.refreshSchedulePreview();
+    document.getElementById('schedule-recipients').value = (schedule?.recipients || []).join(', ');
+    document.getElementById('schedule-subject').value = schedule?.subject_prefix || '';
+    document.getElementById('schedule-instructions').value = schedule?.extra_instructions || '';
+    document.querySelectorAll('input[name="schedule-mode"]').forEach((r) => {
+      r.checked = r.value === (schedule?.mode || 'digest');
+    });
+    if (schedule?.playbook_id) {
+      document.getElementById('schedule-playbook').value = String(schedule.playbook_id);
+    }
+    const editorStatus = document.getElementById('schedule-editor-status');
+    editorStatus.textContent = '';
+    editorStatus.classList.remove('error', 'success');
+    modal.style.display = 'flex';
+  },
+
+  closeScheduleEditor() {
+    const modal = document.querySelector('.schedule-modal');
+    if (modal) modal.style.display = 'none';
+  },
+
+  async saveScheduleFromEditor() {
+    const status = document.getElementById('schedule-editor-status');
+    const builderState = this._scheduleBuilderState();
+    if (builderState.pattern === 'weekly' && !builderState.days.length) {
+      if (status) {
+        status.textContent = 'Pick at least one day of the week.';
+        status.classList.add('error');
+      }
+      return;
+    }
+    const payload = {
+      name: document.getElementById('schedule-name').value.trim(),
+      playbook_id: Number(document.getElementById('schedule-playbook').value),
+      cron: document.getElementById('schedule-cron').value.trim(),
+      timezone: document.getElementById('schedule-timezone').value.trim() || 'UTC',
+      mode: document.querySelector('input[name="schedule-mode"]:checked')?.value || 'digest',
+      recipients: document.getElementById('schedule-recipients').value
+        .split(',').map((s) => s.trim()).filter(Boolean),
+      subject_prefix: document.getElementById('schedule-subject').value.trim() || null,
+      extra_instructions: document.getElementById('schedule-instructions').value.trim() || null,
+    };
+    try {
+      if (this.scheduleEditorMode === 'edit' && this.scheduleEditorId) {
+        await API.updateSchedule(this.scheduleEditorId, payload);
+      } else {
+        await API.createSchedule(payload);
+      }
+      this.closeScheduleEditor();
+      await this.loadSchedulesPanel();
+    } catch (err) {
+      if (status) {
+        status.textContent = err.message;
+        status.classList.add('error');
+      }
+    }
+  },
+
+  _scheduleAdvancedOpen: false,
+
+  _scheduleBuilderState() {
+    return {
+      pattern: document.getElementById('schedule-repeats').value,
+      time: document.getElementById('schedule-time').value || '07:00',
+      days: [...document.querySelectorAll('#schedule-days .schedule-day-chip.on')]
+        .map((b) => Number(b.dataset.day)),
+      every: Number(document.getElementById('schedule-every-n').value),
+      unit: document.getElementById('schedule-every-unit').value,
+      monthday: Number(document.getElementById('schedule-monthday').value),
+    };
+  },
+
+  _syncScheduleBuilderVisibility() {
+    const p = document.getElementById('schedule-repeats').value;
+    document.getElementById('schedule-time-field').hidden = (p === 'interval' || p === 'custom');
+    document.getElementById('schedule-days-field').hidden = (p !== 'weekly');
+    document.getElementById('schedule-interval-field').hidden = (p !== 'interval');
+    document.getElementById('schedule-monthday-field').hidden = (p !== 'monthly');
+    const state = this._scheduleBuilderState();
+    document.getElementById('schedule-monthday-note').hidden = !(p === 'monthly' && state.monthday >= 29);
+    document.getElementById('schedule-advanced-body').hidden = !(p === 'custom' || this._scheduleAdvancedOpen);
+  },
+
+  _renderScheduleDayChips(selected = []) {
+    const wrap = document.getElementById('schedule-days');
+    if (!wrap) return;
+    const order = [1, 2, 3, 4, 5, 6, 0]; // Monday-first, cron day numbers
+    wrap.innerHTML = order.map((d) =>
+      `<button type="button" class="schedule-day-chip${selected.includes(d) ? ' on' : ''}" data-day="${d}">${ScheduleCron.DAY_NAMES[d]}</button>`
+    ).join('');
+    wrap.querySelectorAll('.schedule-day-chip').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        btn.classList.toggle('on');
+        Chat.onScheduleBuilderChange();
+      });
+    });
+  },
+
+  _populateIntervalChoices() {
+    const unit = document.getElementById('schedule-every-unit').value;
+    const list = unit === 'hours' ? SCHEDULE_INTERVAL_HOURS : SCHEDULE_INTERVAL_MINUTES;
+    const sel = document.getElementById('schedule-every-n');
+    const prev = Number(sel.value);
+    sel.innerHTML = list.map((n) => `<option value="${n}">${n}</option>`).join('');
+    sel.value = String(list.includes(prev) ? prev : list[0]);
+    // Deliberately no onScheduleBuilderChange() here: openScheduleEditor calls this
+    // BEFORE restoring the saved cron, and a compile from stale controls would
+    // clobber an exotic schedule's cron. The unit-change listener triggers the
+    // rebuild+compile pair explicitly.
+  },
+
+  _populateMonthdayChoices() {
+    const sel = document.getElementById('schedule-monthday');
+    if (sel.options.length) return;
+    sel.innerHTML = Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}">${i + 1}</option>`).join('');
+  },
+
+  _populateTimezoneSelect(selected) {
+    const sel = document.getElementById('schedule-timezone');
+    if (!sel) return;
+    const detected = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    const zones = (typeof Intl.supportedValuesOf === 'function')
+      ? Intl.supportedValuesOf('timeZone') : [...SCHEDULE_FALLBACK_ZONES];
+    const all = new Set(zones);
+    all.add('UTC');
+    all.add(detected);
+    if (selected) all.add(selected);
+    sel.innerHTML = [...all].sort().map((z) =>
+      `<option value="${Utils.escapeAttr(z)}">${Utils.escapeHtml(z)}${z === detected ? ' · detected' : ''}</option>`
+    ).join('');
+    sel.value = selected || detected;
+  },
+
+  _applyBuilderState(state) {
+    const s = state || { pattern: 'custom' };
+    document.getElementById('schedule-repeats').value = s.pattern;
+    if (s.time) document.getElementById('schedule-time').value = s.time;
+    if (s.pattern === 'interval') {
+      document.getElementById('schedule-every-unit').value = s.unit;
+      this._populateIntervalChoices();
+      document.getElementById('schedule-every-n').value = String(s.every);
+    }
+    if (s.pattern === 'monthly') {
+      document.getElementById('schedule-monthday').value = String(s.monthday);
+    }
+    this._renderScheduleDayChips(s.pattern === 'weekly' ? s.days : [1]);
+    this._syncScheduleBuilderVisibility();
+  },
+
+  onScheduleBuilderChange() {
+    this._syncScheduleBuilderVisibility();
+    const state = this._scheduleBuilderState();
+    if (state.pattern !== 'custom') {
+      const cron = ScheduleCron.compile(state);
+      if (cron) document.getElementById('schedule-cron').value = cron;
+    }
+    this.refreshSchedulePreview();
+  },
+
+  onScheduleCronEdited() {
+    const raw = document.getElementById('schedule-cron').value.trim();
+    const recognized = ScheduleCron.recognize(raw);
+    if (recognized) {
+      this._applyBuilderState(recognized);
+    } else {
+      document.getElementById('schedule-repeats').value = 'custom';
+      this._syncScheduleBuilderVisibility();
+    }
+    this.refreshSchedulePreview();
+  },
+
+  toggleScheduleAdvanced() {
+    this._scheduleAdvancedOpen = !this._scheduleAdvancedOpen;
+    const btn = document.getElementById('schedule-advanced-toggle');
+    if (btn) btn.textContent = `${this._scheduleAdvancedOpen ? '▾' : '▸'} Advanced: edit as cron`;
+    this._syncScheduleBuilderVisibility();
+  },
+
+  refreshSchedulePreview() {
+    if (!this._schedulePreviewDebounced) {
+      this._schedulePreviewDebounced = Utils.debounce(() => this._fetchSchedulePreview(), 300);
+    }
+    this._schedulePreviewDebounced();
+  },
+
+  async _fetchSchedulePreview() {
+    const el = document.getElementById('schedule-preview');
+    if (!el) return;
+    const state = this._scheduleBuilderState();
+    if (state.pattern === 'weekly' && !state.days.length) {
+      el.classList.add('error');
+      el.textContent = 'Pick at least one day.';
+      return;
+    }
+    const cron = document.getElementById('schedule-cron').value.trim();
+    const tz = document.getElementById('schedule-timezone').value;
+    try {
+      const data = await API.previewSchedule({ cron, timezone: tz });
+      const fmt = { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+      const times = (data?.next || []).map((iso) => new Date(iso));
+      const viewerZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      let text = `⏱ Next: ${times.map((d) => d.toLocaleString([], fmt)).join(' · ')} — your local time`;
+      if (times.length && tz !== viewerZone) {
+        text += ` (first run: ${times[0].toLocaleString([], { ...fmt, timeZone: tz })} in ${tz})`;
+      }
+      el.classList.remove('error');
+      el.textContent = text;
+    } catch (err) {
+      el.classList.add('error');
+      el.textContent = (err instanceof TypeError)
+        ? "Can't compute preview right now."
+        : err.message;
     }
   },
 };

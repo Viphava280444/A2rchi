@@ -77,6 +77,17 @@ services:
     update_time: {{ services.piazza.update_time | default(60, true) }}
   mattermost:
     update_time: {{ services.mattermost.update_time | default(60, true) }}
+  playbook_scheduler:
+    poll_interval_seconds: {{ services.playbook_scheduler.poll_interval_seconds | default(30, true) }}
+    run_timeout_seconds: {{ services.playbook_scheduler.run_timeout_seconds | default(600, true) }}
+    catchup_window_minutes: {{ services.playbook_scheduler.catchup_window_minutes | default(60, true) }}
+    max_schedules_per_user: {{ services.playbook_scheduler.max_schedules_per_user | default(10, true) }}
+    min_interval_minutes: {{ services.playbook_scheduler.min_interval_minutes | default(5, true) }}
+    max_consecutive_failures: {{ services.playbook_scheduler.max_consecutive_failures | default(3, true) }}
+    default_timezone: {{ services.playbook_scheduler.default_timezone | default('UTC', true) }}
+    allowed_recipient_domains: {{ services.playbook_scheduler.allowed_recipient_domains | default([], true) }}
+    email_from_display_name: "{{ services.playbook_scheduler.email_from_display_name | default('archi scheduler', true) }}"
+    chat_base_url: "{{ services.playbook_scheduler.chat_base_url | default('', true) }}"
   redmine_mailbox:
     agent_class: {{ services.redmine_mailbox.agent_class | default('CMSCompOpsAgent', true) }}
     agents_dir: "{{ services.redmine_mailbox.agents_dir | default('', true) }}"

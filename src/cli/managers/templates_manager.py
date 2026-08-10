@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from jinja2 import Environment
+from jinja2 import Environment, TemplateNotFound
 
 from src.cli.service_registry import service_registry
 from src.cli.utils.service_builder import DeploymentPlan
@@ -644,11 +644,16 @@ class TemplateManager:
             enabled_services = context.plan.get_enabled_services()
             for service in enabled_services:
                 chart_dir = context.base_dir / "templates" / f"{service}-service.yaml"
-                tmpl = self.env.get_template(str(HELM_PREFIX / service / "service.yaml"))  
-                helm_config = tmpl.render(name=context.plan.name) 
+                try:
+                    tmpl = self.env.get_template(str(HELM_PREFIX / service / "service.yaml"))
+                except TemplateNotFound:
+                    # Headless workers (e.g. playbook-scheduler) ship a Deployment
+                    # but no K8s Service — nothing to stage here.
+                    continue
+                helm_config = tmpl.render(name=context.plan.name)
                 with open(chart_dir,"w") as f:
                     f.write(helm_config)
-        
+
         else:
             for name, hook in self._service_hooks.items():
                 if context.plan.get_service(name).enabled:
