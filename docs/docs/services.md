@@ -330,22 +330,49 @@ archi create [...] --services chatbot,jira_ticket_responder
 
 ## Mattermost Interface
 
-Reads posts from a Mattermost forum and posts draft responses to a specified channel.
+Answers Mattermost posts that tag Archi. Write `@archi <question>` in a channel Archi has
+joined, or send it a direct message, and Archi replies in that thread using the thread as
+conversation history — the same interaction model as tagging an assistant in Slack.
+
+Archi responds to:
+
+- any post containing `@<bot username>` (or one of `mention_aliases`) in a watched channel
+- direct and group messages, tag or not (`respond_to_dms`)
+- follow-up posts in a thread Archi has already replied to, without needing the tag again
+  (`respond_to_thread_followups`)
+
+It never answers its own posts, system join/leave messages, or a post it has already
+answered. On first sight of a channel it records the current position rather than replying
+to the existing backlog.
+
+### Setup
+
+Create a bot account (or a dedicated user) in Mattermost, invite it to the channels it
+should watch, and issue it a personal access token for `MATTERMOST_PAK`. The tag Archi
+listens for defaults to that account's own username, so no extra configuration is needed
+to be reachable as `@archi` if the account is named `archi`.
 
 ### Configuration
 
 ```yaml
 services:
   mattermost:
-    update_time: 60
+    update_time: 60                     # seconds between polls
+    url: https://mattermost.web.cern.ch/
+    agent_class: QAPipeline
+    mention_aliases: []                 # extra tags besides the bot's username, e.g. ["a2rchi"]
+    channels: []                        # channel ids to watch; empty = every channel the bot joined
+    respond_to_dms: true
+    respond_to_thread_followups: true
+    thread_history_limit: 20            # thread messages passed to the model as history
 ```
 
 ### Secrets
 
 ```bash
-MATTERMOST_WEBHOOK=...
-MATTERMOST_PAK=...
-MATTERMOST_CHANNEL_ID_READ=...
+MATTERMOST_PAK=...              # personal access token of the bot account (required)
+MATTERMOST_WEBHOOK=...          # optional fallback used only if the API post fails
+MATTERMOST_CHANNEL_ID_READ=...  # optional; watches only this channel when `channels` is unset
 MATTERMOST_CHANNEL_ID_WRITE=...
 ```
 

@@ -134,10 +134,11 @@ class ServiceRegistry:
         
         self.register(ServiceDefinition(
             name='mattermost',
-            description='Integration service for Mattermost channels',
+            description='Integration service that answers Mattermost posts tagging Archi',
             category='integration',
-            required_secrets=['MATTERMOST_WEBHOOK', 'MATTERMOST_CHANNEL_ID_READ', 
-                            'MATTERMOST_CHANNEL_ID_WRITE', 'MATTERMOST_PAK']
+            # Only the access token is required: channels default to every
+            # channel the bot account has joined, and the webhook is a fallback.
+            required_secrets=['MATTERMOST_PAK']
         ))
         
         self.register(ServiceDefinition(

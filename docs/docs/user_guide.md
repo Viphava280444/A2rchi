@@ -52,7 +52,7 @@ Archi provides these deployable services:
 | `jira_ticket_responder` | Jira ticket responder service | — |
 | `piazza` | Piazza forum integration with Slack | — |
 | `redmine-mailer` | Redmine ticket responses via email | — |
-| `mattermost` | Mattermost channel integration | — |
+| `mattermost` | Answers Mattermost posts that tag `@archi` | — |
 | `grafana` | Monitoring dashboard | 3000 |
 | `grader` | Automated grading service | 7862 |
 

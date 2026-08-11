@@ -77,6 +77,16 @@ services:
     update_time: {{ services.piazza.update_time | default(60, true) }}
   mattermost:
     update_time: {{ services.mattermost.update_time | default(60, true) }}
+    url: {{ services.mattermost.url | default('https://mattermost.web.cern.ch/', true) }}
+    agent_class: {{ services.mattermost.agent_class | default('QAPipeline', true) }}
+    agents_dir: "{{ services.mattermost.agents_dir | default('', true) }}"
+    default_provider: {{ services.mattermost.default_provider | default(services.chat_app.default_provider | default('', true), true) }}
+    default_model: {{ services.mattermost.default_model | default(services.chat_app.default_model | default('', true), true) }}
+    mention_aliases: {{ services.mattermost.mention_aliases | default([], true) | tojson }}
+    channels: {{ services.mattermost.channels | default([], true) | tojson }}
+    respond_to_dms: {{ services.mattermost.respond_to_dms | default(true) | tojson }}
+    respond_to_thread_followups: {{ services.mattermost.respond_to_thread_followups | default(true) | tojson }}
+    thread_history_limit: {{ services.mattermost.thread_history_limit | default(20, true) }}
   redmine_mailbox:
     agent_class: {{ services.redmine_mailbox.agent_class | default('CMSCompOpsAgent', true) }}
     agents_dir: "{{ services.redmine_mailbox.agents_dir | default('', true) }}"

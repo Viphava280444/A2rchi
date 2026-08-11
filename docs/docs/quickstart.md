@@ -24,7 +24,7 @@ Application Services:
 Integration Services:
   jira_ticket_responder  Jira ticket responder service
   piazza               Integration service for Piazza posts and Slack notifications
-  mattermost           Integration service for Mattermost channels
+  mattermost           Integration service that answers Mattermost posts tagging Archi
   redmine-mailer       Email processing and Cleo/Redmine ticket management
 
 Data Sources:

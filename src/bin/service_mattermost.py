@@ -20,7 +20,7 @@ def main():
 
     print("Initializing Mattermost Service")
     mattermost_agent = mattermost.Mattermost()
-    update_time = int(mattermost_agent.mattermost_config["update_time"])
+    update_time = mattermost_agent.update_time
 
     while True:
         mattermost_agent.process_posts()
