@@ -1219,7 +1219,20 @@ class BaseReActAgent:
                             "Failed to record MCP tool input for %s: %s", tool_name, exc
                         )
                     # Run on the background loop - NOT a new loop!
-                    return runner.run(async_tool.coroutine(*args, **sanitized_kwargs))
+                    try:
+                        return runner.run(async_tool.coroutine(*args, **sanitized_kwargs))
+                    except TimeoutError as exc:
+                        # The coroutine was cancelled by AsyncLoopThread.run() after
+                        # exceeding its timeout. Surface this as a normal tool result
+                        # instead of letting it propagate and kill the whole agent
+                        # turn -- the model can retry narrower or answer with what
+                        # it already has.
+                        logger.warning("MCP tool '%s' timed out: %s", tool_name, exc)
+                        return (
+                            f"Error: tool '{tool_name}' exceeded the time limit and was "
+                            "cancelled. Retry with a narrower/more specific query, or "
+                            "proceed using the data already gathered."
+                        )
 
                 # Assign the wrapper to the tool's 'func' attribute
                 async_tool.func = sync_wrapper

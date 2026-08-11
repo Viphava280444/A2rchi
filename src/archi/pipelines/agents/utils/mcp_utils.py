@@ -1,5 +1,6 @@
 from typing import Optional, Any
 import asyncio
+import concurrent.futures
 import threading
 from src.utils.logging import get_logger
 
@@ -47,17 +48,34 @@ class AsyncLoopThread:
 
         Args:
             coro: An awaitable coroutine
-            timeout: Maximum seconds to wait (default 120s for MCP operations)
+            timeout: Maximum seconds to wait (default 120s for MCP operations).
+                Pass None to wait forever.
 
         Returns:
             The result of the coroutine
 
         Raises:
-            TimeoutError: If the coroutine doesn't complete in time
+            TimeoutError: If the coroutine doesn't complete in time. The
+                coroutine is cancelled on the background loop when this
+                happens -- it does not keep running after this call raises.
             Any exception raised by the coroutine
         """
-        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        return future.result(timeout=timeout)
+        if timeout is None:
+            # No deadline: don't wrap in wait_for, just wait forever.
+            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            return future.result()
+
+        # Wrap in asyncio.wait_for so expiry cancels the coroutine natively ON
+        # the loop, instead of merely abandoning it while it keeps running
+        # there. future.result() gets a small grace period beyond the inner
+        # timeout so it's the inner cancellation that fires, not this outer
+        # wait.
+        future = asyncio.run_coroutine_threadsafe(asyncio.wait_for(coro, timeout=timeout), self.loop)
+        try:
+            return future.result(timeout=timeout + 5.0)
+        except (asyncio.TimeoutError, concurrent.futures.TimeoutError) as exc:
+            logger.info("MCP coroutine exceeded %ss and was cancelled", timeout)
+            raise TimeoutError(f"Operation exceeded {timeout}s timeout and was cancelled") from exc
 
     def in_loop_thread(self) -> bool:
         """Return True if called from the background event-loop thread."""
