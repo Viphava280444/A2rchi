@@ -1228,11 +1228,21 @@ class BaseReActAgent:
                         # turn -- the model can retry narrower or answer with what
                         # it already has.
                         logger.warning("MCP tool '%s' timed out: %s", tool_name, exc)
-                        return (
+                        message = (
                             f"Error: tool '{tool_name}' exceeded the time limit and was "
                             "cancelled. Retry with a narrower/more specific query, or "
                             "proceed using the data already gathered."
                         )
+                        # MCP tools loaded via langchain-mcp-adapters are always
+                        # StructuredTools with response_format="content_and_artifact",
+                        # which requires BaseTool.run() to receive a two-tuple of
+                        # (content, artifact) from .func -- a bare string raises
+                        # ValueError('Since response_format=... a two-tuple ... is
+                        # expected') and kills the turn anyway. Match the tool's
+                        # declared shape; getattr covers tools that don't set it.
+                        if getattr(async_tool, "response_format", "content") == "content_and_artifact":
+                            return message, None
+                        return message
 
                 # Assign the wrapper to the tool's 'func' attribute
                 async_tool.func = sync_wrapper

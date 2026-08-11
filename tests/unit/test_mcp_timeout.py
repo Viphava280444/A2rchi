@@ -98,15 +98,24 @@ def test_default_timeout_is_still_120_seconds():
 class _FakeAsyncTool:
     """The smallest stand-in for the langchain BaseTool object make_synchronous
     wraps. sync_wrapper only ever touches .name, .coroutine, and (by
-    assignment) .func, so a real MCP tool is not needed to exercise it."""
+    assignment) .func, so a real MCP tool is not needed to exercise it.
 
-    def __init__(self, name, coroutine_fn):
+    response_format defaults to unset (no attribute at all) to reproduce the
+    original fake exactly. Real MCP tools are never like this: every tool
+    produced by langchain_mcp_adapters.tools.convert_mcp_tool_to_langchain_tool
+    is a StructuredTool constructed with response_format="content_and_artifact"
+    hard-coded (see site-packages/langchain_mcp_adapters/tools.py), so callers
+    that need to match real behavior must pass that explicitly."""
+
+    def __init__(self, name, coroutine_fn, response_format=None):
         self.name = name
         self.coroutine = coroutine_fn
         self.func = None
+        if response_format is not None:
+            self.response_format = response_format
 
 
-def _make_sync_wrapper(monkeypatch, coroutine_fn, tool_name="fake_mcp_tool"):
+def _make_sync_wrapper(monkeypatch, coroutine_fn, tool_name="fake_mcp_tool", response_format=None):
     """Build a REAL sync_wrapper via BaseReActAgent._build_mcp_tools(), faking
     out only initialize_mcp_client() so no network/subprocess MCP server is
     required. Everything downstream of that -- make_synchronous,
@@ -121,7 +130,7 @@ def _make_sync_wrapper(monkeypatch, coroutine_fn, tool_name="fake_mcp_tool"):
     runner, mcp client, skills text) -- it never reads any attribute __init__
     would have set -- so the bypass is safe.
     """
-    fake_tool = _FakeAsyncTool(tool_name, coroutine_fn)
+    fake_tool = _FakeAsyncTool(tool_name, coroutine_fn, response_format=response_format)
 
     async def fake_initialize_mcp_client():
         return (object(), [fake_tool], "")
@@ -148,6 +157,39 @@ def test_sync_wrapper_returns_string_naming_the_tool_on_timeout(monkeypatch):
 
     assert isinstance(result, str)
     assert "dbs_find_files" in result
+
+
+def test_sync_wrapper_returns_two_tuple_for_content_and_artifact_tools(monkeypatch):
+    """Real MCP tools are never like _FakeAsyncTool's default: every tool
+    langchain_mcp_adapters produces is a StructuredTool with
+    response_format="content_and_artifact" hard-coded (see
+    convert_mcp_tool_to_langchain_tool in site-packages/langchain_mcp_adapters/
+    tools.py). langchain_core.tools.base.BaseTool.run enforces that any tool
+    declaring that response_format must return a two-tuple (content, artifact)
+    from .func -- a plain string makes it raise:
+    "Since response_format='content_and_artifact' a two-tuple of the message
+    content and raw tool output is expected. Instead ... generated response
+    is of type: <class 'str'>", which is exactly the production error this
+    fix addresses. This is the test the original fake tool (no response_format
+    attribute) could not have caught."""
+    async def times_out(*args, **kwargs):
+        await asyncio.wait_for(asyncio.sleep(5), timeout=0.05)
+
+    sync_wrapper = _make_sync_wrapper(
+        monkeypatch,
+        times_out,
+        tool_name="dbs_aggregate",
+        response_format="content_and_artifact",
+    )
+
+    result = sync_wrapper()
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    content, artifact = result
+    assert isinstance(content, str)
+    assert "dbs_aggregate" in content
+    assert artifact is None
 
 
 def test_sync_wrapper_does_not_swallow_non_timeout_errors(monkeypatch):
