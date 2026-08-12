@@ -274,8 +274,23 @@ class BaseReActAgent:
             self.refresh_agent(force=True)
         logger.debug("Agent refreshed, invoking now")
         recursion_limit = self._recursion_limit()
+        # Drive the graph via stream(..., stream_mode="values") instead of
+        # invoke() so the last accumulated state survives a GraphRecursionError.
+        # invoke() raises without returning, so a variable assigned from its
+        # result is never in scope in the except block below -- this is what
+        # used to hand the recursion-limit fallback an empty message list
+        # even when the run had gathered real tool results. stream_mode="values"
+        # yields the full accumulated state after each step (the same shape
+        # invoke() itself returns on success), mirroring how the streaming
+        # path (see stream() below) already captures all_messages.
+        answer_output: Any = None
         try:
-            answer_output = self.agent.invoke(agent_inputs, {"recursion_limit": recursion_limit})
+            for answer_output in self.agent.stream(
+                agent_inputs,
+                stream_mode="values",
+                config={"recursion_limit": recursion_limit},
+            ):
+                pass
             logger.debug("Agent invocation completed")
             logger.debug(answer_output)
             messages = self._extract_messages(answer_output)
@@ -292,7 +307,7 @@ class BaseReActAgent:
             return self._handle_recursion_limit_error(
                 error=exc,
                 recursion_limit=recursion_limit,
-                latest_messages=[],
+                latest_messages=self._extract_messages(answer_output),
                 agent_inputs=agent_inputs,
             )
 

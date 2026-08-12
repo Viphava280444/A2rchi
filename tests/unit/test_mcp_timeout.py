@@ -1,5 +1,7 @@
 """
-Tests for two related MCP timeout bugs:
+Tests for three related MCP timeout / recursion-limit bugs, all under the
+same "a turn that runs into trouble should still surface whatever the agent
+already gathered" umbrella:
 
 Bug 1 (mcp_utils.py -- AsyncLoopThread.run): concurrent.futures.Future.result(
 timeout=...) raises TimeoutError in the CALLING thread but does not cancel the
@@ -12,15 +14,30 @@ Bug 2 (base_react.py -- sync_wrapper): when AsyncLoopThread.run() raises on
 timeout, the exception used to propagate out of the tool and kill the whole
 agent turn with an HTTP 500. The fix catches only the timeout and returns a
 structured error string so the model can act on data it already gathered.
+
+Bug 3 (base_react.py -- BaseReActAgent.invoke): when the graph exhausts its
+recursion limit, invoke() caught GraphRecursionError and called the wrap-up
+fallback with an empty message list. self.agent.invoke() raises without
+returning, so whatever messages/tool results the graph had accumulated were
+never in scope to hand to the fallback -- the wrap-up model then had nothing
+to summarize and confabulated a narrative instead of reporting the numbers
+the agent had already gathered. The fix drives the graph with
+self.agent.stream(..., stream_mode="values") instead of .invoke(), keeping
+the last emitted state so it survives a GraphRecursionError. The streaming
+path (BaseReActAgent.stream) already did this correctly; this is the sync
+invoke() path catching up to it.
 """
 import asyncio
 import inspect
 import time
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langgraph.errors import GraphRecursionError
 
 from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
 from src.archi.pipelines.agents import base_react
+from src.archi.utils.output_dataclass import PipelineOutput
 
 
 @pytest.fixture
@@ -200,3 +217,184 @@ def test_sync_wrapper_does_not_swallow_non_timeout_errors(monkeypatch):
 
     with pytest.raises(ValueError, match="real tool bug"):
         sync_wrapper()
+
+
+# ---------------------------------------------------------------------------
+# Bug 3: BaseReActAgent.invoke() must not discard gathered messages when the
+# graph hits its recursion limit. It used to call the fallback handler with
+# latest_messages=[] because self.agent.invoke() raises GraphRecursionError
+# without returning, so nothing the run had gathered was still in scope. The
+# fix drives the graph via self.agent.stream(..., stream_mode="values") and
+# keeps the last emitted state, mirroring what BaseReActAgent.stream()
+# already does for the streaming path.
+# ---------------------------------------------------------------------------
+
+class _FakeCompiledGraph:
+    """Stand-in for the CompiledStateGraph create_agent() returns.
+
+    Faithfully mirrors the langgraph==1.0.1 Pregel contract this fix depends
+    on (verified by reading langgraph.pregel.main.Pregel.invoke/.stream
+    source directly, not assumed): .invoke() is implemented purely in terms
+    of .stream(..., stream_mode="values") -- it keeps the last yielded state
+    and returns it, and if the stream raises partway through, that local
+    state is lost when the exception unwinds .invoke()'s own stack. That is
+    the production bug in miniature.
+
+    A fake that instead special-cased .invoke() -- e.g. by omitting it, or
+    by having it catch its own exception and return the last state anyway
+    -- would not exercise the real failure mode, and would repeat the
+    mistake documented at the top of this file: the previous fix in this
+    file passed its tests and still broke live because its test double
+    didn't match the real object's shape (response_format). Real compiled
+    graphs always have a working .invoke(); this one does too, and it loses
+    state on error exactly like the real one, which is what makes the RED
+    result below mean something.
+    """
+
+    def __init__(self, states, error=None):
+        self._states = list(states)
+        self._error = error
+        self.stream_calls = []
+
+    def stream(self, input, config=None, *, stream_mode=None, **kwargs):
+        assert stream_mode == "values", (
+            "the fix must drive the graph with stream_mode='values'"
+        )
+        self.stream_calls.append({"input": input, "config": config})
+        for state in self._states:
+            yield state
+        if self._error is not None:
+            raise self._error
+
+    def invoke(self, input, config=None, **kwargs):
+        """Mirrors Pregel.invoke(): keep the last 'values' state and return
+        it -- but if .stream() raises partway through, that local `last` is
+        discarded when the exception propagates, same as the real thing."""
+        last = None
+        for last in self.stream(input, config=config, stream_mode="values"):
+            pass
+        return last
+
+
+def _make_bare_agent(graph, recursion_limit=5, agent_inputs=None):
+    """Build a BaseReActAgent with just enough wired up to exercise
+    invoke()'s try/except around the graph call. __init__ needs real
+    LLM/provider config, so bypass it via __new__ -- the same precedent
+    test_playbook_tools.py uses for BaseReActAgent (_mixin_agent /
+    test_base_agent_has_no_playbook_tools). _prepare_agent_inputs and
+    _recursion_limit are stubbed directly because their own logic (token
+    trimming, config parsing) is unrelated to this bug; only the try/except
+    block and its interaction with self.agent / self._handle_recursion_limit_error
+    is under test."""
+    agent = base_react.BaseReActAgent.__new__(base_react.BaseReActAgent)
+    agent.agent = graph
+    agent._active_memory = None
+    fixed_inputs = dict(agent_inputs or {"messages": []})
+    agent._prepare_agent_inputs = lambda **kwargs: fixed_inputs
+    agent._recursion_limit = lambda: recursion_limit
+    return agent
+
+
+def test_invoke_passes_gathered_messages_to_recursion_handler():
+    """The core regression test: when the graph raises GraphRecursionError
+    after producing real messages (a question, a tool call, and a tool
+    result with actual numbers in it -- mirroring the production trace),
+    the fallback handler must receive those messages, not an empty list.
+
+    Fails against current HEAD: the handler is called with
+    latest_messages=[] no matter what the graph gathered, because
+    self.agent.invoke() raises without returning."""
+    human = HumanMessage(content="how big is campaign X?")
+    ai_tool_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "dbs_find_files", "args": {"dataset": "/X"}, "id": "call_1"}],
+    )
+    tool_result = ToolMessage(content="1234 files, 56.7 TB", tool_call_id="call_1")
+
+    states = [
+        {"messages": [human]},
+        {"messages": [human, ai_tool_call]},
+        {"messages": [human, ai_tool_call, tool_result]},
+    ]
+    graph = _FakeCompiledGraph(states, error=GraphRecursionError("recursion limit hit"))
+    agent = _make_bare_agent(graph)
+
+    captured = {}
+
+    def fake_handler(**kwargs):
+        captured.update(kwargs)
+        return "FALLBACK_OUTPUT"
+
+    agent._handle_recursion_limit_error = fake_handler
+
+    result = agent.invoke()
+
+    assert result == "FALLBACK_OUTPUT"
+    assert "latest_messages" in captured
+    got = list(captured["latest_messages"])
+    assert got != [], "handler must not get an empty list when the graph gathered real messages"
+    assert got == states[-1]["messages"]
+    # The number the production trace showed missing from the fallback answer.
+    assert any("56.7 TB" in getattr(m, "content", "") for m in got)
+
+
+def test_invoke_success_path_unchanged():
+    """A normal run (no recursion limit hit) must return the exact same
+    PipelineOutput as before: answer text from the final AI message, the
+    full accumulated message list, empty metadata, final=True.
+
+    Passes against current HEAD too -- this is a regression guard pinning
+    down that the fix only changes behavior on the exception path."""
+    human = HumanMessage(content="how big is campaign X?")
+    ai_tool_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "dbs_find_files", "args": {"dataset": "/X"}, "id": "call_1"}],
+    )
+    tool_result = ToolMessage(content="1234 files, 56.7 TB", tool_call_id="call_1")
+    final_answer = AIMessage(content="Campaign X has 1234 files totaling 56.7 TB.")
+
+    final_messages = [human, ai_tool_call, tool_result, final_answer]
+    states = [
+        {"messages": [human]},
+        {"messages": [human, ai_tool_call]},
+        {"messages": [human, ai_tool_call, tool_result]},
+        {"messages": final_messages},
+    ]
+    graph = _FakeCompiledGraph(states, error=None)
+    agent = _make_bare_agent(graph, recursion_limit=7)
+
+    result = agent.invoke()
+
+    assert isinstance(result, PipelineOutput)
+    assert result.answer == "Campaign X has 1234 files totaling 56.7 TB."
+    assert result.messages == final_messages
+    assert result.metadata == {}
+    assert result.final is True
+    assert result.source_documents == []
+    assert graph.stream_calls, "the fix must drive the graph via .stream(...)"
+    assert graph.stream_calls[0]["config"] == {"recursion_limit": 7}
+
+
+def test_invoke_recursion_error_before_any_state_is_handled_gracefully():
+    """If the graph raises before producing anything at all (e.g. the
+    recursion limit is hit on the very first tick), the handler must get an
+    empty list, not crash.
+
+    Passes against current HEAD too, since the old code always passed [];
+    this guards against a regression where the fix tries to read messages
+    off a state that was never captured."""
+    graph = _FakeCompiledGraph([], error=GraphRecursionError("no progress"))
+    agent = _make_bare_agent(graph)
+
+    captured = {}
+
+    def fake_handler(**kwargs):
+        captured.update(kwargs)
+        return "FALLBACK_OUTPUT"
+
+    agent._handle_recursion_limit_error = fake_handler
+
+    result = agent.invoke()
+
+    assert result == "FALLBACK_OUTPUT"
+    assert captured["latest_messages"] == []
