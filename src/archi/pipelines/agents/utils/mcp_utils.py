@@ -6,6 +6,17 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+
+class McpCallTimeout(TimeoutError):
+    """Raised by AsyncLoopThread.run() when its own deadline expires.
+
+    Deliberately a distinct type so callers can tell "the runner gave up
+    waiting" apart from a TimeoutError raised inside the coroutine itself
+    (e.g. a transport-level connect timeout), which run() re-raises
+    untouched.
+    """
+
+
 class AsyncLoopThread:
     """
     A dedicated background thread running a single event loop.
@@ -55,27 +66,30 @@ class AsyncLoopThread:
             The result of the coroutine
 
         Raises:
-            TimeoutError: If the coroutine doesn't complete in time. The
-                coroutine is cancelled on the background loop when this
-                happens -- it does not keep running after this call raises.
-            Any exception raised by the coroutine
+            McpCallTimeout: The deadline expired. Cancellation is requested
+                on the loop: a coroutine waiting at an await point stops,
+                but one stuck in blocking synchronous work cannot be
+                interrupted and may keep running on the loop after this
+                raises.
+            Any exception raised by the coroutine (re-raised untouched,
+                including the coroutine's own TimeoutError).
         """
-        if timeout is None:
-            # No deadline: don't wrap in wait_for, just wait forever.
-            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-            return future.result()
-
-        # Wrap in asyncio.wait_for so expiry cancels the coroutine natively ON
-        # the loop, instead of merely abandoning it while it keeps running
-        # there. future.result() gets a small grace period beyond the inner
-        # timeout so it's the inner cancellation that fires, not this outer
-        # wait.
-        future = asyncio.run_coroutine_threadsafe(asyncio.wait_for(coro, timeout=timeout), self.loop)
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
         try:
-            return future.result(timeout=timeout + 5.0)
+            # result(timeout=None) waits forever, so timeout=None needs no
+            # special branch. The deadline is enforced here, in the calling
+            # thread, so it holds even when the coroutine blocks the loop
+            # with synchronous work (wait_for's loop-side timer could not).
+            return future.result(timeout=timeout)
         except (asyncio.TimeoutError, concurrent.futures.TimeoutError) as exc:
-            logger.info("MCP coroutine exceeded %ss and was cancelled", timeout)
-            raise TimeoutError(f"Operation exceeded {timeout}s timeout and was cancelled") from exc
+            if future.done() and future.exception() is exc:
+                # The coroutine itself raised a timeout-family error (e.g. a
+                # transport connect timeout) before our deadline -- that is a
+                # real tool error, not the runner's deadline. Re-raise as-is.
+                raise
+            future.cancel()
+            logger.warning("MCP coroutine exceeded %ss deadline; cancellation requested", timeout)
+            raise McpCallTimeout(f"Operation exceeded {timeout}s timeout") from None
 
     def in_loop_thread(self) -> bool:
         """Return True if called from the background event-loop thread."""

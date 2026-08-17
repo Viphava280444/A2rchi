@@ -7,6 +7,7 @@ import json
 from langchain.agents import create_agent
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import ToolException
 try:
     from langchain_core.messages import BaseMessageChunk
 except ImportError:
@@ -20,7 +21,7 @@ from src.archi.providers import get_model
 from src.archi.providers.base import ProviderType
 from src.archi.utils.output_dataclass import PipelineOutput
 from src.archi.pipelines.agents.utils.run_memory import RunMemory
-from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
+from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread, McpCallTimeout
 from src.archi.pipelines.agents.tools import initialize_mcp_client
 from src.utils.logging import get_logger
 
@@ -280,14 +281,18 @@ class BaseReActAgent:
         # result is never in scope in the except block below -- this is what
         # used to hand the recursion-limit fallback an empty message list
         # even when the run had gathered real tool results. stream_mode="values"
-        # yields the full accumulated state after each step (the same shape
-        # invoke() itself returns on success), mirroring how the streaming
-        # path (see stream() below) already captures all_messages.
+        # yields the full accumulated state after each step, mirroring how the
+        # streaming path (see stream() below) already captures all_messages.
+        # output_keys must be pinned to the graph's output channels: invoke()
+        # does this internally, while a bare stream() call falls back to ALL
+        # stream channels and would leak internal routing keys (e.g.
+        # 'jump_to') into the returned state.
         answer_output: Any = None
         try:
             for answer_output in self.agent.stream(
                 agent_inputs,
                 stream_mode="values",
+                output_keys=self.agent.output_channels,
                 config={"recursion_limit": recursion_limit},
             ):
                 pass
@@ -1236,28 +1241,20 @@ class BaseReActAgent:
                     # Run on the background loop - NOT a new loop!
                     try:
                         return runner.run(async_tool.coroutine(*args, **sanitized_kwargs))
-                    except TimeoutError as exc:
-                        # The coroutine was cancelled by AsyncLoopThread.run() after
-                        # exceeding its timeout. Surface this as a normal tool result
-                        # instead of letting it propagate and kill the whole agent
-                        # turn -- the model can retry narrower or answer with what
-                        # it already has.
+                    except McpCallTimeout as exc:
+                        # The runner's deadline expired. Raise ToolException so
+                        # BaseTool.run() -- handle_tool_error=True is set on
+                        # every MCP tool in initialize_mcp_client -- turns it
+                        # into a ToolMessage with status="error" instead of
+                        # killing the whole agent turn. A TimeoutError raised
+                        # by the tool's own coroutine is not McpCallTimeout
+                        # and propagates untouched, like any other tool error.
                         logger.warning("MCP tool '%s' timed out: %s", tool_name, exc)
-                        message = (
-                            f"Error: tool '{tool_name}' exceeded the time limit and was "
-                            "cancelled. Retry with a narrower/more specific query, or "
+                        raise ToolException(
+                            f"Error: tool '{tool_name}' exceeded the time limit. "
+                            "Retry with a narrower/more specific query, or "
                             "proceed using the data already gathered."
-                        )
-                        # MCP tools loaded via langchain-mcp-adapters are always
-                        # StructuredTools with response_format="content_and_artifact",
-                        # which requires BaseTool.run() to receive a two-tuple of
-                        # (content, artifact) from .func -- a bare string raises
-                        # ValueError('Since response_format=... a two-tuple ... is
-                        # expected') and kills the turn anyway. Match the tool's
-                        # declared shape; getattr covers tools that don't set it.
-                        if getattr(async_tool, "response_format", "content") == "content_and_artifact":
-                            return message, None
-                        return message
+                        ) from exc
 
                 # Assign the wrapper to the tool's 'func' attribute
                 async_tool.func = sync_wrapper

@@ -3,17 +3,28 @@ Tests for three related MCP timeout / recursion-limit bugs, all under the
 same "a turn that runs into trouble should still surface whatever the agent
 already gathered" umbrella:
 
-Bug 1 (mcp_utils.py -- AsyncLoopThread.run): concurrent.futures.Future.result(
-timeout=...) raises TimeoutError in the CALLING thread but does not cancel the
-coroutine running on the shared background loop -- it keeps running to
-completion (downloading/parsing data nobody will read), and the next queued
-tool call inherits its delay. The fix wraps the coroutine in
-asyncio.wait_for() so expiry cancels it natively on the loop.
+Bug 1 (mcp_utils.py -- AsyncLoopThread.run): the original code raised
+TimeoutError in the CALLING thread but never cancelled the coroutine on the
+shared background loop -- it kept running to completion and the next queued
+tool call inherited its delay. The fix keeps the deadline in the calling
+thread (future.result(timeout=...), so it holds even when the coroutine
+blocks the loop with synchronous work) and, on expiry, calls future.cancel()
+to request cancellation on the loop, raising McpCallTimeout -- a dedicated
+type, so a TimeoutError raised by the coroutine ITSELF (e.g. a transport
+connect timeout) is re-raised untouched instead of being relabelled as the
+deadline. Honest limits: cancellation lands at the coroutine's next await
+point; code stuck in blocking synchronous work cannot be interrupted, and
+the MCP protocol offers the server no cancellation signal, so server-side
+work may continue after the client gives up.
 
 Bug 2 (base_react.py -- sync_wrapper): when AsyncLoopThread.run() raises on
-timeout, the exception used to propagate out of the tool and kill the whole
-agent turn with an HTTP 500. The fix catches only the timeout and returns a
-structured error string so the model can act on data it already gathered.
+its deadline, the exception used to propagate out of the tool and kill the
+whole agent turn with an HTTP 500. The fix catches exactly McpCallTimeout
+and raises ToolException; initialize_mcp_client sets handle_tool_error=True
+on every MCP tool, so BaseTool.run() converts that into a ToolMessage with
+status="error" -- on the sync and async execution paths alike -- and the
+model can act on data it already gathered. All other tool errors, including
+the tool's own TimeoutError, propagate unchanged.
 
 Bug 3 (base_react.py -- BaseReActAgent.invoke): when the graph exhausts its
 recursion limit, invoke() caught GraphRecursionError and called the wrap-up
@@ -107,32 +118,87 @@ def test_default_timeout_is_still_120_seconds():
     assert sig.parameters["timeout"].default == 120.0
 
 
+def test_deadline_raises_even_if_coroutine_swallows_cancellation(runner):
+    """A tool with a broad `except` around its request loop can absorb the
+    CancelledError that cancellation delivers. The runner must still raise
+    to its caller -- silently returning the late value would present a call
+    that blew its deadline as a success."""
+
+    async def stubborn():
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            return "finished anyway"
+
+    with pytest.raises(TimeoutError):
+        runner.run(stubborn(), timeout=0.1)
+
+
+def test_coroutines_own_timeout_error_is_not_relabelled(runner):
+    """A TimeoutError raised INSIDE the coroutine (e.g. a transport-level
+    connect timeout, which on py3.10+ is the same class family) is a real
+    tool error, not the runner's deadline. It must surface with its own
+    message intact, not be relabelled as 'Operation exceeded 120.0s'."""
+
+    async def transport_fail():
+        raise TimeoutError("connection to dbs server timed out after 3s")
+
+    with pytest.raises(TimeoutError, match="dbs server"):
+        runner.run(transport_fail(), timeout=120.0)
+
+
+def test_deadline_timeout_is_a_distinct_type(runner):
+    """The runner's own deadline raises McpCallTimeout (a TimeoutError
+    subclass), so callers can catch exactly the deadline case and let a
+    tool's own TimeoutError propagate untouched."""
+    from src.archi.pipelines.agents.utils.mcp_utils import McpCallTimeout
+
+    async def slow():
+        await asyncio.sleep(5)
+
+    with pytest.raises(McpCallTimeout):
+        runner.run(slow(), timeout=0.05)
+
+
 # ---------------------------------------------------------------------------
-# Bug 2: sync_wrapper (base_react.py) must convert a tool timeout into a
-# structured error string instead of letting it kill the whole agent turn.
+# Bug 2: sync_wrapper (base_react.py) must convert the runner's deadline into
+# a ToolException instead of letting it kill the whole agent turn.
+# initialize_mcp_client sets handle_tool_error=True on every MCP tool
+# (src/archi/pipelines/agents/tools/mcp.py), so BaseTool.run() turns a
+# ToolException into a ToolMessage with status="error" -- no special return
+# shape needed, on the sync and async paths alike.
 # ---------------------------------------------------------------------------
 
 class _FakeAsyncTool:
     """The smallest stand-in for the langchain BaseTool object make_synchronous
     wraps. sync_wrapper only ever touches .name, .coroutine, and (by
     assignment) .func, so a real MCP tool is not needed to exercise it.
+    (The end-to-end test below uses a real StructuredTool instead, to pin the
+    full handle_tool_error path.)"""
 
-    response_format defaults to unset (no attribute at all) to reproduce the
-    original fake exactly. Real MCP tools are never like this: every tool
-    produced by langchain_mcp_adapters.tools.convert_mcp_tool_to_langchain_tool
-    is a StructuredTool constructed with response_format="content_and_artifact"
-    hard-coded (see site-packages/langchain_mcp_adapters/tools.py), so callers
-    that need to match real behavior must pass that explicitly."""
-
-    def __init__(self, name, coroutine_fn, response_format=None):
+    def __init__(self, name, coroutine_fn):
         self.name = name
         self.coroutine = coroutine_fn
         self.func = None
-        if response_format is not None:
-            self.response_format = response_format
 
 
-def _make_sync_wrapper(monkeypatch, coroutine_fn, tool_name="fake_mcp_tool", response_format=None):
+def _shorten_runner_deadline(monkeypatch, seconds=0.2):
+    """Make the process-wide runner's default deadline short for this test,
+    so the REAL deadline path in AsyncLoopThread.run() fires -- rather than
+    faking the timeout inside the tool coroutine, which would never exercise
+    the runner's own except clause. sync_wrapper calls runner.run(coro) with
+    no timeout argument, so overriding the instance's run() default is the
+    only seam."""
+    inst = AsyncLoopThread.get_instance()
+    orig_run = AsyncLoopThread.run
+
+    def short_run(coro, timeout=120.0):
+        return orig_run(inst, coro, timeout=seconds)
+
+    monkeypatch.setattr(inst, "run", short_run)
+
+
+def _make_sync_wrapper(monkeypatch, coroutine_fn, tool_name="fake_mcp_tool", tool=None):
     """Build a REAL sync_wrapper via BaseReActAgent._build_mcp_tools(), faking
     out only initialize_mcp_client() so no network/subprocess MCP server is
     required. Everything downstream of that -- make_synchronous,
@@ -147,7 +213,7 @@ def _make_sync_wrapper(monkeypatch, coroutine_fn, tool_name="fake_mcp_tool", res
     runner, mcp client, skills text) -- it never reads any attribute __init__
     would have set -- so the bypass is safe.
     """
-    fake_tool = _FakeAsyncTool(tool_name, coroutine_fn, response_format=response_format)
+    fake_tool = tool if tool is not None else _FakeAsyncTool(tool_name, coroutine_fn)
 
     async def fake_initialize_mcp_client():
         return (object(), [fake_tool], "")
@@ -160,53 +226,73 @@ def _make_sync_wrapper(monkeypatch, coroutine_fn, tool_name="fake_mcp_tool", res
     return tools[0].func
 
 
-def test_sync_wrapper_returns_string_naming_the_tool_on_timeout(monkeypatch):
-    async def times_out(*args, **kwargs):
-        # Simulate a tool call that would eventually hit AsyncLoopThread's
-        # (120s default) timeout, without a test actually waiting 120s: the
-        # tool's own coroutine times out against a short internal deadline,
-        # which is what runner.run() ultimately raises up through here.
-        await asyncio.wait_for(asyncio.sleep(5), timeout=0.05)
+def test_sync_wrapper_raises_tool_exception_naming_the_tool_on_timeout(monkeypatch):
+    """The REAL deadline path: the tool coroutine just hangs, the runner's
+    own (shortened) deadline fires, and sync_wrapper must convert exactly
+    that into a ToolException naming the tool -- which handle_tool_error
+    then turns into a status='error' ToolMessage instead of a dead turn."""
+    from langchain_core.tools import ToolException
 
-    sync_wrapper = _make_sync_wrapper(monkeypatch, times_out, tool_name="dbs_find_files")
+    async def hangs(*args, **kwargs):
+        await asyncio.sleep(5)
 
-    result = sync_wrapper()
+    sync_wrapper = _make_sync_wrapper(monkeypatch, hangs, tool_name="dbs_find_files")
+    _shorten_runner_deadline(monkeypatch)
 
-    assert isinstance(result, str)
-    assert "dbs_find_files" in result
+    with pytest.raises(ToolException, match="dbs_find_files"):
+        sync_wrapper()
 
 
-def test_sync_wrapper_returns_two_tuple_for_content_and_artifact_tools(monkeypatch):
-    """Real MCP tools are never like _FakeAsyncTool's default: every tool
-    langchain_mcp_adapters produces is a StructuredTool with
-    response_format="content_and_artifact" hard-coded (see
-    convert_mcp_tool_to_langchain_tool in site-packages/langchain_mcp_adapters/
-    tools.py). langchain_core.tools.base.BaseTool.run enforces that any tool
-    declaring that response_format must return a two-tuple (content, artifact)
-    from .func -- a plain string makes it raise:
-    "Since response_format='content_and_artifact' a two-tuple of the message
-    content and raw tool output is expected. Instead ... generated response
-    is of type: <class 'str'>", which is exactly the production error this
-    fix addresses. This is the test the original fake tool (no response_format
-    attribute) could not have caught."""
-    async def times_out(*args, **kwargs):
-        await asyncio.wait_for(asyncio.sleep(5), timeout=0.05)
+def test_sync_wrapper_timeout_yields_error_tool_message_end_to_end(monkeypatch):
+    """Full-stack check with a REAL StructuredTool configured exactly like
+    production: response_format="content_and_artifact" (hard-coded for every
+    MCP tool by langchain_mcp_adapters) and handle_tool_error=True (set by
+    initialize_mcp_client). Invoking the tool after its coroutine times out
+    must produce a ToolMessage with status='error' naming the tool -- not a
+    success-shaped result, and not a crash."""
+    from langchain_core.tools import StructuredTool
+    from pydantic import BaseModel
 
-    sync_wrapper = _make_sync_wrapper(
-        monkeypatch,
-        times_out,
-        tool_name="dbs_aggregate",
+    class _NoArgs(BaseModel):
+        pass
+
+    async def hangs(*args, **kwargs):
+        await asyncio.sleep(5)
+
+    real_tool = StructuredTool(
+        name="dbs_aggregate",
+        description="fake DBS aggregation tool",
+        coroutine=hangs,
+        args_schema=_NoArgs,
         response_format="content_and_artifact",
     )
+    real_tool.handle_tool_error = True  # what initialize_mcp_client does
 
-    result = sync_wrapper()
+    _make_sync_wrapper(monkeypatch, None, tool=real_tool)
+    _shorten_runner_deadline(monkeypatch)
 
-    assert isinstance(result, tuple)
-    assert len(result) == 2
-    content, artifact = result
-    assert isinstance(content, str)
-    assert "dbs_aggregate" in content
-    assert artifact is None
+    msg = real_tool.invoke(
+        {"type": "tool_call", "id": "call_1", "name": "dbs_aggregate", "args": {}}
+    )
+
+    assert isinstance(msg, ToolMessage)
+    assert msg.status == "error"
+    assert "dbs_aggregate" in msg.content
+
+
+def test_sync_wrapper_reraises_tools_own_timeout_error(monkeypatch):
+    """A TimeoutError raised by the tool's own coroutine (e.g. a transport
+    connect timeout) is a real tool error, not the runner's deadline. It
+    must propagate unchanged -- not be dressed up as a retryable deadline
+    message that sends the model retrying against a dead server."""
+
+    async def transport_fail(*args, **kwargs):
+        raise TimeoutError("connection reset by dbs server")
+
+    sync_wrapper = _make_sync_wrapper(monkeypatch, transport_fail)
+
+    with pytest.raises(TimeoutError, match="connection reset"):
+        sync_wrapper()
 
 
 def test_sync_wrapper_does_not_swallow_non_timeout_errors(monkeypatch):
@@ -251,16 +337,23 @@ class _FakeCompiledGraph:
     result below mean something.
     """
 
+    # Mirrors CompiledStateGraph: the OUTPUT-schema channels, a subset of
+    # all stream channels (a real create_agent graph also carries internal
+    # ones like 'jump_to' that invoke() never returns).
+    output_channels = ["messages", "structured_response"]
+
     def __init__(self, states, error=None):
         self._states = list(states)
         self._error = error
         self.stream_calls = []
 
-    def stream(self, input, config=None, *, stream_mode=None, **kwargs):
+    def stream(self, input, config=None, *, stream_mode=None, output_keys=None, **kwargs):
         assert stream_mode == "values", (
             "the fix must drive the graph with stream_mode='values'"
         )
-        self.stream_calls.append({"input": input, "config": config})
+        self.stream_calls.append(
+            {"input": input, "config": config, "output_keys": output_keys}
+        )
         for state in self._states:
             yield state
         if self._error is not None:
@@ -373,6 +466,23 @@ def test_invoke_success_path_unchanged():
     assert result.source_documents == []
     assert graph.stream_calls, "the fix must drive the graph via .stream(...)"
     assert graph.stream_calls[0]["config"] == {"recursion_limit": 7}
+
+
+def test_invoke_pins_output_keys_to_the_graphs_output_channels():
+    """Pregel.invoke() pins output_keys=self.output_channels before
+    delegating to stream(); a bare stream() call falls back to ALL stream
+    channels, which for a real create_agent graph adds internal routing
+    keys like 'jump_to' to the returned state. invoke() must pass
+    output_keys explicitly so its success-path return shape stays identical
+    to what .invoke() produced before this change."""
+    human = HumanMessage(content="q")
+    final = AIMessage(content="a")
+    graph = _FakeCompiledGraph([{"messages": [human, final]}], error=None)
+    agent = _make_bare_agent(graph)
+
+    agent.invoke()
+
+    assert graph.stream_calls[0]["output_keys"] == graph.output_channels
 
 
 def test_invoke_recursion_error_before_any_state_is_handled_gracefully():
