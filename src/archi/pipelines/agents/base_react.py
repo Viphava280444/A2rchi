@@ -7,6 +7,7 @@ import json
 from langchain.agents import create_agent
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import ToolException
 try:
     from langchain_core.messages import BaseMessageChunk
 except ImportError:
@@ -20,7 +21,7 @@ from src.archi.providers import get_model
 from src.archi.providers.base import ProviderType
 from src.archi.utils.output_dataclass import PipelineOutput
 from src.archi.pipelines.agents.utils.run_memory import RunMemory
-from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread
+from src.archi.pipelines.agents.utils.mcp_utils import AsyncLoopThread, McpCallTimeout
 from src.archi.pipelines.agents.tools import initialize_mcp_client
 from src.utils.logging import get_logger
 
@@ -274,8 +275,27 @@ class BaseReActAgent:
             self.refresh_agent(force=True)
         logger.debug("Agent refreshed, invoking now")
         recursion_limit = self._recursion_limit()
+        # Drive the graph via stream(..., stream_mode="values") instead of
+        # invoke() so the last accumulated state survives a GraphRecursionError.
+        # invoke() raises without returning, so a variable assigned from its
+        # result is never in scope in the except block below -- this is what
+        # used to hand the recursion-limit fallback an empty message list
+        # even when the run had gathered real tool results. stream_mode="values"
+        # yields the full accumulated state after each step, mirroring how the
+        # streaming path (see stream() below) already captures all_messages.
+        # output_keys must be pinned to the graph's output channels: invoke()
+        # does this internally, while a bare stream() call falls back to ALL
+        # stream channels and would leak internal routing keys (e.g.
+        # 'jump_to') into the returned state.
+        answer_output: Any = None
         try:
-            answer_output = self.agent.invoke(agent_inputs, {"recursion_limit": recursion_limit})
+            for answer_output in self.agent.stream(
+                agent_inputs,
+                stream_mode="values",
+                output_keys=self.agent.output_channels,
+                config={"recursion_limit": recursion_limit},
+            ):
+                pass
             logger.debug("Agent invocation completed")
             logger.debug(answer_output)
             messages = self._extract_messages(answer_output)
@@ -292,7 +312,7 @@ class BaseReActAgent:
             return self._handle_recursion_limit_error(
                 error=exc,
                 recursion_limit=recursion_limit,
-                latest_messages=[],
+                latest_messages=self._extract_messages(answer_output),
                 agent_inputs=agent_inputs,
             )
 
@@ -1219,7 +1239,22 @@ class BaseReActAgent:
                             "Failed to record MCP tool input for %s: %s", tool_name, exc
                         )
                     # Run on the background loop - NOT a new loop!
-                    return runner.run(async_tool.coroutine(*args, **sanitized_kwargs))
+                    try:
+                        return runner.run(async_tool.coroutine(*args, **sanitized_kwargs))
+                    except McpCallTimeout as exc:
+                        # The runner's deadline expired. Raise ToolException so
+                        # BaseTool.run() -- handle_tool_error=True is set on
+                        # every MCP tool in initialize_mcp_client -- turns it
+                        # into a ToolMessage with status="error" instead of
+                        # killing the whole agent turn. A TimeoutError raised
+                        # by the tool's own coroutine is not McpCallTimeout
+                        # and propagates untouched, like any other tool error.
+                        logger.warning("MCP tool '%s' timed out: %s", tool_name, exc)
+                        raise ToolException(
+                            f"Error: tool '{tool_name}' exceeded the time limit. "
+                            "Retry with a narrower/more specific query, or "
+                            "proceed using the data already gathered."
+                        ) from exc
 
                 # Assign the wrapper to the tool's 'func' attribute
                 async_tool.func = sync_wrapper
